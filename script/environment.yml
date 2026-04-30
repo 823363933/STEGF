@@ -1,11 +1,23 @@
 channels:
+  - pytorch
   - conda-forge
 dependencies:
-  - plyfile=0.8.1
+  - python=3.7.13
+  - pytorch=1.12.1
+  - torchvision=0.13.1
+  - torchaudio=0.12.1
+  - cudatoolkit=11.6
   - pip=22.3.1
+  - numpy
+  - scipy
   - tqdm
+  - pillow
   - pip:
-    - thirdparty/gaussian_splatting/submodules/gaussian_rasterization_ch9
-    - thirdparty/gaussian_splatting/submodules/simple-knn
-    - natsort
-    - scikit-image
+      - opencv-python
+      - natsort
+      - kornia
+      - plyfile
+      - scikit-image
+      - thirdparty/gaussian_splatting/submodules/gaussian_rasterization_ch9
+      - thirdparty/gaussian_splatting/submodules/simple-knn
+      - -e thirdparty/mmcv

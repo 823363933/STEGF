@@ -44,7 +44,8 @@ import os
 import json 
 import cv2
 import os 
-from script.pre_immersive_distorted import SCALEDICT 
+
+SCALEDICT = {}
 
 
 def getrenderpip(option="train_ours_full"):
@@ -56,71 +57,19 @@ def getrenderpip(option="train_ours_full"):
         return train_ours_full, GaussianRasterizationSettings, GaussianRasterizer
 
 
-    elif option == "train_ours_lite":
-        from thirdparty.gaussian_splatting.renderer import train_ours_lite
-        from diff_gaussian_rasterization_ch3 import GaussianRasterizationSettings 
-        from diff_gaussian_rasterization_ch3 import GaussianRasterizer  
-
-        return train_ours_lite, GaussianRasterizationSettings, GaussianRasterizer
-    
     elif option == "test_ours_full":
         from thirdparty.gaussian_splatting.renderer import test_ours_full
         from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings 
         from diff_gaussian_rasterization_ch9 import GaussianRasterizer  
         return test_ours_full, GaussianRasterizationSettings, GaussianRasterizer
-
-    elif option == "test_ours_lite": # forward only 
-        from thirdparty.gaussian_splatting.renderer import test_ours_lite
-        from forward_lite import GaussianRasterizationSettings 
-        from forward_lite import GaussianRasterizer 
-        return test_ours_lite, GaussianRasterizationSettings, GaussianRasterizer
-    
-    elif option == "test_ours_full_fused":
-        from thirdparty.gaussian_splatting.renderer import test_ours_full_fused
-        from forward_full import GaussianRasterizationSettings
-        from forward_full import GaussianRasterizer
-        return test_ours_full_fused, GaussianRasterizationSettings, GaussianRasterizer
-    
-    elif option == "train_ours_fullss":
-        from thirdparty.gaussian_splatting.renderer import train_ours_fullss
-        from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings 
-        from diff_gaussian_rasterization_ch9 import GaussianRasterizer  
-        return train_ours_fullss, GaussianRasterizationSettings, GaussianRasterizer
-    
-    elif option == "test_ours_fullss":
-        from thirdparty.gaussian_splatting.renderer import test_ours_fullss
-        from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings 
-        from diff_gaussian_rasterization_ch9 import GaussianRasterizer  
-        return test_ours_fullss, GaussianRasterizationSettings, GaussianRasterizer
-    
-    elif option == "test_ours_fullss_fused": # fused mlp in rendering
-        from thirdparty.gaussian_splatting.renderer import test_ours_fullss_fused
-        from forward_full import GaussianRasterizationSettings
-        from forward_full import GaussianRasterizer
-        return test_ours_fullss_fused, GaussianRasterizationSettings, GaussianRasterizer
-    
-    elif option == "train_ours_litess": 
-        from thirdparty.gaussian_splatting.renderer import train_ours_litess
-        from diff_gaussian_rasterization_ch3 import GaussianRasterizationSettings 
-        from diff_gaussian_rasterization_ch3 import GaussianRasterizer 
-        return train_ours_litess, GaussianRasterizationSettings, GaussianRasterizer    
-    
-    elif option == "test_ours_litess":
-        from thirdparty.gaussian_splatting.renderer import test_ours_litess
-        from forward_lite import GaussianRasterizationSettings 
-        from forward_lite import GaussianRasterizer  
-        return test_ours_litess,  GaussianRasterizationSettings, GaussianRasterizer
     else:
-        raise NotImplementedError("Rennder {} not implemented".format(option))
+        raise NotImplementedError("Render {} is not included in the trimmed STEGF runtime".format(option))
     
 def getmodel(model="oursfull"):
     if model == "ours_full":
         from  thirdparty.gaussian_splatting.scene.oursfull import GaussianModel
-    elif model == "ours_lite":
-        from  thirdparty.gaussian_splatting.scene.ourslite import GaussianModel
     else:
-    
-        raise NotImplementedError("model {} not implemented".format(model))
+        raise NotImplementedError("Model {} is not included in the trimmed STEGF runtime".format(model))
     return GaussianModel
 
 def getloss(opt, Ll1, ssim, image, gt_image, gaussians, radii):

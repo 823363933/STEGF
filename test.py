@@ -132,18 +132,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
     if rdpip == "train_ours_full":
-        # full model faster now when use fuse the rendering part (MLP) into cuda, same as 3dgs and instant-NGP. 
-        if getattr(gaussians, "use_euler_field", False):
-            render, GRsetting, GRzer = getrenderpip("test_ours_full")
-        else:
-            render, GRsetting, GRzer = getrenderpip("test_ours_full_fused")
-    elif rdpip == "train_ours_lite":
-        render, GRsetting, GRzer = getrenderpip("test_ours_lite") 
-    elif rdpip == "train_ours_fullss":
-        render, GRsetting, GRzer = getrenderpip("test_ours_fullss_fused") # 
-    elif rdpip == "train_ours_litess":
-        render, GRsetting, GRzer = getrenderpip("test_ours_litess") # 
-    
+        render, GRsetting, GRzer = getrenderpip("test_ours_full")
     else:
         render, GRsetting, GRzer = getrenderpip(rdpip) 
 
