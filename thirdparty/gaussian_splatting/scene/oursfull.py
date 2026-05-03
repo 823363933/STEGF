@@ -101,6 +101,18 @@ class GaussianModel:
         self.use_euler_field = False
         self.field_base_resolution = 4
         self.field_num_levels = 5
+        self.field_resolution_mode = "fixed"
+        self.field_level_resolutions = ""
+        self.field_resolved_level_resolutions = ""
+        self.field_resolution_growth = 2.0
+        self.field_max_resolution = 96
+        self.field_knn_scale_percentile = 25.0
+        self.field_gaussian_scale_percentile = 25.0
+        self.field_pixel_scale_percentile = 25.0
+        self.field_knn_scale_weight = 1.0
+        self.field_gaussian_scale_weight = 1.0
+        self.field_pixel_scale_weight = 1.0
+        self.field_min_cell_scale = 1.5
         self.field_feature_dim = 8
         self.field_fourier_degree = 10
         self.field_level_fourier_degree = 2
@@ -202,6 +214,8 @@ class GaussianModel:
         self._static_support_mask = torch.empty(0)
         self._visibility_persistence_ema = torch.empty(0)
         self._last_field_aux = {}
+        self._field_camera_scale_hints = []
+        self._field_resolution_stats = {}
         self.field_grd = {}
         self.field_router_grd = {}
         self.field_query_gate_grd = {}
@@ -951,6 +965,18 @@ class GaussianModel:
         self.use_euler_field = bool(getattr(args, "use_euler_field", False))
         self.field_base_resolution = int(getattr(args, "field_base_resolution", 4))
         self.field_num_levels = int(getattr(args, "field_num_levels", 5))
+        self.field_resolution_mode = str(getattr(args, "field_resolution_mode", "fixed"))
+        self.field_level_resolutions = getattr(args, "field_level_resolutions", "")
+        self.field_resolved_level_resolutions = getattr(args, "field_resolved_level_resolutions", "")
+        self.field_resolution_growth = float(getattr(args, "field_resolution_growth", 2.0))
+        self.field_max_resolution = int(getattr(args, "field_max_resolution", 96))
+        self.field_knn_scale_percentile = float(getattr(args, "field_knn_scale_percentile", 25.0))
+        self.field_gaussian_scale_percentile = float(getattr(args, "field_gaussian_scale_percentile", 25.0))
+        self.field_pixel_scale_percentile = float(getattr(args, "field_pixel_scale_percentile", 25.0))
+        self.field_knn_scale_weight = float(getattr(args, "field_knn_scale_weight", 1.0))
+        self.field_gaussian_scale_weight = float(getattr(args, "field_gaussian_scale_weight", 1.0))
+        self.field_pixel_scale_weight = float(getattr(args, "field_pixel_scale_weight", 1.0))
+        self.field_min_cell_scale = float(getattr(args, "field_min_cell_scale", 1.5))
         self.field_feature_dim = int(getattr(args, "field_feature_dim", 8))
         self.field_fourier_degree = int(getattr(args, "field_fourier_degree", 10))
         self.field_level_fourier_degree = int(getattr(args, "field_level_fourier_degree", 2))
@@ -1039,9 +1065,179 @@ class GaussianModel:
         self.field_temporal_refine_score_threshold = float(getattr(args, "field_temporal_refine_score_threshold", 0.65))
         self.field_temporal_refine_max_ratio = float(getattr(args, "field_temporal_refine_max_ratio", 0.02))
 
-    def _build_euler_modules(self, bbox_min, bbox_max):
+    def set_field_camera_scale_hints(self, cameras):
+        self._field_camera_scale_hints = []
+        for camera in cameras:
+            camera_center = getattr(camera, "camera_center", None)
+            if camera_center is None:
+                continue
+            self._field_camera_scale_hints.append(
+                {
+                    "center": camera_center.detach().float().cpu(),
+                    "fovx": float(getattr(camera, "FoVx", 0.0)),
+                    "fovy": float(getattr(camera, "FoVy", 0.0)),
+                    "width": int(getattr(camera, "image_width", 0)),
+                    "height": int(getattr(camera, "image_height", 0)),
+                }
+            )
+
+    def _parse_field_level_resolutions(self, spec):
+        if spec is None or spec == "":
+            return None
+        if isinstance(spec, str):
+            items = []
+            for level_spec in spec.replace("|", ";").split(";"):
+                level_spec = level_spec.strip()
+                if not level_spec:
+                    continue
+                values = [v for v in level_spec.replace("x", ",").split(",") if v.strip()]
+                items.append(tuple(int(v) for v in values))
+        elif isinstance(spec, (list, tuple)):
+            items = spec
+        else:
+            return None
+
+        resolutions = []
+        for item in items:
+            if isinstance(item, int):
+                resolution = (item, item, item)
+            else:
+                if len(item) == 1:
+                    resolution = (int(item[0]), int(item[0]), int(item[0]))
+                elif len(item) == 3:
+                    resolution = tuple(int(v) for v in item)
+                else:
+                    raise ValueError(f"Invalid field_level_resolutions entry: {item}")
+            if min(resolution) < 2:
+                raise ValueError(f"Euler grid resolution must be >= 2 on every axis, got {resolution}")
+            resolutions.append(resolution)
+        return resolutions if resolutions else None
+
+    @staticmethod
+    def _format_field_level_resolutions(resolutions):
+        return ";".join("{}x{}x{}".format(*resolution) for resolution in resolutions)
+
+    @staticmethod
+    def _positive_percentile(values, percentile):
+        if values is None:
+            return None
+        values = values.detach().reshape(-1).float()
+        values = values[torch.isfinite(values) & (values > 0)]
+        if values.numel() == 0:
+            return None
+        percentile = max(0.0, min(100.0, float(percentile))) / 100.0
+        return float(torch.quantile(values, percentile).item())
+
+    def _estimate_field_pixel_scale(self, bbox_center):
+        if not self._field_camera_scale_hints:
+            return None
+        pixel_scales = []
+        for hint in self._field_camera_scale_hints:
+            width = max(float(hint["width"]), 1.0)
+            height = max(float(hint["height"]), 1.0)
+            fovx = max(float(hint["fovx"]), 1e-6)
+            fovy = max(float(hint["fovy"]), 1e-6)
+            center = hint["center"].to(device=bbox_center.device, dtype=bbox_center.dtype)
+            depth = torch.linalg.norm(center - bbox_center).clamp_min(1e-6)
+            scale_x = 2.0 * depth * math.tan(0.5 * fovx) / width
+            scale_y = 2.0 * depth * math.tan(0.5 * fovy) / height
+            pixel_scales.append(torch.maximum(scale_x, scale_y))
+        return self._positive_percentile(
+            torch.stack(pixel_scales),
+            self.field_pixel_scale_percentile,
+        )
+
+    def _resolve_field_level_resolutions(self, bbox_min, bbox_max, knn_distances=None, gaussian_scales=None):
+        manual_resolutions = self._parse_field_level_resolutions(self.field_level_resolutions)
+        if manual_resolutions is not None:
+            self._field_resolution_stats = {"mode": "manual"}
+            return manual_resolutions
+
+        checkpoint_resolutions = self._parse_field_level_resolutions(self.field_resolved_level_resolutions)
+        if checkpoint_resolutions is not None and knn_distances is None and gaussian_scales is None:
+            self._field_resolution_stats = {"mode": "checkpoint"}
+            return checkpoint_resolutions
+
+        if str(self.field_resolution_mode).lower() != "auto_physical":
+            self._field_resolution_stats = {"mode": "fixed"}
+            return [
+                (self.field_base_resolution * (2 ** level),) * 3
+                for level in range(self.field_num_levels)
+            ]
+
+        bbox_span = torch.clamp((bbox_max - bbox_min).detach().float(), min=1e-6)
+        max_span = float(torch.max(bbox_span).item())
+        bbox_center = 0.5 * (bbox_min + bbox_max)
+
+        scale_components = {}
+        knn_scale = self._positive_percentile(knn_distances, self.field_knn_scale_percentile)
+        if knn_scale is not None:
+            scale_components["knn"] = knn_scale * self.field_knn_scale_weight
+        gaussian_scale = self._positive_percentile(gaussian_scales, self.field_gaussian_scale_percentile)
+        if gaussian_scale is not None:
+            scale_components["gaussian"] = gaussian_scale * self.field_gaussian_scale_weight
+        pixel_scale = self._estimate_field_pixel_scale(bbox_center)
+        if pixel_scale is not None:
+            scale_components["pixel"] = pixel_scale * self.field_pixel_scale_weight
+
+        finest_cell = 0.0
+        if scale_components:
+            finest_cell = max(scale_components.values()) * max(float(self.field_min_cell_scale), 0.0)
+
+        base_resolution = max(int(self.field_base_resolution), 2)
+        max_resolution = max(int(self.field_max_resolution), base_resolution)
+        growth = max(float(self.field_resolution_growth), 1.01)
+        max_levels = max(int(self.field_num_levels), 1)
+
+        resolutions = []
+        for level in range(max_levels):
+            target_resolution = int(round(base_resolution * (growth ** level)))
+            target_resolution = max(2, min(target_resolution, max_resolution))
+            cell_size = max_span / max(target_resolution - 1, 1)
+            if resolutions and finest_cell > 0.0 and cell_size < finest_cell:
+                break
+            level_resolution = torch.ceil(bbox_span / cell_size).long() + 1
+            level_resolution = torch.clamp(level_resolution, min=2, max=max_resolution)
+            item = tuple(int(v.item()) for v in level_resolution)
+            if resolutions and item == resolutions[-1]:
+                break
+            resolutions.append(item)
+            if target_resolution >= max_resolution:
+                break
+
+        if not resolutions:
+            resolutions = [(base_resolution, base_resolution, base_resolution)]
+
+        self._field_resolution_stats = {
+            "mode": "auto_physical",
+            "finest_cell": finest_cell,
+            "components": scale_components,
+        }
+        return resolutions
+
+    def _build_euler_modules(self, bbox_min, bbox_max, knn_distances=None, gaussian_scales=None):
         if not self.use_euler_field:
             return
+        level_resolutions = self._resolve_field_level_resolutions(
+            bbox_min,
+            bbox_max,
+            knn_distances=knn_distances,
+            gaussian_scales=gaussian_scales,
+        )
+        self.field_num_levels = len(level_resolutions)
+        self.field_resolved_level_resolutions = self._format_field_level_resolutions(level_resolutions)
+        stats = getattr(self, "_field_resolution_stats", {})
+        components = stats.get("components", {})
+        component_text = ", ".join("{}={:.6g}".format(k, v) for k, v in components.items())
+        print(
+            "[STEGF] Euler grid mode={}, levels={}, resolutions={}, finest_cell={}, components={}".format(
+                stats.get("mode", self.field_resolution_mode),
+                self.field_num_levels,
+                self.field_resolved_level_resolutions,
+                stats.get("finest_cell", "n/a"),
+                component_text if component_text else "n/a",
+            )
+        )
         self.euler_field = EulerField(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
@@ -1049,6 +1245,8 @@ class GaussianModel:
             num_levels=self.field_num_levels,
             feature_dim=self.field_feature_dim,
             fourier_degree=self.field_fourier_degree,
+            level_resolutions=level_resolutions,
+            enable_dynamic_grid=not self.field_disable_dynamic_grid,
         ).cuda()
         router_input_dim = self.field_feature_dim + 2 * self.field_level_fourier_degree
         self.field_router = EulerLevelRouter(
@@ -1694,7 +1892,12 @@ class GaussianModel:
         if self.use_euler_field:
             bbox_min = torch.amin(self._xyz.detach(), dim=0)
             bbox_max = torch.amax(self._xyz.detach(), dim=0)
-            self._build_euler_modules(bbox_min, bbox_max)
+            self._build_euler_modules(
+                bbox_min,
+                bbox_max,
+                knn_distances=torch.sqrt(dist2.detach()),
+                gaussian_scales=torch.exp(scales.detach()).mean(dim=1),
+            )
             self._init_static_level_logits(self.get_xyz.shape[0])
             self._init_dynamic_level_logits(self.get_xyz.shape[0])
             self._init_dynamic_level_time_coeff(self.get_xyz.shape[0])
@@ -1951,6 +2154,18 @@ class GaussianModel:
             "use_euler_field": self.use_euler_field,
             "field_base_resolution": self.field_base_resolution,
             "field_num_levels": self.field_num_levels,
+            "field_resolution_mode": self.field_resolution_mode,
+            "field_level_resolutions": self.field_level_resolutions,
+            "field_resolved_level_resolutions": self.field_resolved_level_resolutions,
+            "field_resolution_growth": self.field_resolution_growth,
+            "field_max_resolution": self.field_max_resolution,
+            "field_knn_scale_percentile": self.field_knn_scale_percentile,
+            "field_gaussian_scale_percentile": self.field_gaussian_scale_percentile,
+            "field_pixel_scale_percentile": self.field_pixel_scale_percentile,
+            "field_knn_scale_weight": self.field_knn_scale_weight,
+            "field_gaussian_scale_weight": self.field_gaussian_scale_weight,
+            "field_pixel_scale_weight": self.field_pixel_scale_weight,
+            "field_min_cell_scale": self.field_min_cell_scale,
             "field_feature_dim": self.field_feature_dim,
             "field_fourier_degree": self.field_fourier_degree,
             "field_level_fourier_degree": self.field_level_fourier_degree,
@@ -2064,6 +2279,21 @@ class GaussianModel:
             self.use_euler_field = bool(config.get("use_euler_field", self.use_euler_field))
             self.field_base_resolution = int(config.get("field_base_resolution", self.field_base_resolution))
             self.field_num_levels = int(config.get("field_num_levels", self.field_num_levels))
+            self.field_resolution_mode = str(config.get("field_resolution_mode", self.field_resolution_mode))
+            self.field_level_resolutions = config.get("field_level_resolutions", self.field_level_resolutions)
+            self.field_resolved_level_resolutions = config.get(
+                "field_resolved_level_resolutions",
+                self.field_resolved_level_resolutions,
+            )
+            self.field_resolution_growth = float(config.get("field_resolution_growth", self.field_resolution_growth))
+            self.field_max_resolution = int(config.get("field_max_resolution", self.field_max_resolution))
+            self.field_knn_scale_percentile = float(config.get("field_knn_scale_percentile", self.field_knn_scale_percentile))
+            self.field_gaussian_scale_percentile = float(config.get("field_gaussian_scale_percentile", self.field_gaussian_scale_percentile))
+            self.field_pixel_scale_percentile = float(config.get("field_pixel_scale_percentile", self.field_pixel_scale_percentile))
+            self.field_knn_scale_weight = float(config.get("field_knn_scale_weight", self.field_knn_scale_weight))
+            self.field_gaussian_scale_weight = float(config.get("field_gaussian_scale_weight", self.field_gaussian_scale_weight))
+            self.field_pixel_scale_weight = float(config.get("field_pixel_scale_weight", self.field_pixel_scale_weight))
+            self.field_min_cell_scale = float(config.get("field_min_cell_scale", self.field_min_cell_scale))
             self.field_feature_dim = int(config.get("field_feature_dim", self.field_feature_dim))
             self.field_fourier_degree = int(config.get("field_fourier_degree", self.field_fourier_degree))
             self.field_level_fourier_degree = int(config.get("field_level_fourier_degree", self.field_level_fourier_degree))

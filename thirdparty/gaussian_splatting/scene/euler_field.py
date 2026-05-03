@@ -14,12 +14,16 @@ class EulerField(nn.Module):
         num_levels=5,
         feature_dim=8,
         fourier_degree=10,
+        level_resolutions=None,
+        enable_dynamic_grid=True,
     ):
         super().__init__()
         self.base_resolution = base_resolution
-        self.num_levels = num_levels
+        self.level_resolutions = self._resolve_level_resolutions(base_resolution, num_levels, level_resolutions)
+        self.num_levels = len(self.level_resolutions)
         self.feature_dim = feature_dim
         self.fourier_degree = fourier_degree
+        self.enable_dynamic_grid = enable_dynamic_grid
 
         bbox_min = torch.as_tensor(bbox_min, dtype=torch.float32, device="cuda").view(1, 3)
         bbox_max = torch.as_tensor(bbox_max, dtype=torch.float32, device="cuda").view(1, 3)
@@ -31,18 +35,45 @@ class EulerField(nn.Module):
         dynamic_channels = feature_dim * 2 * fourier_degree
         self.static_grids = nn.ParameterList()
         self.dynamic_grids = nn.ParameterList()
-        for level in range(num_levels):
-            resolution = base_resolution * (2 ** level)
+        for resolution in self.level_resolutions:
+            res_x, res_y, res_z = resolution
             static_grid = nn.Parameter(
-                torch.empty(1, feature_dim, resolution, resolution, resolution, device="cuda")
-            )
-            dynamic_grid = nn.Parameter(
-                torch.empty(1, dynamic_channels, resolution, resolution, resolution, device="cuda")
+                torch.empty(1, feature_dim, res_z, res_y, res_x, device="cuda")
             )
             nn.init.normal_(static_grid, mean=0.0, std=1e-4)
-            nn.init.normal_(dynamic_grid, mean=0.0, std=1e-4)
             self.static_grids.append(static_grid)
-            self.dynamic_grids.append(dynamic_grid)
+            if enable_dynamic_grid:
+                dynamic_grid = nn.Parameter(
+                    torch.empty(1, dynamic_channels, res_z, res_y, res_x, device="cuda")
+                )
+                nn.init.normal_(dynamic_grid, mean=0.0, std=1e-4)
+                self.dynamic_grids.append(dynamic_grid)
+
+    @staticmethod
+    def _resolve_level_resolutions(base_resolution, num_levels, level_resolutions):
+        if level_resolutions is None:
+            return [
+                (base_resolution * (2 ** level),) * 3
+                for level in range(num_levels)
+            ]
+
+        resolved = []
+        for resolution in level_resolutions:
+            if isinstance(resolution, int):
+                item = (resolution, resolution, resolution)
+            else:
+                if len(resolution) == 1:
+                    item = (int(resolution[0]),) * 3
+                elif len(resolution) == 3:
+                    item = tuple(int(v) for v in resolution)
+                else:
+                    raise ValueError(f"Invalid Euler grid resolution entry: {resolution}")
+            if min(item) < 2:
+                raise ValueError(f"Euler grid resolution must be >= 2 on every axis, got {item}")
+            resolved.append(item)
+        if not resolved:
+            raise ValueError("EulerField requires at least one grid level")
+        return resolved
 
     def _normalize_points_unit(self, points):
         coords = (points - self.bbox_min) / self.bbox_span
@@ -73,10 +104,28 @@ class EulerField(nn.Module):
         basis = torch.stack((torch.cos(angles), torch.sin(angles)), dim=1)
         return basis.reshape(-1)
 
+    @staticmethod
+    def _grid_resolution(grid):
+        return int(grid.shape[-1]), int(grid.shape[-2]), int(grid.shape[-3])
+
     def _corner_indices_weights(self, points, resolution):
-        coords = self._normalize_points_unit(points) * (resolution - 1)
+        if isinstance(resolution, int):
+            res_x = res_y = res_z = resolution
+        else:
+            res_x, res_y, res_z = resolution
+        resolution_tensor = torch.tensor(
+            [res_x, res_y, res_z],
+            device=points.device,
+            dtype=points.dtype,
+        )
+        coords = self._normalize_points_unit(points) * (resolution_tensor - 1)
         lower = torch.floor(coords).long()
-        upper = torch.clamp(lower + 1, max=resolution - 1)
+        max_index = torch.tensor(
+            [res_x - 1, res_y - 1, res_z - 1],
+            device=points.device,
+            dtype=torch.long,
+        )
+        upper = torch.minimum(lower + 1, max_index)
         frac = coords - lower.to(coords.dtype)
 
         x0, y0, z0 = lower[:, 0], lower[:, 1], lower[:, 2]
@@ -98,26 +147,33 @@ class EulerField(nn.Module):
             dim=1,
         )
 
-        plane = resolution * resolution
+        plane = res_x * res_y
         indices = torch.stack(
             (
-                z0 * plane + y0 * resolution + x0,
-                z0 * plane + y0 * resolution + x1,
-                z0 * plane + y1 * resolution + x0,
-                z0 * plane + y1 * resolution + x1,
-                z1 * plane + y0 * resolution + x0,
-                z1 * plane + y0 * resolution + x1,
-                z1 * plane + y1 * resolution + x0,
-                z1 * plane + y1 * resolution + x1,
+                z0 * plane + y0 * res_x + x0,
+                z0 * plane + y0 * res_x + x1,
+                z0 * plane + y1 * res_x + x0,
+                z0 * plane + y1 * res_x + x1,
+                z1 * plane + y0 * res_x + x0,
+                z1 * plane + y0 * res_x + x1,
+                z1 * plane + y1 * res_x + x0,
+                z1 * plane + y1 * res_x + x1,
             ),
             dim=1,
         )
         return indices, weights
 
     def _sample_dynamic_grid_nearest(self, grid, points):
-        resolution = grid.shape[-1]
+        resolution = torch.tensor(
+            self._grid_resolution(grid),
+            device=points.device,
+            dtype=points.dtype,
+        )
         coords = self._normalize_points_unit(points) * (resolution - 1)
-        center = torch.round(coords).long().clamp_(0, resolution - 1)
+        center = torch.round(coords).long()
+        min_index = torch.zeros(3, device=points.device, dtype=torch.long)
+        max_index = (resolution.long() - 1)
+        center = torch.maximum(torch.minimum(center, max_index), min_index)
         x, y, z = center[:, 0], center[:, 1], center[:, 2]
         return grid[0, :, z, y, x].transpose(0, 1).contiguous()
 
@@ -138,11 +194,11 @@ class EulerField(nn.Module):
         if view_direction is None or view_mapper is None or view_scale <= 0.0:
             return static_grid
         channels = static_grid.shape[1]
-        resolution = static_grid.shape[-1]
+        depth, height, width = static_grid.shape[-3:]
         features = static_grid.permute(0, 2, 3, 4, 1).reshape(-1, channels)
         view_dirs = view_direction.expand(features.shape[0], -1)
         feature_delta = view_mapper(torch.cat((features, view_dirs), dim=1))
-        feature_delta = feature_delta.view(1, resolution, resolution, resolution, channels)
+        feature_delta = feature_delta.view(1, depth, height, width, channels)
         feature_delta = feature_delta.permute(0, 4, 1, 2, 3).contiguous()
         return static_grid + view_scale * feature_delta
 

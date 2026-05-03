@@ -142,6 +142,12 @@ class Scene:
             for cam in self.test_cameras[resolution_scale]:
                 cam.fisheyemapper = self.fisheyemapper[cam.image_name]
 
+        if hasattr(self.gaussians, "set_field_camera_scale_hints"):
+            field_scale_cameras = []
+            for cameras in self.train_cameras.values():
+                field_scale_cameras.extend(cameras)
+            self.gaussians.set_field_camera_scale_hints(field_scale_cameras)
+
        
         if self.loaded_iter :
             self.gaussians.load_ply(os.path.join(self.model_path,
