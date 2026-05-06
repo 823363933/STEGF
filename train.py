@@ -45,6 +45,54 @@ from argparse import Namespace
 from thirdparty.gaussian_splatting.helper3dg import getparser, getrenderparts
 
 
+def _jsonable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+def write_stegf_config(args, gaussians):
+    all_args = {key: _jsonable(value) for key, value in vars(args).items()}
+    euler_keys = {
+        key
+        for key in all_args.keys()
+        if key.startswith("field_") or key in {"use_euler_field", "grid_logits_lr"}
+    }
+    euler_grid = {key: all_args[key] for key in sorted(euler_keys)}
+    baseline_gaussian = {
+        key: all_args[key]
+        for key in sorted(all_args.keys())
+        if key not in euler_keys
+    }
+    resolved_euler_grid = {}
+    if hasattr(gaussians, "_checkpoint_field_config"):
+        resolved_euler_grid = _jsonable(gaussians._checkpoint_field_config())
+
+    payload = {
+        "meta": {
+            "command": " ".join(sys.argv),
+            "configpath": all_args.get("configpath"),
+            "model_path": all_args.get("model_path"),
+            "source_path": all_args.get("source_path"),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "baseline_gaussian": baseline_gaussian,
+        "euler_grid": euler_grid,
+        "resolved_euler_grid": resolved_euler_grid,
+    }
+    os.makedirs(args.model_path, exist_ok=True)
+    with open(os.path.join(args.model_path, "stegf_config.json"), "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
 def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration=50, rgbfunction="rgbv1", rdpip="v2"):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
@@ -69,6 +117,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     rbfbasefunction = trbfunction
     scene = Scene(dataset, gaussians, duration=duration, loader=dataset.loader)
+    write_stegf_config(args, gaussians)
     
 
     currentxyz = gaussians._xyz 

@@ -73,6 +73,11 @@ def main():
         default=list(DEFAULT_SCENES),
         help="Scene names to run sequentially.",
     )
+    parser.add_argument(
+        "--scene",
+        choices=DEFAULT_SCENES,
+        help="Run a single default scene. This is a convenience alias for --scenes <scene>.",
+    )
     parser.add_argument("--data_root", default="/root/autodl-tmp", help="Root containing scene folders.")
     parser.add_argument("--output_root", default="/root/autodl-tmp/output", help="Root for scene outputs.")
     parser.add_argument("--config_dir", default="configs/n3d_ours", help="Directory containing <scene>.json configs.")
@@ -86,7 +91,7 @@ def main():
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
-    scenes = list(args.scenes)
+    scenes = [args.scene] if args.scene else list(args.scenes)
     validate_paths(args, scenes, repo_root, dry_run=args.dry_run)
 
     failures = []
