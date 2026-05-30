@@ -33,7 +33,7 @@ from utils.graphics_utils import getProjectionMatrixCV, focal2fov, fov2focal
 
 
 
-def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None, time_conditioned=None):
+def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None, time_conditioned=None, static_radiance_mask=None, iteration=None, render_point_mask=None):
     """
     Render the scene. 
     
@@ -67,6 +67,12 @@ def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
 
     rasterizer = GRzer(raster_settings=raster_settings)
 
+    point_mask = None
+    if render_point_mask is not None:
+        point_mask = render_point_mask.to(device=pc.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if point_mask.shape[0] != pc.get_xyz.shape[0] or torch.count_nonzero(point_mask) == 0:
+            point_mask = None
+
     means2D = screenspace_points
     cov3D_precomp = None
     scales = pc.get_scaling
@@ -79,6 +85,13 @@ def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         )
     else:
         means3D, opacity, rotations, colors_precomp = time_conditioned
+    if point_mask is not None:
+        means3D = means3D[point_mask]
+        means2D = means2D[point_mask]
+        opacity = opacity[point_mask]
+        rotations = rotations[point_mask]
+        colors_precomp = colors_precomp[point_mask]
+        scales = scales[point_mask]
     rendered_image, radii, depth = rasterizer(
         means3D = means3D,
         means2D = means2D,
@@ -89,15 +102,85 @@ def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
         rotations = rotations,
         cov3D_precomp = cov3D_precomp)
 
+    if static_radiance_mask is not None and iteration is not None and hasattr(pc, "static_far_segment_radiance_features"):
+        static_radiance = pc.static_far_segment_radiance_features(
+            viewpoint_camera,
+            depth,
+            static_radiance_mask,
+            iteration,
+        )
+        if static_radiance is not None and static_radiance.shape == rendered_image.shape:
+            rendered_image = rendered_image + static_radiance
+
     rendered_image = pc.rgbdecoder(rendered_image.unsqueeze(0), viewpoint_camera.rays, viewpoint_camera.timestamp) # 1 , 3
     rendered_image = rendered_image.squeeze(0)
+    if point_mask is not None:
+        full_radii = torch.zeros((pc.get_xyz.shape[0],), device=radii.device, dtype=radii.dtype)
+        full_radii[point_mask] = radii
+        full_visibility = full_radii > 0
+        returned_viewspace = screenspace_points
+    else:
+        full_radii = radii
+        full_visibility = radii > 0
+        returned_viewspace = screenspace_points
+
     return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
+            "viewspace_points": returned_viewspace,
+            "visibility_filter" : full_visibility,
+            "radii": full_radii,
             "opacity": opacity,
             "means3D": means3D,
             "depth": depth}
+
+
+@torch.no_grad()
+def observation_contribution_ours_full(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, unreliable_mask, scaling_modifier = 1.0, basicfunction = None, GRsetting=None, GRzer=None, time_conditioned=None):
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GRsetting(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False)
+
+    rasterizer = GRzer(raster_settings=raster_settings)
+    cov3D_precomp = None
+    scales = pc.get_scaling
+    shs = None
+    if time_conditioned is None:
+        means3D, opacity, rotations, colors_precomp = pc.compose_time_conditioned_attributes(
+            viewpoint_camera.timestamp,
+            basicfunction,
+            camera_center=viewpoint_camera.camera_center,
+        )
+    else:
+        means3D, opacity, rotations, colors_precomp = time_conditioned
+
+    contrib_total, contrib_masked, radii = rasterizer.contribution(
+        means3D=means3D.detach(),
+        opacities=opacity.detach(),
+        unreliable_mask=unreliable_mask.detach().to(device=means3D.device, dtype=torch.bool).contiguous(),
+        shs=shs,
+        colors_precomp=colors_precomp.detach(),
+        scales=scales.detach(),
+        rotations=rotations.detach(),
+        cov3D_precomp=cov3D_precomp)
+    return {
+        "contrib_total": contrib_total,
+        "contrib_masked": contrib_masked,
+        "radii": radii,
+        "visibility_filter": radii > 0,
+        "means3D": means3D.detach(),
+        "opacity": opacity.detach(),
+    }
 
 
 

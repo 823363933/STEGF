@@ -62,6 +62,17 @@ namespace FORWARD
 		float* out_color,
 		const float* depth,
 	    float* out_depth);
+
+	void contribution(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* points_xy_image,
+		const float4* conic_opacity,
+		const bool* unreliable_mask,
+		float* contrib_total,
+		float* contrib_masked);
 }
 
 

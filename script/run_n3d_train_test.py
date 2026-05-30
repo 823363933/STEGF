@@ -9,7 +9,7 @@ DEFAULT_SCENES = ("coffee_martini", "cook_spinach")
 
 
 def build_train_command(args, scene, repo_root):
-    return [
+    cmd = [
         sys.executable,
         str(repo_root / "train.py"),
         "--quiet",
@@ -21,14 +21,17 @@ def build_train_command(args, scene, repo_root):
         "--source_path",
         str(Path(args.data_root) / scene / args.colmap_subdir),
         "--save_iterations",
-        str(args.save_iteration),
     ]
+    cmd.extend(str(iteration) for iteration in args.save_iterations)
+    return cmd
 
 
 def build_test_command(args, scene, repo_root):
     return [
         sys.executable,
         str(repo_root / "script" / "test_all_iterations.py"),
+        "--iterations",
+        ",".join(str(iteration) for iteration in args.save_iterations),
         "--quiet",
         "--eval",
         "--skip_train",
@@ -82,7 +85,13 @@ def main():
     parser.add_argument("--output_root", default="/root/autodl-tmp/output", help="Root for scene outputs.")
     parser.add_argument("--config_dir", default="configs/n3d_ours", help="Directory containing <scene>.json configs.")
     parser.add_argument("--colmap_subdir", default="colmap_0", help="Scene subdirectory used as --source_path.")
-    parser.add_argument("--save_iteration", type=int, default=30000, help="Single checkpoint iteration to save.")
+    parser.add_argument(
+        "--save_iterations",
+        nargs="+",
+        type=int,
+        default=[20000, 30000],
+        help="Checkpoint iterations to save and then test.",
+    )
     parser.add_argument("--valloader", default="colmapvalid", help="Validation loader passed to test_all_iterations.py.")
     parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
     parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")

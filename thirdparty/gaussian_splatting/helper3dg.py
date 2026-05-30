@@ -59,8 +59,9 @@ def getparser():
     # 2. Get actual user-provided args
     args = parser.parse_args()
 
-    # Optional: append current iteration to save list
-    args.save_iterations.append(args.iterations)  # Only if you use this logic elsewhere
+    # Always save the final iteration, but keep the list stable and unique.
+    args.save_iterations.append(args.iterations)
+    args.save_iterations = list(dict.fromkeys(args.save_iterations))
 
     # 3. Load config if provided
     if os.path.exists(args.configpath) and args.configpath != "None":

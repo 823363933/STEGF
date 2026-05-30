@@ -65,6 +65,7 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self._omega = torch.empty(0)
         self._static_level_logits = torch.empty(0)
+        self._static_radiance_level_logits = torch.empty(0)
         self._dynamic_level_logits = torch.empty(0)
         self._dynamic_level_time_coeff = torch.empty(0)
         self._static_route_logits = torch.empty(0)
@@ -113,6 +114,17 @@ class GaussianModel:
         self.field_gaussian_scale_weight = 1.0
         self.field_pixel_scale_weight = 1.0
         self.field_min_cell_scale = 1.5
+        self.field_bbox_expand_scale = 0.0
+        self.field_bbox_expand_xyz = ""
+        self.field_bbox_extra_min = ""
+        self.field_bbox_extra_max = ""
+        self.field_bbox_preserve_cell_size = True
+        self.field_bbox_frustum_expand = False
+        self.field_bbox_frustum_grid = 5
+        self.field_bbox_frustum_depth_base = "bbox_corners"
+        self.field_bbox_frustum_depth_scales = "1.0,1.5,2.0"
+        self.field_bbox_frustum_margin = 0.0
+        self.field_bbox_frustum_max_expand_xyz = ""
         self.field_feature_dim = 8
         self.field_fourier_degree = 10
         self.field_level_fourier_degree = 2
@@ -136,6 +148,16 @@ class GaussianModel:
         self.field_static_motion_scale = 0.05
         self.field_static_opacity_scale = 0.02
         self.field_static_app_scale = 0.05
+        self.field_static_temporal_residual = False
+        self.field_static_temporal_frames = 50
+        self.field_static_temporal_scale = 1.0
+        self.field_static_radiance_branch = False
+        self.field_static_radiance_start = 3000
+        self.field_static_radiance_warmup = 1000
+        self.field_static_radiance_scale = 0.05
+        self.field_static_radiance_depth_multiplier = 5.0
+        self.field_static_radiance_samples = 4
+        self.field_static_radiance_max_pixels = 0
         self.field_static_use_global_gate = False
         self.field_static_prior_floor = 0.25
         self.field_soft_route_slope = 8.0
@@ -200,6 +222,197 @@ class GaussianModel:
         self.field_temporal_refine_opacity_threshold = 0.2
         self.field_temporal_refine_score_threshold = 0.65
         self.field_temporal_refine_max_ratio = 0.02
+        self.field_bg_prior = False
+        self.field_bg_prior_source = "background"
+        self.field_bg_prior_color_source = "median"
+        self.field_bg_prior_start = 3200
+        self.field_bg_prior_until = 9000
+        self.field_bg_prior_interval = 500
+        self.field_bg_prior_loss_weight = 0.03
+        self.field_bg_prior_visible_threshold = 0.08
+        self.field_bg_prior_stability_threshold = 0.12
+        self.field_bg_prior_error_quantile = 0.97
+        self.field_bg_prior_depth_quantile = 0.80
+        self.field_bg_prior_max_pixels = 1024
+        self.field_bg_prior_num_per_ray = 1
+        self.field_bg_prior_depth_scale = 1.02
+        self.field_bg_prior_depth_values = ""
+        self.field_bg_prior_opacity = 0.05
+        self.field_bg_prior_color_init = "gt"
+        self.field_bg_prior_scale_init = "knn"
+        self.field_bg_prior_fixed_scale = 0.01
+        self.field_bg_prior_hybrid_knn_scale_threshold = 5.0
+        self.field_bg_prior_trbf_center = 0.5
+        self.field_bg_prior_trbf_scale = 0.0
+        self.field_bg_prior_protect_iters = 1500
+        self.field_bg_prior_mature_prune = True
+        self.field_bg_prior_mature_prune_interval = 500
+        self.field_bg_prior_mature_min_opacity = 0.01
+        self.field_bg_prior_mature_min_visibility = 0.01
+        self.field_bg_prior_debug = False
+        self.field_bg_prior_debug_max_events = 0
+        self.field_bg_prior_debug_mode = "first_per_camera"
+        self.field_bg_prior_schedule_mode = "scan"
+        self.field_bg_prior_scan_views_per_event = 2
+        self.field_bg_prior_scan_time_indices = ""
+        self.field_bg_prior_block_size = 32
+        self.field_bg_prior_pixels_per_block = 8
+        self.field_bg_prior_strict_max_pixels = 32
+        self.field_bg_prior_strict_pixels_per_block = 2
+        self.field_bg_prior_recall_max_pixels = 32
+        self.field_bg_prior_recall_pixels_per_block = 2
+        self.field_bg_prior_recall_error_quantile = 0.95
+        self.field_bg_prior_recall_min_visible_ratio = 0.15
+        self.field_bg_prior_recall_min_stable_ratio = 0.35
+        self.field_bg_prior_recall_max_occlusion_ratio = 0.25
+        self.field_bg_prior_unreliable_max_pixels = 32
+        self.field_bg_prior_unreliable_pixels_per_block = 2
+        self.field_bg_prior_unreliable_error_quantile = 0.95
+        self.field_bg_prior_min_visible_ratio = 0.35
+        self.field_bg_prior_min_stable_ratio = 0.65
+        self.field_bg_prior_max_occlusion_ratio = 0.05
+        self.field_bg_prior_occlusion_threshold = 0.12
+        self.field_bg_prior_occlusion_dilate = 7
+        self.field_bg_prior_exposure_robust = True
+        self.field_bg_prior_structural_weight = 0.5
+        self.field_bg_prior_local_window = 31
+        self.field_bg_prior_fixed_depth = True
+        self.field_bg_prior_fixed_depth_ratio = 0.95
+        self.field_bg_prior_depth_max = 15.0
+        self.field_bg_prior_suppress = False
+        self.field_bg_prior_suppress_decay = 0.02
+        self.field_bg_prior_suppress_max_points = 512
+        self.field_bg_prior_suppress_depth_margin = 1.0
+        self.field_bg_prior_suppress_opacity_threshold = 0.05
+        self.field_bg_prior_suppress_scale_quantile = 0.75
+        self.field_bg_prior_clone_split = False
+        self.field_bg_prior_clone_stat_start = 9000
+        self.field_bg_prior_clone_start = 9500
+        self.field_bg_prior_clone_until = 16000
+        self.field_bg_prior_clone_interval = 500
+        self.field_bg_prior_clone_grad_threshold = 0.0002
+        self.field_bg_prior_clone_max_ratio = 0.05
+        self.field_bg_prior_clone_max_points = 3000
+        self.field_bg_prior_clone_min_age = 500
+        self.field_bg_prior_clone_min_opacity = 0.01
+        self.field_bg_prior_clone_min_visibility = 0.0
+        self.field_bg_prior_clone_split_children = 2
+        self.field_bg_prior_keep_split_parent = False
+        self.field_bg_dense_add = False
+        self.field_bg_dense_add_iter = 3000
+        self.field_bg_dense_add_time_indices = "0,12,25,37,49"
+        self.field_bg_dense_depth_base = "render"
+        self.field_bg_dense_depth_scales = "1,1.5,2,2.5,4"
+        self.field_bg_dense_depth_values = ""
+        self.field_bg_dense_mask_source = "instant"
+        self.field_bg_dense_sample_block_size = 3
+        self.field_bg_dense_pixels_per_block = 1
+        self.field_bg_dense_max_pixels_per_camera = 512
+        self.field_bg_dense_debug = False
+        self.field_bg_dense_debug_max_events = 0
+        self.field_bg_dense_da3_filter = False
+        self.field_bg_dense_da3_path = ""
+        self.field_bg_dense_da3_foreground_quantile = 0.45
+        self.field_bg_dense_beit_filter = False
+        self.field_bg_dense_beit_path = ""
+        self.field_bg_dense_beit_band_low = 0.10
+        self.field_bg_dense_beit_band_high = 0.30
+        self.field_bg_dense_beit_threshold = 0.50
+        self.field_bg_dense_cell_dedup = False
+        self.field_bg_dense_dedup_level = 3
+        self.field_bg_dense_max_per_cell = 1
+        self.field_bg_dense_skip_control_at_add_iter = False
+        self.field_bg_dense_clip_to_bbox = False
+        self.field_bg_dense_bbox_clip_margin = 0.999
+        self.field_depthpro_supervision = False
+        self.field_depthpro_path = ""
+        self.field_depthpro_start = 3000
+        self.field_depthpro_until = -1
+        self.field_depthpro_loss_weight = 0.0
+        self.field_depthpro_max_depth = 2.0
+        self.field_depthpro_min_pixels = 256
+        self.field_depthpro_error_clamp = 1.0
+        self.field_depthpro_use_beit_mask = True
+        self.field_depthpro_exclude_unreliable = True
+        self.field_scale_reg = False
+        self.field_scale_reg_start = 9000
+        self.field_scale_reg_until = -1
+        self.field_scale_reg_weight = 0.0
+        self.field_scale_reg_base_limit = 0.3
+        self.field_scale_reg_depth_ref = 8.0
+        self.field_scale_reg_depth_gamma = 0.75
+        self.field_scale_reg_max_boost = 8.0
+        self.field_bg_candidate_grad_boost = False
+        self.field_bg_candidate_feature_grad_scale = 3.0
+        self.field_bg_candidate_opacity_grad_scale = 2.0
+        self.field_bg_candidate_scaling_grad_scale = 1.5
+        self.field_bg_only_train = False
+        self.field_bg_only_start = 3000
+        self.field_bg_only_until = 12000
+        self.field_bg_only_interval = 1
+        self.field_bg_only_loss_weight = 1.0
+        self.field_bg_only_min_pixels = 128
+        self.field_bg_only_da3_filter = True
+        self.field_bg_only_update_modules = False
+        self.field_obs_reliability = False
+        self.field_obs_reliability_floor = 0.35
+        self.field_obs_reliability_mad_threshold = 0.045
+        self.field_obs_reliability_diff_threshold = 0.12
+        self.field_obs_reliability_motion_threshold = 0.12
+        self.field_obs_reliability_mad_weight = 0.40
+        self.field_obs_reliability_diff_weight = 0.40
+        self.field_obs_reliability_motion_weight = 0.20
+        self.field_obs_reliability_unreliable_threshold = 0.55
+        self.field_obs_reliability_debug = False
+        self.field_obs_reliability_start = 1500
+        self.field_obs_reliability_until = -1
+        self.field_obs_reliability_ema = 0.05
+        self.field_obs_reliability_error_quantile = 0.90
+        self.field_obs_reliability_error_threshold = 0.0
+        self.field_obs_reliability_min_error = 0.03
+        self.field_obs_reliability_dynamic_dilate = 5
+        self.field_obs_reliability_structural_weight = 0.5
+        self.field_obs_reliability_local_window = 31
+        self.field_obs_boost_unreliable_loss = False
+        self.field_obs_boost_weight = 2.0
+        self.field_obs_reset = False
+        self.field_obs_reset_mode = "batch"
+        self.field_obs_reset_start = 1500
+        self.field_obs_reset_until = 9000
+        self.field_obs_reset_interval = 500
+        self.field_obs_reset_schedule = ""
+        self.field_obs_reset_opacity = 0.01
+        self.field_obs_reset_min_opacity = 0.05
+        self.field_obs_reset_max_points = 512
+        self.field_obs_reset_selection_mode = "center"
+        self.field_obs_reset_min_masked_contrib = 0.0
+        self.field_obs_reset_min_contrib_ratio = 0.05
+        self.field_obs_reset_debug = False
+        self.field_obs_reset_debug_max_events = 32
+        self.field_obs_reset_log_zero = True
+        self.field_obs_reset_scan_time_indices = "0,12,25,37,49"
+        self.field_obs_reset_scan_views_per_time = 0
+        self.field_obs_reset_scan_min_hits = 2
+        self.field_obs_reset_scan_top_ratio = 0.2
+        self.field_obs_reset_scan_max_points = 0
+        self.field_obs_reset_scan_update_ema = False
+        self.field_global_reset = False
+        self.field_global_reset_schedule = ""
+        self.field_freq_prior = False
+        self.field_freq_prior_start = 3500
+        self.field_freq_prior_until = 12000
+        self.field_freq_prior_weight = 0.01
+        self.field_freq_prior_patch_size = 32
+        self.field_freq_prior_highpass = 0.25
+        self.field_freq_prior_max_patches = 16
+        self.field_freq_prior_min_mask_ratio = 0.05
+        self.field_freq_prior_reference = "median"
+        self.field_freq_prior_on_reset_only = False
+        self.field_freq_prior_debug = False
+        self.field_freq_prior_debug_max_events = 32
+        self.field_freq_prior_debug_mode = "first_per_camera"
+        self.field_bg_median_loss = False
+        self.field_bg_median_loss_weight = 0.05
         self.field_stage = "baseline_warmup"
         self.field_current_iteration = 0
         self._dynamic_score_ema = torch.empty(0)
@@ -213,6 +426,8 @@ class GaussianModel:
         self._static_support_ema = torch.empty(0)
         self._static_support_mask = torch.empty(0)
         self._visibility_persistence_ema = torch.empty(0)
+        self._bg_candidate_mask = torch.empty(0)
+        self._bg_birth_iter = torch.empty(0)
         self._last_field_aux = {}
         self._field_camera_scale_hints = []
         self._field_resolution_stats = {}
@@ -977,6 +1192,17 @@ class GaussianModel:
         self.field_gaussian_scale_weight = float(getattr(args, "field_gaussian_scale_weight", 1.0))
         self.field_pixel_scale_weight = float(getattr(args, "field_pixel_scale_weight", 1.0))
         self.field_min_cell_scale = float(getattr(args, "field_min_cell_scale", 1.5))
+        self.field_bbox_expand_scale = float(getattr(args, "field_bbox_expand_scale", 0.0))
+        self.field_bbox_expand_xyz = getattr(args, "field_bbox_expand_xyz", "")
+        self.field_bbox_extra_min = getattr(args, "field_bbox_extra_min", "")
+        self.field_bbox_extra_max = getattr(args, "field_bbox_extra_max", "")
+        self.field_bbox_preserve_cell_size = bool(getattr(args, "field_bbox_preserve_cell_size", 1))
+        self.field_bbox_frustum_expand = bool(getattr(args, "field_bbox_frustum_expand", 0))
+        self.field_bbox_frustum_grid = int(getattr(args, "field_bbox_frustum_grid", 5))
+        self.field_bbox_frustum_depth_base = str(getattr(args, "field_bbox_frustum_depth_base", "bbox_corners"))
+        self.field_bbox_frustum_depth_scales = str(getattr(args, "field_bbox_frustum_depth_scales", "1.0,1.5,2.0"))
+        self.field_bbox_frustum_margin = float(getattr(args, "field_bbox_frustum_margin", 0.0))
+        self.field_bbox_frustum_max_expand_xyz = getattr(args, "field_bbox_frustum_max_expand_xyz", "")
         self.field_feature_dim = int(getattr(args, "field_feature_dim", 8))
         self.field_fourier_degree = int(getattr(args, "field_fourier_degree", 10))
         self.field_level_fourier_degree = int(getattr(args, "field_level_fourier_degree", 2))
@@ -1000,6 +1226,16 @@ class GaussianModel:
         self.field_static_motion_scale = float(getattr(args, "field_static_motion_scale", 0.05))
         self.field_static_opacity_scale = float(getattr(args, "field_static_opacity_scale", 0.02))
         self.field_static_app_scale = float(getattr(args, "field_static_app_scale", 0.05))
+        self.field_static_temporal_residual = bool(getattr(args, "field_static_temporal_residual", 0))
+        self.field_static_temporal_frames = int(getattr(args, "field_static_temporal_frames", getattr(args, "duration", 50)))
+        self.field_static_temporal_scale = float(getattr(args, "field_static_temporal_scale", 1.0))
+        self.field_static_radiance_branch = bool(getattr(args, "field_static_radiance_branch", 0))
+        self.field_static_radiance_start = int(getattr(args, "field_static_radiance_start", 3000))
+        self.field_static_radiance_warmup = int(getattr(args, "field_static_radiance_warmup", 1000))
+        self.field_static_radiance_scale = float(getattr(args, "field_static_radiance_scale", 0.05))
+        self.field_static_radiance_depth_multiplier = float(getattr(args, "field_static_radiance_depth_multiplier", 5.0))
+        self.field_static_radiance_samples = int(getattr(args, "field_static_radiance_samples", 4))
+        self.field_static_radiance_max_pixels = int(getattr(args, "field_static_radiance_max_pixels", 0))
         self.field_static_use_global_gate = bool(getattr(args, "field_static_use_global_gate", 0))
         self.field_static_prior_floor = float(getattr(args, "field_static_prior_floor", 0.25))
         self.field_soft_route_slope = float(getattr(args, "field_soft_route_slope", 8.0))
@@ -1064,6 +1300,197 @@ class GaussianModel:
         self.field_temporal_refine_opacity_threshold = float(getattr(args, "field_temporal_refine_opacity_threshold", 0.2))
         self.field_temporal_refine_score_threshold = float(getattr(args, "field_temporal_refine_score_threshold", 0.65))
         self.field_temporal_refine_max_ratio = float(getattr(args, "field_temporal_refine_max_ratio", 0.02))
+        self.field_bg_prior = bool(getattr(args, "field_bg_prior", 0))
+        self.field_bg_prior_source = str(getattr(args, "field_bg_prior_source", "background"))
+        self.field_bg_prior_color_source = str(getattr(args, "field_bg_prior_color_source", "median"))
+        self.field_bg_prior_start = int(getattr(args, "field_bg_prior_start", 3200))
+        self.field_bg_prior_until = int(getattr(args, "field_bg_prior_until", 9000))
+        self.field_bg_prior_interval = int(getattr(args, "field_bg_prior_interval", 500))
+        self.field_bg_prior_loss_weight = float(getattr(args, "field_bg_prior_loss_weight", 0.03))
+        self.field_bg_prior_visible_threshold = float(getattr(args, "field_bg_prior_visible_threshold", 0.08))
+        self.field_bg_prior_stability_threshold = float(getattr(args, "field_bg_prior_stability_threshold", 0.12))
+        self.field_bg_prior_error_quantile = float(getattr(args, "field_bg_prior_error_quantile", 0.97))
+        self.field_bg_prior_depth_quantile = float(getattr(args, "field_bg_prior_depth_quantile", 0.80))
+        self.field_bg_prior_max_pixels = int(getattr(args, "field_bg_prior_max_pixels", 1024))
+        self.field_bg_prior_num_per_ray = int(getattr(args, "field_bg_prior_num_per_ray", 1))
+        self.field_bg_prior_depth_scale = float(getattr(args, "field_bg_prior_depth_scale", 1.02))
+        self.field_bg_prior_depth_values = str(getattr(args, "field_bg_prior_depth_values", ""))
+        self.field_bg_prior_opacity = float(getattr(args, "field_bg_prior_opacity", 0.05))
+        self.field_bg_prior_color_init = str(getattr(args, "field_bg_prior_color_init", "gt"))
+        self.field_bg_prior_scale_init = str(getattr(args, "field_bg_prior_scale_init", "knn"))
+        self.field_bg_prior_fixed_scale = float(getattr(args, "field_bg_prior_fixed_scale", 0.01))
+        self.field_bg_prior_hybrid_knn_scale_threshold = float(getattr(args, "field_bg_prior_hybrid_knn_scale_threshold", 5.0))
+        self.field_bg_prior_trbf_center = float(getattr(args, "field_bg_prior_trbf_center", 0.5))
+        self.field_bg_prior_trbf_scale = float(getattr(args, "field_bg_prior_trbf_scale", 0.0))
+        self.field_bg_prior_protect_iters = int(getattr(args, "field_bg_prior_protect_iters", 1500))
+        self.field_bg_prior_mature_prune = bool(getattr(args, "field_bg_prior_mature_prune", 1))
+        self.field_bg_prior_mature_prune_interval = int(getattr(args, "field_bg_prior_mature_prune_interval", 500))
+        self.field_bg_prior_mature_min_opacity = float(getattr(args, "field_bg_prior_mature_min_opacity", 0.01))
+        self.field_bg_prior_mature_min_visibility = float(getattr(args, "field_bg_prior_mature_min_visibility", 0.01))
+        self.field_bg_prior_debug = bool(getattr(args, "field_bg_prior_debug", 0))
+        self.field_bg_prior_debug_max_events = int(getattr(args, "field_bg_prior_debug_max_events", 0))
+        self.field_bg_prior_debug_mode = str(getattr(args, "field_bg_prior_debug_mode", "first_per_camera"))
+        self.field_bg_prior_schedule_mode = str(getattr(args, "field_bg_prior_schedule_mode", "scan"))
+        self.field_bg_prior_scan_views_per_event = int(getattr(args, "field_bg_prior_scan_views_per_event", 2))
+        self.field_bg_prior_scan_time_indices = str(getattr(args, "field_bg_prior_scan_time_indices", ""))
+        self.field_bg_prior_block_size = int(getattr(args, "field_bg_prior_block_size", 32))
+        self.field_bg_prior_pixels_per_block = int(getattr(args, "field_bg_prior_pixels_per_block", 8))
+        self.field_bg_prior_strict_max_pixels = int(getattr(args, "field_bg_prior_strict_max_pixels", 32))
+        self.field_bg_prior_strict_pixels_per_block = int(getattr(args, "field_bg_prior_strict_pixels_per_block", 2))
+        self.field_bg_prior_recall_max_pixels = int(getattr(args, "field_bg_prior_recall_max_pixels", 32))
+        self.field_bg_prior_recall_pixels_per_block = int(getattr(args, "field_bg_prior_recall_pixels_per_block", 2))
+        self.field_bg_prior_recall_error_quantile = float(getattr(args, "field_bg_prior_recall_error_quantile", 0.95))
+        self.field_bg_prior_recall_min_visible_ratio = float(getattr(args, "field_bg_prior_recall_min_visible_ratio", 0.15))
+        self.field_bg_prior_recall_min_stable_ratio = float(getattr(args, "field_bg_prior_recall_min_stable_ratio", 0.35))
+        self.field_bg_prior_recall_max_occlusion_ratio = float(getattr(args, "field_bg_prior_recall_max_occlusion_ratio", 0.25))
+        self.field_bg_prior_unreliable_max_pixels = int(getattr(args, "field_bg_prior_unreliable_max_pixels", 32))
+        self.field_bg_prior_unreliable_pixels_per_block = int(getattr(args, "field_bg_prior_unreliable_pixels_per_block", 2))
+        self.field_bg_prior_unreliable_error_quantile = float(getattr(args, "field_bg_prior_unreliable_error_quantile", 0.95))
+        self.field_bg_prior_min_visible_ratio = float(getattr(args, "field_bg_prior_min_visible_ratio", 0.35))
+        self.field_bg_prior_min_stable_ratio = float(getattr(args, "field_bg_prior_min_stable_ratio", 0.65))
+        self.field_bg_prior_max_occlusion_ratio = float(getattr(args, "field_bg_prior_max_occlusion_ratio", 0.05))
+        self.field_bg_prior_occlusion_threshold = float(getattr(args, "field_bg_prior_occlusion_threshold", 0.12))
+        self.field_bg_prior_occlusion_dilate = int(getattr(args, "field_bg_prior_occlusion_dilate", 7))
+        self.field_bg_prior_exposure_robust = bool(getattr(args, "field_bg_prior_exposure_robust", 1))
+        self.field_bg_prior_structural_weight = float(getattr(args, "field_bg_prior_structural_weight", 0.5))
+        self.field_bg_prior_local_window = int(getattr(args, "field_bg_prior_local_window", 31))
+        self.field_bg_prior_fixed_depth = bool(getattr(args, "field_bg_prior_fixed_depth", 1))
+        self.field_bg_prior_fixed_depth_ratio = float(getattr(args, "field_bg_prior_fixed_depth_ratio", 0.95))
+        self.field_bg_prior_depth_max = float(getattr(args, "field_bg_prior_depth_max", 15.0))
+        self.field_bg_prior_suppress = bool(getattr(args, "field_bg_prior_suppress", 0))
+        self.field_bg_prior_suppress_decay = float(getattr(args, "field_bg_prior_suppress_decay", 0.02))
+        self.field_bg_prior_suppress_max_points = int(getattr(args, "field_bg_prior_suppress_max_points", 512))
+        self.field_bg_prior_suppress_depth_margin = float(getattr(args, "field_bg_prior_suppress_depth_margin", 1.0))
+        self.field_bg_prior_suppress_opacity_threshold = float(getattr(args, "field_bg_prior_suppress_opacity_threshold", 0.05))
+        self.field_bg_prior_suppress_scale_quantile = float(getattr(args, "field_bg_prior_suppress_scale_quantile", 0.75))
+        self.field_bg_prior_clone_split = bool(getattr(args, "field_bg_prior_clone_split", 0))
+        self.field_bg_prior_clone_stat_start = int(getattr(args, "field_bg_prior_clone_stat_start", 9000))
+        self.field_bg_prior_clone_start = int(getattr(args, "field_bg_prior_clone_start", 9500))
+        self.field_bg_prior_clone_until = int(getattr(args, "field_bg_prior_clone_until", 16000))
+        self.field_bg_prior_clone_interval = int(getattr(args, "field_bg_prior_clone_interval", 500))
+        self.field_bg_prior_clone_grad_threshold = float(getattr(args, "field_bg_prior_clone_grad_threshold", 0.0002))
+        self.field_bg_prior_clone_max_ratio = float(getattr(args, "field_bg_prior_clone_max_ratio", 0.05))
+        self.field_bg_prior_clone_max_points = int(getattr(args, "field_bg_prior_clone_max_points", 3000))
+        self.field_bg_prior_clone_min_age = int(getattr(args, "field_bg_prior_clone_min_age", 500))
+        self.field_bg_prior_clone_min_opacity = float(getattr(args, "field_bg_prior_clone_min_opacity", 0.01))
+        self.field_bg_prior_clone_min_visibility = float(getattr(args, "field_bg_prior_clone_min_visibility", 0.0))
+        self.field_bg_prior_clone_split_children = int(getattr(args, "field_bg_prior_clone_split_children", 2))
+        self.field_bg_prior_keep_split_parent = bool(getattr(args, "field_bg_prior_keep_split_parent", 0))
+        self.field_bg_dense_add = bool(getattr(args, "field_bg_dense_add", 0))
+        self.field_bg_dense_add_iter = int(getattr(args, "field_bg_dense_add_iter", 3000))
+        self.field_bg_dense_add_time_indices = str(getattr(args, "field_bg_dense_add_time_indices", "0,12,25,37,49"))
+        self.field_bg_dense_depth_base = str(getattr(args, "field_bg_dense_depth_base", "render"))
+        self.field_bg_dense_depth_scales = str(getattr(args, "field_bg_dense_depth_scales", "1,1.5,2,2.5,4"))
+        self.field_bg_dense_depth_values = str(getattr(args, "field_bg_dense_depth_values", ""))
+        self.field_bg_dense_mask_source = str(getattr(args, "field_bg_dense_mask_source", "instant"))
+        self.field_bg_dense_sample_block_size = int(getattr(args, "field_bg_dense_sample_block_size", 3))
+        self.field_bg_dense_pixels_per_block = int(getattr(args, "field_bg_dense_pixels_per_block", 1))
+        self.field_bg_dense_max_pixels_per_camera = int(getattr(args, "field_bg_dense_max_pixels_per_camera", 512))
+        self.field_bg_dense_debug = bool(getattr(args, "field_bg_dense_debug", 0))
+        self.field_bg_dense_debug_max_events = int(getattr(args, "field_bg_dense_debug_max_events", 0))
+        self.field_bg_dense_da3_filter = bool(getattr(args, "field_bg_dense_da3_filter", 0))
+        self.field_bg_dense_da3_path = str(getattr(args, "field_bg_dense_da3_path", ""))
+        self.field_bg_dense_da3_foreground_quantile = float(getattr(args, "field_bg_dense_da3_foreground_quantile", 0.45))
+        self.field_bg_dense_beit_filter = bool(getattr(args, "field_bg_dense_beit_filter", 0))
+        self.field_bg_dense_beit_path = str(getattr(args, "field_bg_dense_beit_path", ""))
+        self.field_bg_dense_beit_band_low = float(getattr(args, "field_bg_dense_beit_band_low", 0.10))
+        self.field_bg_dense_beit_band_high = float(getattr(args, "field_bg_dense_beit_band_high", 0.30))
+        self.field_bg_dense_beit_threshold = float(getattr(args, "field_bg_dense_beit_threshold", 0.50))
+        self.field_bg_dense_cell_dedup = bool(getattr(args, "field_bg_dense_cell_dedup", 0))
+        self.field_bg_dense_dedup_level = int(getattr(args, "field_bg_dense_dedup_level", 3))
+        self.field_bg_dense_max_per_cell = int(getattr(args, "field_bg_dense_max_per_cell", 1))
+        self.field_bg_dense_skip_control_at_add_iter = bool(getattr(args, "field_bg_dense_skip_control_at_add_iter", 0))
+        self.field_bg_dense_clip_to_bbox = bool(getattr(args, "field_bg_dense_clip_to_bbox", 0))
+        self.field_bg_dense_bbox_clip_margin = float(getattr(args, "field_bg_dense_bbox_clip_margin", 0.999))
+        self.field_depthpro_supervision = bool(getattr(args, "field_depthpro_supervision", 0))
+        self.field_depthpro_path = str(getattr(args, "field_depthpro_path", ""))
+        self.field_depthpro_start = int(getattr(args, "field_depthpro_start", 3000))
+        self.field_depthpro_until = int(getattr(args, "field_depthpro_until", -1))
+        self.field_depthpro_loss_weight = float(getattr(args, "field_depthpro_loss_weight", 0.0))
+        self.field_depthpro_max_depth = float(getattr(args, "field_depthpro_max_depth", 2.0))
+        self.field_depthpro_min_pixels = int(getattr(args, "field_depthpro_min_pixels", 256))
+        self.field_depthpro_error_clamp = float(getattr(args, "field_depthpro_error_clamp", 1.0))
+        self.field_depthpro_use_beit_mask = bool(getattr(args, "field_depthpro_use_beit_mask", 1))
+        self.field_depthpro_exclude_unreliable = bool(getattr(args, "field_depthpro_exclude_unreliable", 1))
+        self.field_scale_reg = bool(getattr(args, "field_scale_reg", 0))
+        self.field_scale_reg_start = int(getattr(args, "field_scale_reg_start", 9000))
+        self.field_scale_reg_until = int(getattr(args, "field_scale_reg_until", -1))
+        self.field_scale_reg_weight = float(getattr(args, "field_scale_reg_weight", 0.0))
+        self.field_scale_reg_base_limit = float(getattr(args, "field_scale_reg_base_limit", 0.3))
+        self.field_scale_reg_depth_ref = float(getattr(args, "field_scale_reg_depth_ref", 8.0))
+        self.field_scale_reg_depth_gamma = float(getattr(args, "field_scale_reg_depth_gamma", 0.75))
+        self.field_scale_reg_max_boost = float(getattr(args, "field_scale_reg_max_boost", 8.0))
+        self.field_bg_candidate_grad_boost = bool(getattr(args, "field_bg_candidate_grad_boost", 0))
+        self.field_bg_candidate_feature_grad_scale = float(getattr(args, "field_bg_candidate_feature_grad_scale", 3.0))
+        self.field_bg_candidate_opacity_grad_scale = float(getattr(args, "field_bg_candidate_opacity_grad_scale", 2.0))
+        self.field_bg_candidate_scaling_grad_scale = float(getattr(args, "field_bg_candidate_scaling_grad_scale", 1.5))
+        self.field_bg_only_train = bool(getattr(args, "field_bg_only_train", 0))
+        self.field_bg_only_start = int(getattr(args, "field_bg_only_start", 3000))
+        self.field_bg_only_until = int(getattr(args, "field_bg_only_until", 12000))
+        self.field_bg_only_interval = int(getattr(args, "field_bg_only_interval", 1))
+        self.field_bg_only_loss_weight = float(getattr(args, "field_bg_only_loss_weight", 1.0))
+        self.field_bg_only_min_pixels = int(getattr(args, "field_bg_only_min_pixels", 128))
+        self.field_bg_only_da3_filter = bool(getattr(args, "field_bg_only_da3_filter", 1))
+        self.field_bg_only_update_modules = bool(getattr(args, "field_bg_only_update_modules", 0))
+        self.field_obs_reliability = bool(getattr(args, "field_obs_reliability", 0))
+        self.field_obs_reliability_floor = float(getattr(args, "field_obs_reliability_floor", 0.35))
+        self.field_obs_reliability_mad_threshold = float(getattr(args, "field_obs_reliability_mad_threshold", 0.045))
+        self.field_obs_reliability_diff_threshold = float(getattr(args, "field_obs_reliability_diff_threshold", 0.12))
+        self.field_obs_reliability_motion_threshold = float(getattr(args, "field_obs_reliability_motion_threshold", 0.12))
+        self.field_obs_reliability_mad_weight = float(getattr(args, "field_obs_reliability_mad_weight", 0.40))
+        self.field_obs_reliability_diff_weight = float(getattr(args, "field_obs_reliability_diff_weight", 0.40))
+        self.field_obs_reliability_motion_weight = float(getattr(args, "field_obs_reliability_motion_weight", 0.20))
+        self.field_obs_reliability_unreliable_threshold = float(getattr(args, "field_obs_reliability_unreliable_threshold", 0.55))
+        self.field_obs_reliability_debug = bool(getattr(args, "field_obs_reliability_debug", 0))
+        self.field_obs_reliability_start = int(getattr(args, "field_obs_reliability_start", 1500))
+        self.field_obs_reliability_until = int(getattr(args, "field_obs_reliability_until", -1))
+        self.field_obs_reliability_ema = float(getattr(args, "field_obs_reliability_ema", 0.05))
+        self.field_obs_reliability_error_quantile = float(getattr(args, "field_obs_reliability_error_quantile", 0.90))
+        self.field_obs_reliability_error_threshold = float(getattr(args, "field_obs_reliability_error_threshold", 0.0))
+        self.field_obs_reliability_min_error = float(getattr(args, "field_obs_reliability_min_error", 0.03))
+        self.field_obs_reliability_dynamic_dilate = int(getattr(args, "field_obs_reliability_dynamic_dilate", 5))
+        self.field_obs_reliability_structural_weight = float(getattr(args, "field_obs_reliability_structural_weight", 0.5))
+        self.field_obs_reliability_local_window = int(getattr(args, "field_obs_reliability_local_window", 31))
+        self.field_obs_boost_unreliable_loss = bool(getattr(args, "field_obs_boost_unreliable_loss", 0))
+        self.field_obs_boost_weight = float(getattr(args, "field_obs_boost_weight", 2.0))
+        self.field_obs_reset = bool(getattr(args, "field_obs_reset", 0))
+        self.field_obs_reset_mode = str(getattr(args, "field_obs_reset_mode", "batch"))
+        self.field_obs_reset_start = int(getattr(args, "field_obs_reset_start", 1500))
+        self.field_obs_reset_until = int(getattr(args, "field_obs_reset_until", 9000))
+        self.field_obs_reset_interval = int(getattr(args, "field_obs_reset_interval", 500))
+        self.field_obs_reset_schedule = str(getattr(args, "field_obs_reset_schedule", ""))
+        self.field_obs_reset_opacity = float(getattr(args, "field_obs_reset_opacity", 0.01))
+        self.field_obs_reset_min_opacity = float(getattr(args, "field_obs_reset_min_opacity", 0.05))
+        self.field_obs_reset_max_points = int(getattr(args, "field_obs_reset_max_points", 512))
+        self.field_obs_reset_selection_mode = str(getattr(args, "field_obs_reset_selection_mode", "center"))
+        self.field_obs_reset_min_masked_contrib = float(getattr(args, "field_obs_reset_min_masked_contrib", 0.0))
+        self.field_obs_reset_min_contrib_ratio = float(getattr(args, "field_obs_reset_min_contrib_ratio", 0.05))
+        self.field_obs_reset_debug = bool(getattr(args, "field_obs_reset_debug", 0))
+        self.field_obs_reset_debug_max_events = int(getattr(args, "field_obs_reset_debug_max_events", 32))
+        self.field_obs_reset_log_zero = bool(getattr(args, "field_obs_reset_log_zero", 1))
+        self.field_obs_reset_scan_time_indices = str(getattr(args, "field_obs_reset_scan_time_indices", "0,12,25,37,49"))
+        self.field_obs_reset_scan_views_per_time = int(getattr(args, "field_obs_reset_scan_views_per_time", 0))
+        self.field_obs_reset_scan_min_hits = int(getattr(args, "field_obs_reset_scan_min_hits", 2))
+        self.field_obs_reset_scan_top_ratio = float(getattr(args, "field_obs_reset_scan_top_ratio", 0.2))
+        self.field_obs_reset_scan_max_points = int(getattr(args, "field_obs_reset_scan_max_points", 0))
+        self.field_obs_reset_scan_update_ema = bool(getattr(args, "field_obs_reset_scan_update_ema", 0))
+        self.field_global_reset = bool(getattr(args, "field_global_reset", 0))
+        self.field_global_reset_schedule = str(getattr(args, "field_global_reset_schedule", ""))
+        self.field_freq_prior = bool(getattr(args, "field_freq_prior", 0))
+        self.field_freq_prior_start = int(getattr(args, "field_freq_prior_start", 3500))
+        self.field_freq_prior_until = int(getattr(args, "field_freq_prior_until", 12000))
+        self.field_freq_prior_weight = float(getattr(args, "field_freq_prior_weight", 0.01))
+        self.field_freq_prior_patch_size = int(getattr(args, "field_freq_prior_patch_size", 32))
+        self.field_freq_prior_highpass = float(getattr(args, "field_freq_prior_highpass", 0.25))
+        self.field_freq_prior_max_patches = int(getattr(args, "field_freq_prior_max_patches", 16))
+        self.field_freq_prior_min_mask_ratio = float(getattr(args, "field_freq_prior_min_mask_ratio", 0.05))
+        self.field_freq_prior_reference = str(getattr(args, "field_freq_prior_reference", "median"))
+        self.field_freq_prior_on_reset_only = bool(getattr(args, "field_freq_prior_on_reset_only", 0))
+        self.field_freq_prior_debug = bool(getattr(args, "field_freq_prior_debug", 0))
+        self.field_freq_prior_debug_max_events = int(getattr(args, "field_freq_prior_debug_max_events", 32))
+        self.field_freq_prior_debug_mode = str(getattr(args, "field_freq_prior_debug_mode", "first_per_camera"))
+        self.field_bg_median_loss = bool(getattr(args, "field_bg_median_loss", 0))
+        self.field_bg_median_loss_weight = float(getattr(args, "field_bg_median_loss_weight", 0.05))
 
     def set_field_camera_scale_hints(self, cameras):
         self._field_camera_scale_hints = []
@@ -1071,9 +1498,17 @@ class GaussianModel:
             camera_center = getattr(camera, "camera_center", None)
             if camera_center is None:
                 continue
+            camera_to_world = None
+            world_view_transform = getattr(camera, "world_view_transform", None)
+            if world_view_transform is not None:
+                try:
+                    camera_to_world = world_view_transform.detach().float().cpu().T.inverse()
+                except Exception:
+                    camera_to_world = None
             self._field_camera_scale_hints.append(
                 {
                     "center": camera_center.detach().float().cpu(),
+                    "c2w_rotation": None if camera_to_world is None else camera_to_world[:3, :3].contiguous(),
                     "fovx": float(getattr(camera, "FoVx", 0.0)),
                     "fovy": float(getattr(camera, "FoVy", 0.0)),
                     "width": int(getattr(camera, "image_width", 0)),
@@ -1116,6 +1551,226 @@ class GaussianModel:
     @staticmethod
     def _format_field_level_resolutions(resolutions):
         return ";".join("{}x{}x{}".format(*resolution) for resolution in resolutions)
+
+    @staticmethod
+    def _parse_field_bbox_vector(value, device, dtype, name):
+        if value is None:
+            return torch.zeros(3, device=device, dtype=dtype)
+        if torch.is_tensor(value):
+            values = value.detach().to(device=device, dtype=dtype).reshape(-1)
+        elif isinstance(value, (list, tuple)):
+            values = torch.tensor([float(v) for v in value], device=device, dtype=dtype).reshape(-1)
+        else:
+            text = str(value).strip()
+            if not text:
+                return torch.zeros(3, device=device, dtype=dtype)
+            for sep in (";", "x", "X"):
+                text = text.replace(sep, ",")
+            parts = [part.strip() for part in text.split(",") if part.strip()]
+            values = torch.tensor([float(part) for part in parts], device=device, dtype=dtype)
+        if values.numel() == 1:
+            values = values.repeat(3)
+        if values.numel() != 3:
+            raise ValueError(f"{name} expects 1 or 3 values, got {values.numel()}: {value}")
+        return values.view(3)
+
+    @staticmethod
+    def _parse_field_float_list(value, default, name):
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return list(default)
+            for sep in (";", "x", "X", "|"):
+                text = text.replace(sep, ",")
+            parts = [part.strip() for part in text.split(",") if part.strip()]
+            values = [float(part) for part in parts]
+        elif isinstance(value, (list, tuple)):
+            values = [float(part) for part in value]
+        else:
+            values = [float(value)]
+        values = [v for v in values if math.isfinite(v) and v > 0.0]
+        if not values:
+            raise ValueError(f"{name} must contain at least one positive finite value: {value}")
+        return values
+
+    def _sample_field_frustum_bbox_points(self, bbox_min, bbox_max):
+        if not bool(getattr(self, "field_bbox_frustum_expand", False)):
+            return None, {}
+        if not self._field_camera_scale_hints:
+            return None, {"enabled": True, "points": 0, "reason": "no_camera_hints"}
+
+        device = bbox_min.device
+        dtype = bbox_min.dtype
+        span = torch.clamp(bbox_max - bbox_min, min=1e-6)
+        bbox_center = 0.5 * (bbox_min + bbox_max)
+        bbox_diag = torch.linalg.norm(span).clamp_min(1e-6)
+        bbox_max_span = torch.max(span).clamp_min(1e-6)
+        corners = torch.stack(
+            [
+                torch.stack((x, y, z))
+                for x in (bbox_min[0], bbox_max[0])
+                for y in (bbox_min[1], bbox_max[1])
+                for z in (bbox_min[2], bbox_max[2])
+            ],
+            dim=0,
+        )
+
+        grid = max(int(getattr(self, "field_bbox_frustum_grid", 5)), 2)
+        coords = torch.linspace(-1.0, 1.0, grid, device=device, dtype=dtype)
+        depth_scales = self._parse_field_float_list(
+            getattr(self, "field_bbox_frustum_depth_scales", "1.0,1.5,2.0"),
+            default=[1.0, 1.5, 2.0],
+            name="field_bbox_frustum_depth_scales",
+        )
+        depth_mode = str(getattr(self, "field_bbox_frustum_depth_base", "bbox_corners")).lower()
+        points = []
+        base_depths = []
+        used_cameras = 0
+
+        for hint in self._field_camera_scale_hints:
+            rotation = hint.get("c2w_rotation", None)
+            if rotation is None:
+                continue
+            fovx = float(hint.get("fovx", 0.0))
+            fovy = float(hint.get("fovy", 0.0))
+            if not (math.isfinite(fovx) and math.isfinite(fovy) and fovx > 0.0 and fovy > 0.0):
+                continue
+            center = hint["center"].to(device=device, dtype=dtype)
+            rotation = rotation.to(device=device, dtype=dtype)
+
+            if depth_mode in ("diag", "bbox_diag"):
+                base_depth = bbox_diag
+            elif depth_mode in ("span", "max_span", "bbox_span"):
+                base_depth = bbox_max_span
+            elif depth_mode in ("center", "bbox_center"):
+                base_depth = torch.linalg.norm(bbox_center - center).clamp_min(1e-6)
+            else:
+                local_corners = (corners - center.view(1, 3)) @ rotation
+                positive_z = local_corners[:, 2][local_corners[:, 2] > 1e-6]
+                if positive_z.numel() > 0:
+                    base_depth = positive_z.max().clamp_min(1e-6)
+                else:
+                    base_depth = torch.linalg.norm(corners - center.view(1, 3), dim=1).max().clamp_min(1e-6)
+
+            tanx = math.tan(0.5 * fovx)
+            tany = math.tan(0.5 * fovy)
+            base_depths.append(float(base_depth.detach().cpu().item()))
+            used_cameras += 1
+
+            for scale in depth_scales:
+                depth = base_depth * float(scale)
+                local_rows = []
+                for y in coords:
+                    for x in coords:
+                        local_rows.append(torch.stack((x * tanx * depth, y * tany * depth, depth)))
+                local = torch.stack(local_rows, dim=0)
+                world = center.view(1, 3) + local @ rotation.T
+                points.append(world)
+
+        if not points:
+            return None, {"enabled": True, "points": 0, "reason": "no_valid_camera_frustums"}
+
+        points = torch.cat(points, dim=0)
+        points = points[torch.isfinite(points).all(dim=1)]
+        if points.numel() == 0:
+            return None, {"enabled": True, "points": 0, "reason": "nonfinite_points"}
+
+        stats = {
+            "enabled": True,
+            "points": int(points.shape[0]),
+            "cameras": used_cameras,
+            "grid": grid,
+            "depth_mode": depth_mode,
+            "depth_scales": depth_scales,
+            "base_depth_min": min(base_depths) if base_depths else 0.0,
+            "base_depth_max": max(base_depths) if base_depths else 0.0,
+        }
+        return points, stats
+
+    def _expand_field_bbox(self, bbox_min, bbox_max):
+        bbox_min = bbox_min.detach().float()
+        bbox_max = bbox_max.detach().float()
+        span = torch.clamp(bbox_max - bbox_min, min=1e-6)
+        device = bbox_min.device
+        dtype = bbox_min.dtype
+        uniform = max(float(getattr(self, "field_bbox_expand_scale", 0.0)), 0.0)
+        expand_ratio = torch.full((3,), uniform, device=device, dtype=dtype)
+        expand_ratio = expand_ratio + torch.clamp(
+            self._parse_field_bbox_vector(
+                getattr(self, "field_bbox_expand_xyz", ""),
+                device,
+                dtype,
+                "field_bbox_expand_xyz",
+            ),
+            min=0.0,
+        )
+        extra_min = torch.clamp(
+            self._parse_field_bbox_vector(
+                getattr(self, "field_bbox_extra_min", ""),
+                device,
+                dtype,
+                "field_bbox_extra_min",
+            ),
+            min=0.0,
+        )
+        extra_max = torch.clamp(
+            self._parse_field_bbox_vector(
+                getattr(self, "field_bbox_extra_max", ""),
+                device,
+                dtype,
+                "field_bbox_extra_max",
+            ),
+            min=0.0,
+        )
+        pad = span * expand_ratio
+        expanded_min = bbox_min - pad - extra_min
+        expanded_max = bbox_max + pad + extra_max
+        frustum_points, frustum_stats = self._sample_field_frustum_bbox_points(bbox_min, bbox_max)
+        frustum_min = None
+        frustum_max = None
+        frustum_margin = max(float(getattr(self, "field_bbox_frustum_margin", 0.0)), 0.0)
+        if frustum_points is not None:
+            frustum_min = frustum_points.min(dim=0).values
+            frustum_max = frustum_points.max(dim=0).values
+            if frustum_margin > 0.0:
+                frustum_min = frustum_min - frustum_margin
+                frustum_max = frustum_max + frustum_margin
+            expanded_min = torch.minimum(expanded_min, frustum_min)
+            expanded_max = torch.maximum(expanded_max, frustum_max)
+
+            max_expand_spec = getattr(self, "field_bbox_frustum_max_expand_xyz", "")
+            if max_expand_spec is not None and str(max_expand_spec).strip():
+                max_expand = torch.clamp(
+                    self._parse_field_bbox_vector(
+                        max_expand_spec,
+                        device,
+                        dtype,
+                        "field_bbox_frustum_max_expand_xyz",
+                    ),
+                    min=0.0,
+                )
+                expanded_min = torch.maximum(expanded_min, bbox_min - span * max_expand)
+                expanded_max = torch.minimum(expanded_max, bbox_max + span * max_expand)
+                frustum_stats["max_expand_xyz"] = max_expand.detach().cpu()
+        self._field_bbox_stats = {
+            "raw_min": bbox_min.detach().cpu(),
+            "raw_max": bbox_max.detach().cpu(),
+            "expanded_min": expanded_min.detach().cpu(),
+            "expanded_max": expanded_max.detach().cpu(),
+            "expand_ratio": expand_ratio.detach().cpu(),
+            "extra_min": extra_min.detach().cpu(),
+            "extra_max": extra_max.detach().cpu(),
+            "frustum": frustum_stats,
+            "frustum_min": None if frustum_min is None else frustum_min.detach().cpu(),
+            "frustum_max": None if frustum_max is None else frustum_max.detach().cpu(),
+        }
+        if bool(getattr(self, "field_bbox_preserve_cell_size", True)):
+            self._field_resolution_reference_span = span.detach().float()
+        else:
+            self._field_resolution_reference_span = None
+        return expanded_min, expanded_max
 
     @staticmethod
     def _positive_percentile(values, percentile):
@@ -1166,7 +1821,12 @@ class GaussianModel:
             ]
 
         bbox_span = torch.clamp((bbox_max - bbox_min).detach().float(), min=1e-6)
-        max_span = float(torch.max(bbox_span).item())
+        reference_span = getattr(self, "_field_resolution_reference_span", None)
+        if reference_span is not None:
+            reference_span = torch.clamp(reference_span.detach().float().to(device=bbox_span.device), min=1e-6)
+        else:
+            reference_span = bbox_span
+        max_span = float(torch.max(reference_span).item())
         bbox_center = 0.5 * (bbox_min + bbox_max)
 
         scale_components = {}
@@ -1218,6 +1878,7 @@ class GaussianModel:
     def _build_euler_modules(self, bbox_min, bbox_max, knn_distances=None, gaussian_scales=None):
         if not self.use_euler_field:
             return
+        bbox_min, bbox_max = self._expand_field_bbox(bbox_min, bbox_max)
         level_resolutions = self._resolve_field_level_resolutions(
             bbox_min,
             bbox_max,
@@ -1230,14 +1891,55 @@ class GaussianModel:
         components = stats.get("components", {})
         component_text = ", ".join("{}={:.6g}".format(k, v) for k, v in components.items())
         print(
-            "[STEGF] Euler grid mode={}, levels={}, resolutions={}, finest_cell={}, components={}".format(
+            "[STEGF] Euler grid mode={}, levels={}, resolutions={}, finest_cell={}, components={}, static_temporal_bins={}".format(
                 stats.get("mode", self.field_resolution_mode),
                 self.field_num_levels,
                 self.field_resolved_level_resolutions,
                 stats.get("finest_cell", "n/a"),
                 component_text if component_text else "n/a",
+                EulerField._resolve_static_temporal_bins(self.field_num_levels, self.field_static_temporal_frames)
+                if self.field_static_temporal_residual
+                else "off",
             )
         )
+        bbox_stats = getattr(self, "_field_bbox_stats", None)
+        if bbox_stats is not None:
+            expand_ratio = bbox_stats["expand_ratio"]
+            extra_min = bbox_stats["extra_min"]
+            extra_max = bbox_stats["extra_max"]
+            frustum_stats = bbox_stats.get("frustum", {})
+            frustum_points = int(frustum_stats.get("points", 0)) if isinstance(frustum_stats, dict) else 0
+            if bool(torch.any(expand_ratio > 0).item() or torch.any(extra_min > 0).item() or torch.any(extra_max > 0).item() or frustum_points > 0):
+                frustum_text = "off"
+                if isinstance(frustum_stats, dict) and frustum_stats.get("enabled", False):
+                    frustum_text = (
+                        "points={}, cameras={}, grid={}, depth_mode={}, depth_scales={}, base_depth=[{:.6g},{:.6g}]".format(
+                            int(frustum_stats.get("points", 0)),
+                            int(frustum_stats.get("cameras", 0)),
+                            int(frustum_stats.get("grid", 0)),
+                            frustum_stats.get("depth_mode", "n/a"),
+                            [round(float(v), 6) for v in frustum_stats.get("depth_scales", [])],
+                            float(frustum_stats.get("base_depth_min", 0.0)),
+                            float(frustum_stats.get("base_depth_max", 0.0)),
+                        )
+                    )
+                    if "max_expand_xyz" in frustum_stats:
+                        frustum_text += ", max_expand_xyz={}".format(
+                            [round(float(v), 6) for v in frustum_stats["max_expand_xyz"].view(-1)]
+                        )
+                print(
+                    "[STEGF] Euler grid bbox expanded: raw_min={}, raw_max={}, expanded_min={}, expanded_max={}, ratio={}, extra_min={}, extra_max={}, frustum={}, preserve_cell_size={}".format(
+                        [round(float(v), 6) for v in bbox_stats["raw_min"].view(-1)],
+                        [round(float(v), 6) for v in bbox_stats["raw_max"].view(-1)],
+                        [round(float(v), 6) for v in bbox_stats["expanded_min"].view(-1)],
+                        [round(float(v), 6) for v in bbox_stats["expanded_max"].view(-1)],
+                        [round(float(v), 6) for v in expand_ratio.view(-1)],
+                        [round(float(v), 6) for v in extra_min.view(-1)],
+                        [round(float(v), 6) for v in extra_max.view(-1)],
+                        frustum_text,
+                        bool(getattr(self, "field_bbox_preserve_cell_size", True)),
+                    )
+                )
         self.euler_field = EulerField(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
@@ -1247,6 +1949,9 @@ class GaussianModel:
             fourier_degree=self.field_fourier_degree,
             level_resolutions=level_resolutions,
             enable_dynamic_grid=not self.field_disable_dynamic_grid,
+            enable_static_temporal_residual=self.field_static_temporal_residual,
+            static_temporal_frames=self.field_static_temporal_frames,
+            static_temporal_scale=self.field_static_temporal_scale,
         ).cuda()
         router_input_dim = self.field_feature_dim + 2 * self.field_level_fourier_degree
         self.field_router = EulerLevelRouter(
@@ -1279,6 +1984,12 @@ class GaussianModel:
             nn.Linear(self.field_decoder_hidden, 6, bias=False),
         ).cuda()
         nn.init.normal_(self.field_static_app_head[-1].weight, mean=0.0, std=1e-3)
+        if self.field_static_radiance_branch:
+            self._static_radiance_level_logits = nn.Parameter(
+                torch.zeros((self.field_num_levels,), device="cuda", dtype=torch.float32).requires_grad_(True)
+            )
+        else:
+            self._static_radiance_level_logits = torch.empty(0, device="cuda")
 
     def _init_static_level_logits(self, num_points, values=None):
         if not self.use_euler_field:
@@ -1653,7 +2364,7 @@ class GaussianModel:
                 static_residual = None
                 static_residual_motion = torch.zeros((self.get_xyz.shape[0], 1), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
                 if stage != "baseline_warmup":
-                    static_level_features = self.euler_field.query_static_level_features(canonical_points)
+                    static_level_features = self.euler_field.query_static_level_features(canonical_points, timestamp=timestamp)
                     static_level_logits = self._get_static_level_logits()
                     static_feature = self.euler_field.blend_level_features(static_level_features, static_level_logits)
                     static_residual = self.field_decoder(static_feature)
@@ -1722,6 +2433,7 @@ class GaussianModel:
                         camera_center=camera_center,
                         view_mapper=self.field_static_view_mapper,
                         view_scale=self.field_static_app_scale,
+                        timestamp=timestamp,
                     )
                     static_level_logits = self._get_static_level_logits()
                     static_feature = self.euler_field.blend_level_features(static_level_features, static_level_logits)
@@ -1792,6 +2504,114 @@ class GaussianModel:
             colors_precomp = colors_precomp + static_warmup * self.field_static_app_scale * app_delta
         self.trbfoutput = trbfoutput
         return means3D, opacity, rotations, colors_precomp
+
+    def static_far_segment_radiance_features(self, viewpoint_camera, depth, unreliable_mask, iteration):
+        if not bool(getattr(self, "field_static_radiance_branch", False)):
+            return None
+        if int(iteration) < int(getattr(self, "field_static_radiance_start", 3000)):
+            return None
+        if self.euler_field is None or self.field_static_app_head is None:
+            return None
+        if unreliable_mask is None or depth is None:
+            return None
+        if getattr(viewpoint_camera, "rayd", None) is None:
+            return None
+
+        depth = depth.squeeze(0)
+        mask = unreliable_mask.to(device=depth.device, dtype=torch.bool)
+        if mask.shape != depth.shape or torch.count_nonzero(mask) == 0:
+            return None
+
+        pixel_indices = torch.nonzero(mask, as_tuple=False)
+        max_pixels = int(getattr(self, "field_static_radiance_max_pixels", 0))
+        if max_pixels > 0 and pixel_indices.shape[0] > max_pixels:
+            pick = torch.linspace(
+                0,
+                pixel_indices.shape[0] - 1,
+                max_pixels,
+                device=pixel_indices.device,
+            ).round().long()
+            pixel_indices = pixel_indices[pick]
+        if pixel_indices.numel() == 0:
+            return None
+
+        y = pixel_indices[:, 0]
+        x = pixel_indices[:, 1]
+        ray_dirs = viewpoint_camera.rayd[0, :, y, x].transpose(0, 1).to(device=depth.device, dtype=depth.dtype)
+        ray_dirs = torch.nn.functional.normalize(ray_dirs, dim=1, eps=1e-6)
+        ray_origin = viewpoint_camera.camera_center.to(device=depth.device, dtype=depth.dtype).view(1, 3)
+        bbox_min = self.euler_field.bbox_min.to(device=depth.device, dtype=depth.dtype).view(1, 3)
+        bbox_max = self.euler_field.bbox_max.to(device=depth.device, dtype=depth.dtype).view(1, 3)
+
+        near = depth[y, x].to(dtype=depth.dtype) * float(getattr(self, "field_static_radiance_depth_multiplier", 5.0))
+        finite_depth = torch.isfinite(near) & (near > 1e-4)
+        eps = torch.tensor(1e-6, device=depth.device, dtype=depth.dtype)
+        parallel = torch.abs(ray_dirs) < eps
+        inside_parallel = (ray_origin >= bbox_min) & (ray_origin <= bbox_max)
+        denom = torch.where(parallel, torch.ones_like(ray_dirs), ray_dirs)
+        t0 = (bbox_min - ray_origin) / denom
+        t1 = (bbox_max - ray_origin) / denom
+        t_axis_min = torch.minimum(t0, t1)
+        t_axis_max = torch.maximum(t0, t1)
+        neg_inf = torch.full_like(t_axis_min, -float("inf"))
+        pos_inf = torch.full_like(t_axis_max, float("inf"))
+        t_axis_min = torch.where(parallel & inside_parallel, neg_inf, t_axis_min)
+        t_axis_max = torch.where(parallel & inside_parallel, pos_inf, t_axis_max)
+        invalid_parallel = torch.any(parallel & (~inside_parallel), dim=1)
+        t_enter = torch.max(t_axis_min, dim=1).values
+        t_exit = torch.min(t_axis_max, dim=1).values
+
+        start = torch.maximum(near, t_enter + 1e-4)
+        valid = finite_depth & (~invalid_parallel) & torch.isfinite(t_exit) & (t_exit > start + 1e-4)
+        if torch.count_nonzero(valid) == 0:
+            return None
+
+        y = y[valid]
+        x = x[valid]
+        ray_dirs = ray_dirs[valid]
+        start = start[valid]
+        t_exit = t_exit[valid]
+        samples = max(int(getattr(self, "field_static_radiance_samples", 4)), 1)
+        alpha = (torch.arange(samples, device=depth.device, dtype=depth.dtype) + 0.5) / float(samples)
+        sample_depth = start[:, None] * (1.0 - alpha[None, :]) + t_exit[:, None] * alpha[None, :]
+        points = ray_origin.view(1, 1, 3) + sample_depth[:, :, None] * ray_dirs[:, None, :]
+        flat_points = points.reshape(-1, 3)
+
+        level_features = self.euler_field.query_static_level_features(
+            flat_points,
+            camera_center=viewpoint_camera.camera_center,
+            view_mapper=self.field_static_view_mapper,
+            view_scale=self.field_static_app_scale,
+            timestamp=getattr(viewpoint_camera, "timestamp", None),
+        )
+        # Ray samples are independent query points, not existing Gaussians, so
+        # they use a global learnable level preference instead of per-Gaussian logits.
+        if self._static_radiance_level_logits.numel() == level_features.shape[1]:
+            level_logits = self._static_radiance_level_logits.to(
+                device=level_features.device,
+                dtype=level_features.dtype,
+            ).view(1, -1).expand(flat_points.shape[0], -1)
+        else:
+            level_logits = torch.zeros(
+                (flat_points.shape[0], level_features.shape[1]),
+                device=level_features.device,
+                dtype=level_features.dtype,
+            )
+        feature = self.euler_field.blend_level_features(level_features, level_logits)
+        app_residual = self.field_static_app_head(feature).view(-1, samples, 6).mean(dim=1)
+        zeros_t = torch.zeros((app_residual.shape[0], 3), device=app_residual.device, dtype=app_residual.dtype)
+        radiance_feature = torch.cat((app_residual, zeros_t), dim=1)
+
+        start_iter = int(getattr(self, "field_static_radiance_start", 3000))
+        warmup_iters = max(int(getattr(self, "field_static_radiance_warmup", 1000)), 1)
+        warmup = max(0.0, min((float(iteration) - float(start_iter)) / float(warmup_iters), 1.0))
+        scale = float(getattr(self, "field_static_radiance_scale", 0.05)) * warmup
+        if scale <= 0.0:
+            return None
+
+        out = torch.zeros((9, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)), device=depth.device, dtype=app_residual.dtype)
+        out[:, y, x] = (scale * radiance_feature).transpose(0, 1)
+        return out
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
@@ -1905,6 +2725,49 @@ class GaussianModel:
             self._init_field_residual_gate()
         self._init_ems_mask(self.get_xyz.shape[0])
         self._init_dynamic_score_state(self.get_xyz.shape[0])
+
+    def boost_background_candidate_gradients(self, iteration):
+        if not bool(getattr(self, "field_bg_candidate_grad_boost", False)):
+            return 0
+        if self._bg_candidate_mask.numel() == 0 or self._bg_birth_iter.numel() == 0:
+            return 0
+        num_points = self._xyz.shape[0]
+        if self._bg_candidate_mask.shape[0] != num_points or self._bg_birth_iter.shape[0] != num_points:
+            return 0
+
+        candidate_mask = (self._bg_candidate_mask.detach().reshape(-1) > 0.5)
+        birth_iter = self._bg_birth_iter.detach().reshape(-1)
+        protect_iters = max(int(getattr(self, "field_bg_prior_protect_iters", 1500)), 0)
+        valid_birth = birth_iter >= 0
+        if protect_iters > 0:
+            age = float(iteration) - birth_iter
+            candidate_mask = candidate_mask & valid_birth & (age >= 0) & (age < float(protect_iters))
+        else:
+            candidate_mask = candidate_mask & valid_birth
+
+        if torch.count_nonzero(candidate_mask) == 0:
+            return 0
+
+        def scale_point_grad(parameter, scale):
+            if parameter.grad is None:
+                return
+            if parameter.grad.shape[0] != num_points:
+                return
+            scale = float(scale)
+            if scale == 1.0:
+                return
+            factor = torch.ones((num_points,), device=parameter.grad.device, dtype=parameter.grad.dtype)
+            factor[candidate_mask.to(device=parameter.grad.device)] = scale
+            while factor.dim() < parameter.grad.dim():
+                factor = factor.unsqueeze(-1)
+            parameter.grad.mul_(factor)
+
+        scale_point_grad(self._features_dc, getattr(self, "field_bg_candidate_feature_grad_scale", 3.0))
+        scale_point_grad(self._features_t, getattr(self, "field_bg_candidate_feature_grad_scale", 3.0))
+        scale_point_grad(self._opacity, getattr(self, "field_bg_candidate_opacity_grad_scale", 2.0))
+        scale_point_grad(self._scaling, getattr(self, "field_bg_candidate_scaling_grad_scale", 1.5))
+        return int(torch.count_nonzero(candidate_mask).item())
+
     def cache_gradient(self):
         self._xyz_grd += self._xyz.grad.clone()
         self._features_dc_grd += self._features_dc.grad.clone()
@@ -2088,6 +2951,8 @@ class GaussianModel:
             l.append({'params': list(self.rgbdecoder.parameters()), 'lr': training_args.rgb_lr, "name": "decoder"})
         if self.use_euler_field and self.euler_field is not None:
             l.append({'params': [self._static_level_logits], 'lr': training_args.grid_logits_lr, "name": "static_grid_logits"})
+            if self._static_radiance_level_logits.numel() > 0:
+                l.append({'params': [self._static_radiance_level_logits], 'lr': training_args.grid_logits_lr, "name": "static_radiance_level_logits"})
             l.append({'params': [self._dynamic_level_logits], 'lr': training_args.grid_logits_lr, "name": "dynamic_grid_logits"})
             if self._dynamic_level_time_coeff.numel() > 0:
                 l.append({'params': [self._dynamic_level_time_coeff], 'lr': training_args.grid_logits_lr, "name": "dynamic_grid_time_coeff"})
@@ -2166,6 +3031,17 @@ class GaussianModel:
             "field_gaussian_scale_weight": self.field_gaussian_scale_weight,
             "field_pixel_scale_weight": self.field_pixel_scale_weight,
             "field_min_cell_scale": self.field_min_cell_scale,
+            "field_bbox_expand_scale": self.field_bbox_expand_scale,
+            "field_bbox_expand_xyz": self.field_bbox_expand_xyz,
+            "field_bbox_extra_min": self.field_bbox_extra_min,
+            "field_bbox_extra_max": self.field_bbox_extra_max,
+            "field_bbox_preserve_cell_size": int(self.field_bbox_preserve_cell_size),
+            "field_bbox_frustum_expand": int(self.field_bbox_frustum_expand),
+            "field_bbox_frustum_grid": self.field_bbox_frustum_grid,
+            "field_bbox_frustum_depth_base": self.field_bbox_frustum_depth_base,
+            "field_bbox_frustum_depth_scales": self.field_bbox_frustum_depth_scales,
+            "field_bbox_frustum_margin": self.field_bbox_frustum_margin,
+            "field_bbox_frustum_max_expand_xyz": self.field_bbox_frustum_max_expand_xyz,
             "field_feature_dim": self.field_feature_dim,
             "field_fourier_degree": self.field_fourier_degree,
             "field_level_fourier_degree": self.field_level_fourier_degree,
@@ -2189,6 +3065,16 @@ class GaussianModel:
             "field_static_motion_scale": self.field_static_motion_scale,
             "field_static_opacity_scale": self.field_static_opacity_scale,
             "field_static_app_scale": self.field_static_app_scale,
+            "field_static_temporal_residual": int(self.field_static_temporal_residual),
+            "field_static_temporal_frames": self.field_static_temporal_frames,
+            "field_static_temporal_scale": self.field_static_temporal_scale,
+            "field_static_radiance_branch": int(self.field_static_radiance_branch),
+            "field_static_radiance_start": self.field_static_radiance_start,
+            "field_static_radiance_warmup": self.field_static_radiance_warmup,
+            "field_static_radiance_scale": self.field_static_radiance_scale,
+            "field_static_radiance_depth_multiplier": self.field_static_radiance_depth_multiplier,
+            "field_static_radiance_samples": self.field_static_radiance_samples,
+            "field_static_radiance_max_pixels": self.field_static_radiance_max_pixels,
             "field_static_use_global_gate": int(self.field_static_use_global_gate),
             "field_static_prior_floor": self.field_static_prior_floor,
             "field_soft_route_slope": self.field_soft_route_slope,
@@ -2253,6 +3139,197 @@ class GaussianModel:
             "field_temporal_refine_opacity_threshold": self.field_temporal_refine_opacity_threshold,
             "field_temporal_refine_score_threshold": self.field_temporal_refine_score_threshold,
             "field_temporal_refine_max_ratio": self.field_temporal_refine_max_ratio,
+            "field_bg_prior": int(self.field_bg_prior),
+            "field_bg_prior_source": self.field_bg_prior_source,
+            "field_bg_prior_color_source": self.field_bg_prior_color_source,
+            "field_bg_prior_start": self.field_bg_prior_start,
+            "field_bg_prior_until": self.field_bg_prior_until,
+            "field_bg_prior_interval": self.field_bg_prior_interval,
+            "field_bg_prior_loss_weight": self.field_bg_prior_loss_weight,
+            "field_bg_prior_visible_threshold": self.field_bg_prior_visible_threshold,
+            "field_bg_prior_stability_threshold": self.field_bg_prior_stability_threshold,
+            "field_bg_prior_error_quantile": self.field_bg_prior_error_quantile,
+            "field_bg_prior_depth_quantile": self.field_bg_prior_depth_quantile,
+            "field_bg_prior_max_pixels": self.field_bg_prior_max_pixels,
+            "field_bg_prior_num_per_ray": self.field_bg_prior_num_per_ray,
+            "field_bg_prior_depth_scale": self.field_bg_prior_depth_scale,
+            "field_bg_prior_depth_values": self.field_bg_prior_depth_values,
+            "field_bg_prior_opacity": self.field_bg_prior_opacity,
+            "field_bg_prior_color_init": self.field_bg_prior_color_init,
+            "field_bg_prior_scale_init": self.field_bg_prior_scale_init,
+            "field_bg_prior_fixed_scale": self.field_bg_prior_fixed_scale,
+            "field_bg_prior_hybrid_knn_scale_threshold": self.field_bg_prior_hybrid_knn_scale_threshold,
+            "field_bg_prior_trbf_center": self.field_bg_prior_trbf_center,
+            "field_bg_prior_trbf_scale": self.field_bg_prior_trbf_scale,
+            "field_bg_prior_protect_iters": self.field_bg_prior_protect_iters,
+            "field_bg_prior_mature_prune": int(self.field_bg_prior_mature_prune),
+            "field_bg_prior_mature_prune_interval": self.field_bg_prior_mature_prune_interval,
+            "field_bg_prior_mature_min_opacity": self.field_bg_prior_mature_min_opacity,
+            "field_bg_prior_mature_min_visibility": self.field_bg_prior_mature_min_visibility,
+            "field_bg_prior_debug": int(self.field_bg_prior_debug),
+            "field_bg_prior_debug_max_events": self.field_bg_prior_debug_max_events,
+            "field_bg_prior_debug_mode": self.field_bg_prior_debug_mode,
+            "field_bg_prior_schedule_mode": self.field_bg_prior_schedule_mode,
+            "field_bg_prior_scan_views_per_event": self.field_bg_prior_scan_views_per_event,
+            "field_bg_prior_scan_time_indices": self.field_bg_prior_scan_time_indices,
+            "field_bg_prior_block_size": self.field_bg_prior_block_size,
+            "field_bg_prior_pixels_per_block": self.field_bg_prior_pixels_per_block,
+            "field_bg_prior_strict_max_pixels": self.field_bg_prior_strict_max_pixels,
+            "field_bg_prior_strict_pixels_per_block": self.field_bg_prior_strict_pixels_per_block,
+            "field_bg_prior_recall_max_pixels": self.field_bg_prior_recall_max_pixels,
+            "field_bg_prior_recall_pixels_per_block": self.field_bg_prior_recall_pixels_per_block,
+            "field_bg_prior_recall_error_quantile": self.field_bg_prior_recall_error_quantile,
+            "field_bg_prior_recall_min_visible_ratio": self.field_bg_prior_recall_min_visible_ratio,
+            "field_bg_prior_recall_min_stable_ratio": self.field_bg_prior_recall_min_stable_ratio,
+            "field_bg_prior_recall_max_occlusion_ratio": self.field_bg_prior_recall_max_occlusion_ratio,
+            "field_bg_prior_unreliable_max_pixels": self.field_bg_prior_unreliable_max_pixels,
+            "field_bg_prior_unreliable_pixels_per_block": self.field_bg_prior_unreliable_pixels_per_block,
+            "field_bg_prior_unreliable_error_quantile": self.field_bg_prior_unreliable_error_quantile,
+            "field_bg_prior_min_visible_ratio": self.field_bg_prior_min_visible_ratio,
+            "field_bg_prior_min_stable_ratio": self.field_bg_prior_min_stable_ratio,
+            "field_bg_prior_max_occlusion_ratio": self.field_bg_prior_max_occlusion_ratio,
+            "field_bg_prior_occlusion_threshold": self.field_bg_prior_occlusion_threshold,
+            "field_bg_prior_occlusion_dilate": self.field_bg_prior_occlusion_dilate,
+            "field_bg_prior_exposure_robust": int(self.field_bg_prior_exposure_robust),
+            "field_bg_prior_structural_weight": self.field_bg_prior_structural_weight,
+            "field_bg_prior_local_window": self.field_bg_prior_local_window,
+            "field_bg_prior_fixed_depth": int(self.field_bg_prior_fixed_depth),
+            "field_bg_prior_fixed_depth_ratio": self.field_bg_prior_fixed_depth_ratio,
+            "field_bg_prior_depth_max": self.field_bg_prior_depth_max,
+            "field_bg_prior_suppress": int(self.field_bg_prior_suppress),
+            "field_bg_prior_suppress_decay": self.field_bg_prior_suppress_decay,
+            "field_bg_prior_suppress_max_points": self.field_bg_prior_suppress_max_points,
+            "field_bg_prior_suppress_depth_margin": self.field_bg_prior_suppress_depth_margin,
+            "field_bg_prior_suppress_opacity_threshold": self.field_bg_prior_suppress_opacity_threshold,
+            "field_bg_prior_suppress_scale_quantile": self.field_bg_prior_suppress_scale_quantile,
+            "field_bg_prior_clone_split": int(self.field_bg_prior_clone_split),
+            "field_bg_prior_clone_stat_start": self.field_bg_prior_clone_stat_start,
+            "field_bg_prior_clone_start": self.field_bg_prior_clone_start,
+            "field_bg_prior_clone_until": self.field_bg_prior_clone_until,
+            "field_bg_prior_clone_interval": self.field_bg_prior_clone_interval,
+            "field_bg_prior_clone_grad_threshold": self.field_bg_prior_clone_grad_threshold,
+            "field_bg_prior_clone_max_ratio": self.field_bg_prior_clone_max_ratio,
+            "field_bg_prior_clone_max_points": self.field_bg_prior_clone_max_points,
+            "field_bg_prior_clone_min_age": self.field_bg_prior_clone_min_age,
+            "field_bg_prior_clone_min_opacity": self.field_bg_prior_clone_min_opacity,
+            "field_bg_prior_clone_min_visibility": self.field_bg_prior_clone_min_visibility,
+            "field_bg_prior_clone_split_children": self.field_bg_prior_clone_split_children,
+            "field_bg_prior_keep_split_parent": int(self.field_bg_prior_keep_split_parent),
+            "field_bg_dense_add": int(self.field_bg_dense_add),
+            "field_bg_dense_add_iter": self.field_bg_dense_add_iter,
+            "field_bg_dense_add_time_indices": self.field_bg_dense_add_time_indices,
+            "field_bg_dense_depth_base": self.field_bg_dense_depth_base,
+            "field_bg_dense_depth_scales": self.field_bg_dense_depth_scales,
+            "field_bg_dense_depth_values": self.field_bg_dense_depth_values,
+            "field_bg_dense_mask_source": self.field_bg_dense_mask_source,
+            "field_bg_dense_sample_block_size": self.field_bg_dense_sample_block_size,
+            "field_bg_dense_pixels_per_block": self.field_bg_dense_pixels_per_block,
+            "field_bg_dense_max_pixels_per_camera": self.field_bg_dense_max_pixels_per_camera,
+            "field_bg_dense_debug": int(self.field_bg_dense_debug),
+            "field_bg_dense_debug_max_events": self.field_bg_dense_debug_max_events,
+            "field_bg_dense_da3_filter": int(self.field_bg_dense_da3_filter),
+            "field_bg_dense_da3_path": self.field_bg_dense_da3_path,
+            "field_bg_dense_da3_foreground_quantile": self.field_bg_dense_da3_foreground_quantile,
+            "field_bg_dense_beit_filter": int(self.field_bg_dense_beit_filter),
+            "field_bg_dense_beit_path": self.field_bg_dense_beit_path,
+            "field_bg_dense_beit_band_low": self.field_bg_dense_beit_band_low,
+            "field_bg_dense_beit_band_high": self.field_bg_dense_beit_band_high,
+            "field_bg_dense_beit_threshold": self.field_bg_dense_beit_threshold,
+            "field_bg_dense_cell_dedup": int(self.field_bg_dense_cell_dedup),
+            "field_bg_dense_dedup_level": self.field_bg_dense_dedup_level,
+            "field_bg_dense_max_per_cell": self.field_bg_dense_max_per_cell,
+            "field_bg_dense_skip_control_at_add_iter": int(self.field_bg_dense_skip_control_at_add_iter),
+            "field_bg_dense_clip_to_bbox": int(self.field_bg_dense_clip_to_bbox),
+            "field_bg_dense_bbox_clip_margin": self.field_bg_dense_bbox_clip_margin,
+            "field_depthpro_supervision": int(self.field_depthpro_supervision),
+            "field_depthpro_path": self.field_depthpro_path,
+            "field_depthpro_start": self.field_depthpro_start,
+            "field_depthpro_until": self.field_depthpro_until,
+            "field_depthpro_loss_weight": self.field_depthpro_loss_weight,
+            "field_depthpro_max_depth": self.field_depthpro_max_depth,
+            "field_depthpro_min_pixels": self.field_depthpro_min_pixels,
+            "field_depthpro_error_clamp": self.field_depthpro_error_clamp,
+            "field_depthpro_use_beit_mask": int(self.field_depthpro_use_beit_mask),
+            "field_depthpro_exclude_unreliable": int(self.field_depthpro_exclude_unreliable),
+            "field_scale_reg": int(self.field_scale_reg),
+            "field_scale_reg_start": self.field_scale_reg_start,
+            "field_scale_reg_until": self.field_scale_reg_until,
+            "field_scale_reg_weight": self.field_scale_reg_weight,
+            "field_scale_reg_base_limit": self.field_scale_reg_base_limit,
+            "field_scale_reg_depth_ref": self.field_scale_reg_depth_ref,
+            "field_scale_reg_depth_gamma": self.field_scale_reg_depth_gamma,
+            "field_scale_reg_max_boost": self.field_scale_reg_max_boost,
+            "field_bg_candidate_grad_boost": int(self.field_bg_candidate_grad_boost),
+            "field_bg_candidate_feature_grad_scale": self.field_bg_candidate_feature_grad_scale,
+            "field_bg_candidate_opacity_grad_scale": self.field_bg_candidate_opacity_grad_scale,
+            "field_bg_candidate_scaling_grad_scale": self.field_bg_candidate_scaling_grad_scale,
+            "field_bg_only_train": int(self.field_bg_only_train),
+            "field_bg_only_start": self.field_bg_only_start,
+            "field_bg_only_until": self.field_bg_only_until,
+            "field_bg_only_interval": self.field_bg_only_interval,
+            "field_bg_only_loss_weight": self.field_bg_only_loss_weight,
+            "field_bg_only_min_pixels": self.field_bg_only_min_pixels,
+            "field_bg_only_da3_filter": int(self.field_bg_only_da3_filter),
+            "field_bg_only_update_modules": int(self.field_bg_only_update_modules),
+            "field_obs_reliability": int(self.field_obs_reliability),
+            "field_obs_reliability_floor": self.field_obs_reliability_floor,
+            "field_obs_reliability_mad_threshold": self.field_obs_reliability_mad_threshold,
+            "field_obs_reliability_diff_threshold": self.field_obs_reliability_diff_threshold,
+            "field_obs_reliability_motion_threshold": self.field_obs_reliability_motion_threshold,
+            "field_obs_reliability_mad_weight": self.field_obs_reliability_mad_weight,
+            "field_obs_reliability_diff_weight": self.field_obs_reliability_diff_weight,
+            "field_obs_reliability_motion_weight": self.field_obs_reliability_motion_weight,
+            "field_obs_reliability_unreliable_threshold": self.field_obs_reliability_unreliable_threshold,
+            "field_obs_reliability_debug": int(self.field_obs_reliability_debug),
+            "field_obs_reliability_start": self.field_obs_reliability_start,
+            "field_obs_reliability_until": self.field_obs_reliability_until,
+            "field_obs_reliability_ema": self.field_obs_reliability_ema,
+            "field_obs_reliability_error_quantile": self.field_obs_reliability_error_quantile,
+            "field_obs_reliability_error_threshold": self.field_obs_reliability_error_threshold,
+            "field_obs_reliability_min_error": self.field_obs_reliability_min_error,
+            "field_obs_reliability_dynamic_dilate": self.field_obs_reliability_dynamic_dilate,
+            "field_obs_reliability_structural_weight": self.field_obs_reliability_structural_weight,
+            "field_obs_reliability_local_window": self.field_obs_reliability_local_window,
+            "field_obs_boost_unreliable_loss": int(self.field_obs_boost_unreliable_loss),
+            "field_obs_boost_weight": self.field_obs_boost_weight,
+            "field_obs_reset": int(self.field_obs_reset),
+            "field_obs_reset_mode": self.field_obs_reset_mode,
+            "field_obs_reset_start": self.field_obs_reset_start,
+            "field_obs_reset_until": self.field_obs_reset_until,
+            "field_obs_reset_interval": self.field_obs_reset_interval,
+            "field_obs_reset_schedule": self.field_obs_reset_schedule,
+            "field_obs_reset_opacity": self.field_obs_reset_opacity,
+            "field_obs_reset_min_opacity": self.field_obs_reset_min_opacity,
+            "field_obs_reset_max_points": self.field_obs_reset_max_points,
+            "field_obs_reset_selection_mode": self.field_obs_reset_selection_mode,
+            "field_obs_reset_min_masked_contrib": self.field_obs_reset_min_masked_contrib,
+            "field_obs_reset_min_contrib_ratio": self.field_obs_reset_min_contrib_ratio,
+            "field_obs_reset_debug": int(self.field_obs_reset_debug),
+            "field_obs_reset_debug_max_events": self.field_obs_reset_debug_max_events,
+            "field_obs_reset_log_zero": int(self.field_obs_reset_log_zero),
+            "field_obs_reset_scan_time_indices": self.field_obs_reset_scan_time_indices,
+            "field_obs_reset_scan_views_per_time": self.field_obs_reset_scan_views_per_time,
+            "field_obs_reset_scan_min_hits": self.field_obs_reset_scan_min_hits,
+            "field_obs_reset_scan_top_ratio": self.field_obs_reset_scan_top_ratio,
+            "field_obs_reset_scan_max_points": self.field_obs_reset_scan_max_points,
+            "field_obs_reset_scan_update_ema": int(self.field_obs_reset_scan_update_ema),
+            "field_global_reset": int(self.field_global_reset),
+            "field_global_reset_schedule": self.field_global_reset_schedule,
+            "field_freq_prior": int(self.field_freq_prior),
+            "field_freq_prior_start": self.field_freq_prior_start,
+            "field_freq_prior_until": self.field_freq_prior_until,
+            "field_freq_prior_weight": self.field_freq_prior_weight,
+            "field_freq_prior_patch_size": self.field_freq_prior_patch_size,
+            "field_freq_prior_highpass": self.field_freq_prior_highpass,
+            "field_freq_prior_max_patches": self.field_freq_prior_max_patches,
+            "field_freq_prior_min_mask_ratio": self.field_freq_prior_min_mask_ratio,
+            "field_freq_prior_reference": self.field_freq_prior_reference,
+            "field_freq_prior_on_reset_only": int(self.field_freq_prior_on_reset_only),
+            "field_freq_prior_debug": int(self.field_freq_prior_debug),
+            "field_freq_prior_debug_max_events": self.field_freq_prior_debug_max_events,
+            "field_freq_prior_debug_mode": self.field_freq_prior_debug_mode,
+            "field_bg_median_loss": int(self.field_bg_median_loss),
+            "field_bg_median_loss_weight": self.field_bg_median_loss_weight,
         }
 
     def _load_aux_payload(self, path):
@@ -2294,6 +3371,17 @@ class GaussianModel:
             self.field_gaussian_scale_weight = float(config.get("field_gaussian_scale_weight", self.field_gaussian_scale_weight))
             self.field_pixel_scale_weight = float(config.get("field_pixel_scale_weight", self.field_pixel_scale_weight))
             self.field_min_cell_scale = float(config.get("field_min_cell_scale", self.field_min_cell_scale))
+            self.field_bbox_expand_scale = float(config.get("field_bbox_expand_scale", self.field_bbox_expand_scale))
+            self.field_bbox_expand_xyz = config.get("field_bbox_expand_xyz", self.field_bbox_expand_xyz)
+            self.field_bbox_extra_min = config.get("field_bbox_extra_min", self.field_bbox_extra_min)
+            self.field_bbox_extra_max = config.get("field_bbox_extra_max", self.field_bbox_extra_max)
+            self.field_bbox_preserve_cell_size = bool(config.get("field_bbox_preserve_cell_size", int(self.field_bbox_preserve_cell_size)))
+            self.field_bbox_frustum_expand = bool(config.get("field_bbox_frustum_expand", int(self.field_bbox_frustum_expand)))
+            self.field_bbox_frustum_grid = int(config.get("field_bbox_frustum_grid", self.field_bbox_frustum_grid))
+            self.field_bbox_frustum_depth_base = str(config.get("field_bbox_frustum_depth_base", self.field_bbox_frustum_depth_base))
+            self.field_bbox_frustum_depth_scales = config.get("field_bbox_frustum_depth_scales", self.field_bbox_frustum_depth_scales)
+            self.field_bbox_frustum_margin = float(config.get("field_bbox_frustum_margin", self.field_bbox_frustum_margin))
+            self.field_bbox_frustum_max_expand_xyz = config.get("field_bbox_frustum_max_expand_xyz", self.field_bbox_frustum_max_expand_xyz)
             self.field_feature_dim = int(config.get("field_feature_dim", self.field_feature_dim))
             self.field_fourier_degree = int(config.get("field_fourier_degree", self.field_fourier_degree))
             self.field_level_fourier_degree = int(config.get("field_level_fourier_degree", self.field_level_fourier_degree))
@@ -2317,6 +3405,16 @@ class GaussianModel:
             self.field_static_motion_scale = float(config.get("field_static_motion_scale", self.field_static_motion_scale))
             self.field_static_opacity_scale = float(config.get("field_static_opacity_scale", self.field_static_opacity_scale))
             self.field_static_app_scale = float(config.get("field_static_app_scale", self.field_static_app_scale))
+            self.field_static_temporal_residual = bool(config.get("field_static_temporal_residual", int(self.field_static_temporal_residual)))
+            self.field_static_temporal_frames = int(config.get("field_static_temporal_frames", self.field_static_temporal_frames))
+            self.field_static_temporal_scale = float(config.get("field_static_temporal_scale", self.field_static_temporal_scale))
+            self.field_static_radiance_branch = bool(config.get("field_static_radiance_branch", int(self.field_static_radiance_branch)))
+            self.field_static_radiance_start = int(config.get("field_static_radiance_start", self.field_static_radiance_start))
+            self.field_static_radiance_warmup = int(config.get("field_static_radiance_warmup", self.field_static_radiance_warmup))
+            self.field_static_radiance_scale = float(config.get("field_static_radiance_scale", self.field_static_radiance_scale))
+            self.field_static_radiance_depth_multiplier = float(config.get("field_static_radiance_depth_multiplier", self.field_static_radiance_depth_multiplier))
+            self.field_static_radiance_samples = int(config.get("field_static_radiance_samples", self.field_static_radiance_samples))
+            self.field_static_radiance_max_pixels = int(config.get("field_static_radiance_max_pixels", self.field_static_radiance_max_pixels))
             self.field_static_use_global_gate = bool(config.get("field_static_use_global_gate", int(self.field_static_use_global_gate)))
             self.field_static_prior_floor = float(config.get("field_static_prior_floor", self.field_static_prior_floor))
             self.field_soft_route_slope = float(config.get("field_soft_route_slope", self.field_soft_route_slope))
@@ -2381,6 +3479,197 @@ class GaussianModel:
             self.field_temporal_refine_opacity_threshold = float(config.get("field_temporal_refine_opacity_threshold", self.field_temporal_refine_opacity_threshold))
             self.field_temporal_refine_score_threshold = float(config.get("field_temporal_refine_score_threshold", self.field_temporal_refine_score_threshold))
             self.field_temporal_refine_max_ratio = float(config.get("field_temporal_refine_max_ratio", self.field_temporal_refine_max_ratio))
+            self.field_bg_prior = bool(config.get("field_bg_prior", int(self.field_bg_prior)))
+            self.field_bg_prior_start = int(config.get("field_bg_prior_start", self.field_bg_prior_start))
+            self.field_bg_prior_source = str(config.get("field_bg_prior_source", self.field_bg_prior_source))
+            self.field_bg_prior_color_source = str(config.get("field_bg_prior_color_source", self.field_bg_prior_color_source))
+            self.field_bg_prior_until = int(config.get("field_bg_prior_until", self.field_bg_prior_until))
+            self.field_bg_prior_interval = int(config.get("field_bg_prior_interval", self.field_bg_prior_interval))
+            self.field_bg_prior_loss_weight = float(config.get("field_bg_prior_loss_weight", self.field_bg_prior_loss_weight))
+            self.field_bg_prior_visible_threshold = float(config.get("field_bg_prior_visible_threshold", self.field_bg_prior_visible_threshold))
+            self.field_bg_prior_stability_threshold = float(config.get("field_bg_prior_stability_threshold", self.field_bg_prior_stability_threshold))
+            self.field_bg_prior_error_quantile = float(config.get("field_bg_prior_error_quantile", self.field_bg_prior_error_quantile))
+            self.field_bg_prior_depth_quantile = float(config.get("field_bg_prior_depth_quantile", self.field_bg_prior_depth_quantile))
+            self.field_bg_prior_max_pixels = int(config.get("field_bg_prior_max_pixels", self.field_bg_prior_max_pixels))
+            self.field_bg_prior_num_per_ray = int(config.get("field_bg_prior_num_per_ray", self.field_bg_prior_num_per_ray))
+            self.field_bg_prior_depth_scale = float(config.get("field_bg_prior_depth_scale", self.field_bg_prior_depth_scale))
+            self.field_bg_prior_depth_values = str(config.get("field_bg_prior_depth_values", self.field_bg_prior_depth_values))
+            self.field_bg_prior_opacity = float(config.get("field_bg_prior_opacity", self.field_bg_prior_opacity))
+            self.field_bg_prior_color_init = str(config.get("field_bg_prior_color_init", self.field_bg_prior_color_init))
+            self.field_bg_prior_scale_init = str(config.get("field_bg_prior_scale_init", self.field_bg_prior_scale_init))
+            self.field_bg_prior_fixed_scale = float(config.get("field_bg_prior_fixed_scale", self.field_bg_prior_fixed_scale))
+            self.field_bg_prior_hybrid_knn_scale_threshold = float(config.get("field_bg_prior_hybrid_knn_scale_threshold", self.field_bg_prior_hybrid_knn_scale_threshold))
+            self.field_bg_prior_trbf_center = float(config.get("field_bg_prior_trbf_center", self.field_bg_prior_trbf_center))
+            self.field_bg_prior_trbf_scale = float(config.get("field_bg_prior_trbf_scale", self.field_bg_prior_trbf_scale))
+            self.field_bg_prior_protect_iters = int(config.get("field_bg_prior_protect_iters", self.field_bg_prior_protect_iters))
+            self.field_bg_prior_mature_prune = bool(config.get("field_bg_prior_mature_prune", int(self.field_bg_prior_mature_prune)))
+            self.field_bg_prior_mature_prune_interval = int(config.get("field_bg_prior_mature_prune_interval", self.field_bg_prior_mature_prune_interval))
+            self.field_bg_prior_mature_min_opacity = float(config.get("field_bg_prior_mature_min_opacity", self.field_bg_prior_mature_min_opacity))
+            self.field_bg_prior_mature_min_visibility = float(config.get("field_bg_prior_mature_min_visibility", self.field_bg_prior_mature_min_visibility))
+            self.field_bg_prior_debug = bool(config.get("field_bg_prior_debug", int(self.field_bg_prior_debug)))
+            self.field_bg_prior_debug_max_events = int(config.get("field_bg_prior_debug_max_events", self.field_bg_prior_debug_max_events))
+            self.field_bg_prior_debug_mode = str(config.get("field_bg_prior_debug_mode", self.field_bg_prior_debug_mode))
+            self.field_bg_prior_schedule_mode = str(config.get("field_bg_prior_schedule_mode", self.field_bg_prior_schedule_mode))
+            self.field_bg_prior_scan_views_per_event = int(config.get("field_bg_prior_scan_views_per_event", self.field_bg_prior_scan_views_per_event))
+            self.field_bg_prior_scan_time_indices = str(config.get("field_bg_prior_scan_time_indices", self.field_bg_prior_scan_time_indices))
+            self.field_bg_prior_block_size = int(config.get("field_bg_prior_block_size", self.field_bg_prior_block_size))
+            self.field_bg_prior_pixels_per_block = int(config.get("field_bg_prior_pixels_per_block", self.field_bg_prior_pixels_per_block))
+            self.field_bg_prior_strict_max_pixels = int(config.get("field_bg_prior_strict_max_pixels", self.field_bg_prior_strict_max_pixels))
+            self.field_bg_prior_strict_pixels_per_block = int(config.get("field_bg_prior_strict_pixels_per_block", self.field_bg_prior_strict_pixels_per_block))
+            self.field_bg_prior_recall_max_pixels = int(config.get("field_bg_prior_recall_max_pixels", self.field_bg_prior_recall_max_pixels))
+            self.field_bg_prior_recall_pixels_per_block = int(config.get("field_bg_prior_recall_pixels_per_block", self.field_bg_prior_recall_pixels_per_block))
+            self.field_bg_prior_recall_error_quantile = float(config.get("field_bg_prior_recall_error_quantile", self.field_bg_prior_recall_error_quantile))
+            self.field_bg_prior_recall_min_visible_ratio = float(config.get("field_bg_prior_recall_min_visible_ratio", self.field_bg_prior_recall_min_visible_ratio))
+            self.field_bg_prior_recall_min_stable_ratio = float(config.get("field_bg_prior_recall_min_stable_ratio", self.field_bg_prior_recall_min_stable_ratio))
+            self.field_bg_prior_recall_max_occlusion_ratio = float(config.get("field_bg_prior_recall_max_occlusion_ratio", self.field_bg_prior_recall_max_occlusion_ratio))
+            self.field_bg_prior_unreliable_max_pixels = int(config.get("field_bg_prior_unreliable_max_pixels", self.field_bg_prior_unreliable_max_pixels))
+            self.field_bg_prior_unreliable_pixels_per_block = int(config.get("field_bg_prior_unreliable_pixels_per_block", self.field_bg_prior_unreliable_pixels_per_block))
+            self.field_bg_prior_unreliable_error_quantile = float(config.get("field_bg_prior_unreliable_error_quantile", self.field_bg_prior_unreliable_error_quantile))
+            self.field_bg_prior_min_visible_ratio = float(config.get("field_bg_prior_min_visible_ratio", self.field_bg_prior_min_visible_ratio))
+            self.field_bg_prior_min_stable_ratio = float(config.get("field_bg_prior_min_stable_ratio", self.field_bg_prior_min_stable_ratio))
+            self.field_bg_prior_max_occlusion_ratio = float(config.get("field_bg_prior_max_occlusion_ratio", self.field_bg_prior_max_occlusion_ratio))
+            self.field_bg_prior_occlusion_threshold = float(config.get("field_bg_prior_occlusion_threshold", self.field_bg_prior_occlusion_threshold))
+            self.field_bg_prior_occlusion_dilate = int(config.get("field_bg_prior_occlusion_dilate", self.field_bg_prior_occlusion_dilate))
+            self.field_bg_prior_exposure_robust = bool(config.get("field_bg_prior_exposure_robust", int(self.field_bg_prior_exposure_robust)))
+            self.field_bg_prior_structural_weight = float(config.get("field_bg_prior_structural_weight", self.field_bg_prior_structural_weight))
+            self.field_bg_prior_local_window = int(config.get("field_bg_prior_local_window", self.field_bg_prior_local_window))
+            self.field_bg_prior_fixed_depth = bool(config.get("field_bg_prior_fixed_depth", int(self.field_bg_prior_fixed_depth)))
+            self.field_bg_prior_fixed_depth_ratio = float(config.get("field_bg_prior_fixed_depth_ratio", self.field_bg_prior_fixed_depth_ratio))
+            self.field_bg_prior_depth_max = float(config.get("field_bg_prior_depth_max", self.field_bg_prior_depth_max))
+            self.field_bg_prior_suppress = bool(config.get("field_bg_prior_suppress", int(self.field_bg_prior_suppress)))
+            self.field_bg_prior_suppress_decay = float(config.get("field_bg_prior_suppress_decay", self.field_bg_prior_suppress_decay))
+            self.field_bg_prior_suppress_max_points = int(config.get("field_bg_prior_suppress_max_points", self.field_bg_prior_suppress_max_points))
+            self.field_bg_prior_suppress_depth_margin = float(config.get("field_bg_prior_suppress_depth_margin", self.field_bg_prior_suppress_depth_margin))
+            self.field_bg_prior_suppress_opacity_threshold = float(config.get("field_bg_prior_suppress_opacity_threshold", self.field_bg_prior_suppress_opacity_threshold))
+            self.field_bg_prior_suppress_scale_quantile = float(config.get("field_bg_prior_suppress_scale_quantile", self.field_bg_prior_suppress_scale_quantile))
+            self.field_bg_prior_clone_split = bool(config.get("field_bg_prior_clone_split", int(self.field_bg_prior_clone_split)))
+            self.field_bg_prior_clone_stat_start = int(config.get("field_bg_prior_clone_stat_start", self.field_bg_prior_clone_stat_start))
+            self.field_bg_prior_clone_start = int(config.get("field_bg_prior_clone_start", self.field_bg_prior_clone_start))
+            self.field_bg_prior_clone_until = int(config.get("field_bg_prior_clone_until", self.field_bg_prior_clone_until))
+            self.field_bg_prior_clone_interval = int(config.get("field_bg_prior_clone_interval", self.field_bg_prior_clone_interval))
+            self.field_bg_prior_clone_grad_threshold = float(config.get("field_bg_prior_clone_grad_threshold", self.field_bg_prior_clone_grad_threshold))
+            self.field_bg_prior_clone_max_ratio = float(config.get("field_bg_prior_clone_max_ratio", self.field_bg_prior_clone_max_ratio))
+            self.field_bg_prior_clone_max_points = int(config.get("field_bg_prior_clone_max_points", self.field_bg_prior_clone_max_points))
+            self.field_bg_prior_clone_min_age = int(config.get("field_bg_prior_clone_min_age", self.field_bg_prior_clone_min_age))
+            self.field_bg_prior_clone_min_opacity = float(config.get("field_bg_prior_clone_min_opacity", self.field_bg_prior_clone_min_opacity))
+            self.field_bg_prior_clone_min_visibility = float(config.get("field_bg_prior_clone_min_visibility", self.field_bg_prior_clone_min_visibility))
+            self.field_bg_prior_clone_split_children = int(config.get("field_bg_prior_clone_split_children", self.field_bg_prior_clone_split_children))
+            self.field_bg_prior_keep_split_parent = bool(config.get("field_bg_prior_keep_split_parent", int(self.field_bg_prior_keep_split_parent)))
+            self.field_bg_dense_add = bool(config.get("field_bg_dense_add", int(self.field_bg_dense_add)))
+            self.field_bg_dense_add_iter = int(config.get("field_bg_dense_add_iter", self.field_bg_dense_add_iter))
+            self.field_bg_dense_add_time_indices = str(config.get("field_bg_dense_add_time_indices", self.field_bg_dense_add_time_indices))
+            self.field_bg_dense_depth_base = str(config.get("field_bg_dense_depth_base", self.field_bg_dense_depth_base))
+            self.field_bg_dense_depth_scales = str(config.get("field_bg_dense_depth_scales", self.field_bg_dense_depth_scales))
+            self.field_bg_dense_depth_values = str(config.get("field_bg_dense_depth_values", self.field_bg_dense_depth_values))
+            self.field_bg_dense_mask_source = str(config.get("field_bg_dense_mask_source", self.field_bg_dense_mask_source))
+            self.field_bg_dense_sample_block_size = int(config.get("field_bg_dense_sample_block_size", self.field_bg_dense_sample_block_size))
+            self.field_bg_dense_pixels_per_block = int(config.get("field_bg_dense_pixels_per_block", self.field_bg_dense_pixels_per_block))
+            self.field_bg_dense_max_pixels_per_camera = int(config.get("field_bg_dense_max_pixels_per_camera", self.field_bg_dense_max_pixels_per_camera))
+            self.field_bg_dense_debug = bool(config.get("field_bg_dense_debug", int(self.field_bg_dense_debug)))
+            self.field_bg_dense_debug_max_events = int(config.get("field_bg_dense_debug_max_events", self.field_bg_dense_debug_max_events))
+            self.field_bg_dense_da3_filter = bool(config.get("field_bg_dense_da3_filter", int(self.field_bg_dense_da3_filter)))
+            self.field_bg_dense_da3_path = str(config.get("field_bg_dense_da3_path", self.field_bg_dense_da3_path))
+            self.field_bg_dense_da3_foreground_quantile = float(config.get("field_bg_dense_da3_foreground_quantile", self.field_bg_dense_da3_foreground_quantile))
+            self.field_bg_dense_beit_filter = bool(config.get("field_bg_dense_beit_filter", int(self.field_bg_dense_beit_filter)))
+            self.field_bg_dense_beit_path = str(config.get("field_bg_dense_beit_path", self.field_bg_dense_beit_path))
+            self.field_bg_dense_beit_band_low = float(config.get("field_bg_dense_beit_band_low", self.field_bg_dense_beit_band_low))
+            self.field_bg_dense_beit_band_high = float(config.get("field_bg_dense_beit_band_high", self.field_bg_dense_beit_band_high))
+            self.field_bg_dense_beit_threshold = float(config.get("field_bg_dense_beit_threshold", self.field_bg_dense_beit_threshold))
+            self.field_bg_dense_cell_dedup = bool(config.get("field_bg_dense_cell_dedup", int(self.field_bg_dense_cell_dedup)))
+            self.field_bg_dense_dedup_level = int(config.get("field_bg_dense_dedup_level", self.field_bg_dense_dedup_level))
+            self.field_bg_dense_max_per_cell = int(config.get("field_bg_dense_max_per_cell", self.field_bg_dense_max_per_cell))
+            self.field_bg_dense_skip_control_at_add_iter = bool(config.get("field_bg_dense_skip_control_at_add_iter", int(self.field_bg_dense_skip_control_at_add_iter)))
+            self.field_bg_dense_clip_to_bbox = bool(config.get("field_bg_dense_clip_to_bbox", int(self.field_bg_dense_clip_to_bbox)))
+            self.field_bg_dense_bbox_clip_margin = float(config.get("field_bg_dense_bbox_clip_margin", self.field_bg_dense_bbox_clip_margin))
+            self.field_depthpro_supervision = bool(config.get("field_depthpro_supervision", int(self.field_depthpro_supervision)))
+            self.field_depthpro_path = str(config.get("field_depthpro_path", self.field_depthpro_path))
+            self.field_depthpro_start = int(config.get("field_depthpro_start", self.field_depthpro_start))
+            self.field_depthpro_until = int(config.get("field_depthpro_until", self.field_depthpro_until))
+            self.field_depthpro_loss_weight = float(config.get("field_depthpro_loss_weight", self.field_depthpro_loss_weight))
+            self.field_depthpro_max_depth = float(config.get("field_depthpro_max_depth", self.field_depthpro_max_depth))
+            self.field_depthpro_min_pixels = int(config.get("field_depthpro_min_pixels", self.field_depthpro_min_pixels))
+            self.field_depthpro_error_clamp = float(config.get("field_depthpro_error_clamp", self.field_depthpro_error_clamp))
+            self.field_depthpro_use_beit_mask = bool(config.get("field_depthpro_use_beit_mask", int(self.field_depthpro_use_beit_mask)))
+            self.field_depthpro_exclude_unreliable = bool(config.get("field_depthpro_exclude_unreliable", int(self.field_depthpro_exclude_unreliable)))
+            self.field_scale_reg = bool(config.get("field_scale_reg", int(self.field_scale_reg)))
+            self.field_scale_reg_start = int(config.get("field_scale_reg_start", self.field_scale_reg_start))
+            self.field_scale_reg_until = int(config.get("field_scale_reg_until", self.field_scale_reg_until))
+            self.field_scale_reg_weight = float(config.get("field_scale_reg_weight", self.field_scale_reg_weight))
+            self.field_scale_reg_base_limit = float(config.get("field_scale_reg_base_limit", self.field_scale_reg_base_limit))
+            self.field_scale_reg_depth_ref = float(config.get("field_scale_reg_depth_ref", self.field_scale_reg_depth_ref))
+            self.field_scale_reg_depth_gamma = float(config.get("field_scale_reg_depth_gamma", self.field_scale_reg_depth_gamma))
+            self.field_scale_reg_max_boost = float(config.get("field_scale_reg_max_boost", self.field_scale_reg_max_boost))
+            self.field_bg_candidate_grad_boost = bool(config.get("field_bg_candidate_grad_boost", int(self.field_bg_candidate_grad_boost)))
+            self.field_bg_candidate_feature_grad_scale = float(config.get("field_bg_candidate_feature_grad_scale", self.field_bg_candidate_feature_grad_scale))
+            self.field_bg_candidate_opacity_grad_scale = float(config.get("field_bg_candidate_opacity_grad_scale", self.field_bg_candidate_opacity_grad_scale))
+            self.field_bg_candidate_scaling_grad_scale = float(config.get("field_bg_candidate_scaling_grad_scale", self.field_bg_candidate_scaling_grad_scale))
+            self.field_bg_only_train = bool(config.get("field_bg_only_train", int(self.field_bg_only_train)))
+            self.field_bg_only_start = int(config.get("field_bg_only_start", self.field_bg_only_start))
+            self.field_bg_only_until = int(config.get("field_bg_only_until", self.field_bg_only_until))
+            self.field_bg_only_interval = int(config.get("field_bg_only_interval", self.field_bg_only_interval))
+            self.field_bg_only_loss_weight = float(config.get("field_bg_only_loss_weight", self.field_bg_only_loss_weight))
+            self.field_bg_only_min_pixels = int(config.get("field_bg_only_min_pixels", self.field_bg_only_min_pixels))
+            self.field_bg_only_da3_filter = bool(config.get("field_bg_only_da3_filter", int(self.field_bg_only_da3_filter)))
+            self.field_bg_only_update_modules = bool(config.get("field_bg_only_update_modules", int(self.field_bg_only_update_modules)))
+            self.field_obs_reliability = bool(config.get("field_obs_reliability", int(self.field_obs_reliability)))
+            self.field_obs_reliability_floor = float(config.get("field_obs_reliability_floor", self.field_obs_reliability_floor))
+            self.field_obs_reliability_mad_threshold = float(config.get("field_obs_reliability_mad_threshold", self.field_obs_reliability_mad_threshold))
+            self.field_obs_reliability_diff_threshold = float(config.get("field_obs_reliability_diff_threshold", self.field_obs_reliability_diff_threshold))
+            self.field_obs_reliability_motion_threshold = float(config.get("field_obs_reliability_motion_threshold", self.field_obs_reliability_motion_threshold))
+            self.field_obs_reliability_mad_weight = float(config.get("field_obs_reliability_mad_weight", self.field_obs_reliability_mad_weight))
+            self.field_obs_reliability_diff_weight = float(config.get("field_obs_reliability_diff_weight", self.field_obs_reliability_diff_weight))
+            self.field_obs_reliability_motion_weight = float(config.get("field_obs_reliability_motion_weight", self.field_obs_reliability_motion_weight))
+            self.field_obs_reliability_unreliable_threshold = float(config.get("field_obs_reliability_unreliable_threshold", self.field_obs_reliability_unreliable_threshold))
+            self.field_obs_reliability_debug = bool(config.get("field_obs_reliability_debug", int(self.field_obs_reliability_debug)))
+            self.field_obs_reliability_start = int(config.get("field_obs_reliability_start", self.field_obs_reliability_start))
+            self.field_obs_reliability_until = int(config.get("field_obs_reliability_until", self.field_obs_reliability_until))
+            self.field_obs_reliability_ema = float(config.get("field_obs_reliability_ema", self.field_obs_reliability_ema))
+            self.field_obs_reliability_error_quantile = float(config.get("field_obs_reliability_error_quantile", self.field_obs_reliability_error_quantile))
+            self.field_obs_reliability_error_threshold = float(config.get("field_obs_reliability_error_threshold", self.field_obs_reliability_error_threshold))
+            self.field_obs_reliability_min_error = float(config.get("field_obs_reliability_min_error", self.field_obs_reliability_min_error))
+            self.field_obs_reliability_dynamic_dilate = int(config.get("field_obs_reliability_dynamic_dilate", self.field_obs_reliability_dynamic_dilate))
+            self.field_obs_reliability_structural_weight = float(config.get("field_obs_reliability_structural_weight", self.field_obs_reliability_structural_weight))
+            self.field_obs_reliability_local_window = int(config.get("field_obs_reliability_local_window", self.field_obs_reliability_local_window))
+            self.field_obs_boost_unreliable_loss = bool(config.get("field_obs_boost_unreliable_loss", int(self.field_obs_boost_unreliable_loss)))
+            self.field_obs_boost_weight = float(config.get("field_obs_boost_weight", self.field_obs_boost_weight))
+            self.field_obs_reset = bool(config.get("field_obs_reset", int(self.field_obs_reset)))
+            self.field_obs_reset_mode = str(config.get("field_obs_reset_mode", self.field_obs_reset_mode))
+            self.field_obs_reset_start = int(config.get("field_obs_reset_start", self.field_obs_reset_start))
+            self.field_obs_reset_until = int(config.get("field_obs_reset_until", self.field_obs_reset_until))
+            self.field_obs_reset_interval = int(config.get("field_obs_reset_interval", self.field_obs_reset_interval))
+            self.field_obs_reset_schedule = str(config.get("field_obs_reset_schedule", self.field_obs_reset_schedule))
+            self.field_obs_reset_opacity = float(config.get("field_obs_reset_opacity", self.field_obs_reset_opacity))
+            self.field_obs_reset_min_opacity = float(config.get("field_obs_reset_min_opacity", self.field_obs_reset_min_opacity))
+            self.field_obs_reset_max_points = int(config.get("field_obs_reset_max_points", self.field_obs_reset_max_points))
+            self.field_obs_reset_selection_mode = str(config.get("field_obs_reset_selection_mode", self.field_obs_reset_selection_mode))
+            self.field_obs_reset_min_masked_contrib = float(config.get("field_obs_reset_min_masked_contrib", self.field_obs_reset_min_masked_contrib))
+            self.field_obs_reset_min_contrib_ratio = float(config.get("field_obs_reset_min_contrib_ratio", self.field_obs_reset_min_contrib_ratio))
+            self.field_obs_reset_debug = bool(config.get("field_obs_reset_debug", int(self.field_obs_reset_debug)))
+            self.field_obs_reset_debug_max_events = int(config.get("field_obs_reset_debug_max_events", self.field_obs_reset_debug_max_events))
+            self.field_obs_reset_log_zero = bool(config.get("field_obs_reset_log_zero", int(self.field_obs_reset_log_zero)))
+            self.field_obs_reset_scan_time_indices = str(config.get("field_obs_reset_scan_time_indices", self.field_obs_reset_scan_time_indices))
+            self.field_obs_reset_scan_views_per_time = int(config.get("field_obs_reset_scan_views_per_time", self.field_obs_reset_scan_views_per_time))
+            self.field_obs_reset_scan_min_hits = int(config.get("field_obs_reset_scan_min_hits", self.field_obs_reset_scan_min_hits))
+            self.field_obs_reset_scan_top_ratio = float(config.get("field_obs_reset_scan_top_ratio", self.field_obs_reset_scan_top_ratio))
+            self.field_obs_reset_scan_max_points = int(config.get("field_obs_reset_scan_max_points", self.field_obs_reset_scan_max_points))
+            self.field_obs_reset_scan_update_ema = bool(config.get("field_obs_reset_scan_update_ema", int(self.field_obs_reset_scan_update_ema)))
+            self.field_global_reset = bool(config.get("field_global_reset", int(self.field_global_reset)))
+            self.field_global_reset_schedule = str(config.get("field_global_reset_schedule", self.field_global_reset_schedule))
+            self.field_freq_prior = bool(config.get("field_freq_prior", int(self.field_freq_prior)))
+            self.field_freq_prior_start = int(config.get("field_freq_prior_start", self.field_freq_prior_start))
+            self.field_freq_prior_until = int(config.get("field_freq_prior_until", self.field_freq_prior_until))
+            self.field_freq_prior_weight = float(config.get("field_freq_prior_weight", self.field_freq_prior_weight))
+            self.field_freq_prior_patch_size = int(config.get("field_freq_prior_patch_size", self.field_freq_prior_patch_size))
+            self.field_freq_prior_highpass = float(config.get("field_freq_prior_highpass", self.field_freq_prior_highpass))
+            self.field_freq_prior_max_patches = int(config.get("field_freq_prior_max_patches", self.field_freq_prior_max_patches))
+            self.field_freq_prior_min_mask_ratio = float(config.get("field_freq_prior_min_mask_ratio", self.field_freq_prior_min_mask_ratio))
+            self.field_freq_prior_reference = str(config.get("field_freq_prior_reference", self.field_freq_prior_reference))
+            self.field_freq_prior_on_reset_only = bool(config.get("field_freq_prior_on_reset_only", int(self.field_freq_prior_on_reset_only)))
+            self.field_freq_prior_debug = bool(config.get("field_freq_prior_debug", int(self.field_freq_prior_debug)))
+            self.field_freq_prior_debug_max_events = int(config.get("field_freq_prior_debug_max_events", self.field_freq_prior_debug_max_events))
+            self.field_freq_prior_debug_mode = str(config.get("field_freq_prior_debug_mode", self.field_freq_prior_debug_mode))
+            self.field_bg_median_loss = bool(config.get("field_bg_median_loss", int(self.field_bg_median_loss)))
+            self.field_bg_median_loss_weight = float(config.get("field_bg_median_loss_weight", self.field_bg_median_loss_weight))
 
         if not self.use_euler_field:
             self._static_level_logits = torch.empty(0, device="cuda")
@@ -2411,6 +3700,7 @@ class GaussianModel:
             self._load_module_state_compatible(self.field_static_app_head, payload["field_static_app_head"])
 
         saved_static_logits = payload.get("static_level_logits")
+        saved_static_radiance_logits = payload.get("static_radiance_level_logits")
         if saved_static_logits is None:
             saved_static_logits = payload.get("grid_level_logits")
         saved_dynamic_logits = payload.get("dynamic_level_logits")
@@ -2437,6 +3727,22 @@ class GaussianModel:
             static_logits = saved_static_logits.to(device="cuda", dtype=torch.float32)
         else:
             static_logits = torch.zeros((num_points, self.field_num_levels), device="cuda")
+        if saved_static_radiance_logits is not None:
+            static_radiance_logits = saved_static_radiance_logits.to(device="cuda", dtype=torch.float32).view(-1)
+            if static_radiance_logits.shape[0] < self.field_num_levels:
+                static_radiance_logits = torch.cat(
+                    (
+                        static_radiance_logits,
+                        torch.zeros((self.field_num_levels - static_radiance_logits.shape[0],), device="cuda", dtype=static_radiance_logits.dtype),
+                    ),
+                    dim=0,
+                )
+            elif static_radiance_logits.shape[0] > self.field_num_levels:
+                static_radiance_logits = static_radiance_logits[: self.field_num_levels]
+        elif self.field_static_radiance_branch:
+            static_radiance_logits = torch.zeros((self.field_num_levels,), device="cuda")
+        else:
+            static_radiance_logits = torch.empty(0, device="cuda")
 
         if saved_dynamic_logits is not None:
             dynamic_logits = saved_dynamic_logits.to(device="cuda", dtype=torch.float32)
@@ -2500,6 +3806,10 @@ class GaussianModel:
                 static_route_logits = torch.cat((base_static_route_logits, static_route_logits), dim=0)
 
         self._static_level_logits = nn.Parameter(static_logits.requires_grad_(True))
+        if static_radiance_logits.numel() > 0:
+            self._static_radiance_level_logits = nn.Parameter(static_radiance_logits.requires_grad_(True))
+        else:
+            self._static_radiance_level_logits = torch.empty(0, device="cuda")
         self._dynamic_level_logits = nn.Parameter(dynamic_logits.requires_grad_(True))
         self._dynamic_level_time_coeff = nn.Parameter(dynamic_time_coeff.requires_grad_(True))
         if static_route_logits.numel() > 0:
@@ -2671,6 +3981,7 @@ class GaussianModel:
             "rgbdecoder": self.rgbdecoder.state_dict() if self.rgbdecoder is not None else None,
             "field_config": self._checkpoint_field_config(),
             "static_level_logits": self._static_level_logits.detach().cpu() if self.use_euler_field and self._static_level_logits.numel() > 0 else None,
+            "static_radiance_level_logits": self._static_radiance_level_logits.detach().cpu() if self.use_euler_field and self._static_radiance_level_logits.numel() > 0 else None,
             "dynamic_level_logits": self._dynamic_level_logits.detach().cpu() if self.use_euler_field and self._dynamic_level_logits.numel() > 0 else None,
             "dynamic_level_time_coeff": self._dynamic_level_time_coeff.detach().cpu() if self.use_euler_field and self._dynamic_level_time_coeff.numel() > 0 else None,
             "static_route_logits": self._static_route_logits.detach().cpu() if self.use_euler_field and self._static_route_logits.numel() > 0 else None,
@@ -2705,6 +4016,297 @@ class GaussianModel:
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+
+    def reset_observation_region_opacity(self, region_mask, viewpoint_cam, means3D, visibility_filter, iteration, radii=None, return_stats=False, contrib_total=None, contrib_masked=None):
+        def make_result(reason, stats=None):
+            if not return_stats:
+                return 0
+            result = {
+                "reason": reason,
+                "selected_points": 0,
+                "candidate_points": 0,
+                "in_region_points": 0,
+                "valid_projected_points": 0,
+                "visible_points": 0,
+            }
+            if stats is not None:
+                result.update(stats)
+            result["reason"] = reason
+            return result
+
+        def summarize_tensor(stats, prefix, values):
+            if values is None:
+                return
+            values = values.detach().float()
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                return
+            stats[f"{prefix}_mean"] = float(values.mean().item())
+            stats[f"{prefix}_min"] = float(values.min().item())
+            stats[f"{prefix}_max"] = float(values.max().item())
+            stats[f"{prefix}_p50"] = float(torch.quantile(values, 0.50).item())
+            stats[f"{prefix}_p90"] = float(torch.quantile(values, 0.90).item())
+
+        if not bool(getattr(self, "field_obs_reset", False)):
+            return make_result("disabled")
+        schedule_raw = str(getattr(self, "field_obs_reset_schedule", "")).strip()
+        if schedule_raw:
+            scheduled_iters = set()
+            for item in schedule_raw.split(","):
+                item = item.strip()
+                if item:
+                    scheduled_iters.add(int(item))
+            if int(iteration) not in scheduled_iters:
+                return make_result("outside_schedule")
+        else:
+            start = int(getattr(self, "field_obs_reset_start", 1500))
+            until = int(getattr(self, "field_obs_reset_until", 9000))
+            interval = max(int(getattr(self, "field_obs_reset_interval", 500)), 1)
+            if int(iteration) < start or int(iteration) > until or (int(iteration) - start) % interval != 0:
+                return make_result("outside_schedule")
+        if region_mask is None or torch.count_nonzero(region_mask) == 0:
+            return make_result("empty_region")
+        if means3D is None or means3D.shape[0] != self._xyz.shape[0]:
+            return make_result("invalid_means")
+        if visibility_filter is None or visibility_filter.shape[0] != self._xyz.shape[0]:
+            return make_result("invalid_visibility")
+
+        with torch.no_grad():
+            device = self._xyz.device
+            means3D = means3D.to(device=device)
+            region_mask = region_mask.to(device=device, dtype=torch.bool)
+            visibility_filter = visibility_filter.to(device=device, dtype=torch.bool)
+            height, width = region_mask.shape
+            stats = {
+                "reason": "ok",
+                "iteration": int(iteration),
+                "camera": str(getattr(viewpoint_cam, "image_name", "")),
+                "timestamp": float(getattr(viewpoint_cam, "timestamp", 0.0)),
+                "image_height": int(height),
+                "image_width": int(width),
+                "region_pixels": int(torch.count_nonzero(region_mask).item()),
+                "region_ratio": float(torch.count_nonzero(region_mask).float().item() / max(float(height * width), 1.0)),
+                "total_points": int(self._xyz.shape[0]),
+                "visible_points": int(torch.count_nonzero(visibility_filter).item()),
+            }
+            projected = geom_transform_points(means3D, viewpoint_cam.full_proj_transform)
+            ndc = projected[:, :2]
+            valid = (
+                visibility_filter
+                & torch.isfinite(ndc[:, 0])
+                & torch.isfinite(ndc[:, 1])
+                & (ndc[:, 0] >= -1.0)
+                & (ndc[:, 0] <= 1.0)
+                & (ndc[:, 1] >= -1.0)
+                & (ndc[:, 1] <= 1.0)
+            )
+            if torch.count_nonzero(valid) == 0:
+                return make_result("no_valid_projected", stats)
+            stats["valid_projected_points"] = int(torch.count_nonzero(valid).item())
+
+            x = (((ndc[:, 0] + 1.0) * float(width)) - 1.0) * 0.5
+            y = (((ndc[:, 1] + 1.0) * float(height)) - 1.0) * 0.5
+            x_idx = torch.round(x).long().clamp(0, width - 1)
+            y_idx = torch.round(y).long().clamp(0, height - 1)
+            in_region = torch.zeros_like(valid)
+            in_region[valid] = region_mask[y_idx[valid], x_idx[valid]]
+            stats["in_region_points"] = int(torch.count_nonzero(in_region).item())
+
+            opacity = self.get_opacity.squeeze(1)
+            min_opacity = max(float(getattr(self, "field_obs_reset_min_opacity", 0.05)), 0.0)
+            selection_mode = str(getattr(self, "field_obs_reset_selection_mode", "center")).lower()
+            score = opacity.float()
+            if selection_mode == "contribution":
+                if contrib_total is None or contrib_masked is None:
+                    return make_result("missing_contribution", stats)
+                if contrib_total.shape[0] != self._xyz.shape[0] or contrib_masked.shape[0] != self._xyz.shape[0]:
+                    return make_result("invalid_contribution", stats)
+                contrib_total = contrib_total.to(device=device, dtype=torch.float32)
+                contrib_masked = contrib_masked.to(device=device, dtype=torch.float32)
+                contrib_ratio = contrib_masked / (contrib_total + 1e-6)
+                min_masked = max(float(getattr(self, "field_obs_reset_min_masked_contrib", 0.0)), 0.0)
+                min_ratio = max(float(getattr(self, "field_obs_reset_min_contrib_ratio", 0.05)), 0.0)
+                candidate = valid & (opacity > min_opacity) & (contrib_masked > min_masked) & (contrib_ratio > min_ratio)
+                score = contrib_masked * contrib_ratio * opacity.float()
+                stats["selection_mode"] = "contribution"
+                stats["min_masked_contrib"] = float(min_masked)
+                stats["min_contrib_ratio"] = float(min_ratio)
+                summarize_tensor(stats, "candidate_contrib_total", contrib_total[candidate])
+                summarize_tensor(stats, "candidate_contrib_masked", contrib_masked[candidate])
+                summarize_tensor(stats, "candidate_contrib_ratio", contrib_ratio[candidate])
+                summarize_tensor(stats, "candidate_score", score[candidate])
+            else:
+                candidate = in_region & (opacity > min_opacity)
+                stats["selection_mode"] = "center"
+            stats["candidate_points"] = int(torch.count_nonzero(candidate).item())
+            summarize_tensor(stats, "candidate_opacity", opacity[candidate])
+            selected_indices = torch.nonzero(candidate, as_tuple=False).squeeze(1)
+
+            if return_stats:
+                masks = {
+                    "in_region_points": torch.zeros((height, width), device=device, dtype=torch.bool),
+                    "candidate_points": torch.zeros((height, width), device=device, dtype=torch.bool),
+                    "reset_points": torch.zeros((height, width), device=device, dtype=torch.bool),
+                }
+                masks["in_region_points"][y_idx[in_region], x_idx[in_region]] = True
+                masks["candidate_points"][y_idx[candidate], x_idx[candidate]] = True
+                stats["_debug_masks"] = masks
+
+            if selected_indices.numel() == 0:
+                return make_result("no_candidate", stats)
+
+            max_points = max(int(getattr(self, "field_obs_reset_max_points", 512)), 1)
+            if selected_indices.numel() > max_points:
+                _, topk = torch.topk(score[selected_indices].float(), k=max_points, largest=True)
+                selected_indices = selected_indices[topk]
+
+            reset_opacity = max(min(float(getattr(self, "field_obs_reset_opacity", 0.01)), 1.0 - 1e-6), 1e-6)
+            old_opacity = self.get_opacity[selected_indices].clamp(1e-6, 1.0 - 1e-6)
+            new_opacity = torch.minimum(old_opacity, torch.full_like(old_opacity, reset_opacity))
+            self._opacity[selected_indices] = inverse_sigmoid(new_opacity)
+            stats["selected_points"] = int(selected_indices.numel())
+            stats["limited_by_max_points"] = int(stats["candidate_points"] > selected_indices.numel())
+            stats["reset_opacity"] = float(reset_opacity)
+            summarize_tensor(stats, "selected_opacity_before", old_opacity.squeeze(1))
+            summarize_tensor(stats, "selected_opacity_after", new_opacity.squeeze(1))
+            if selection_mode == "contribution":
+                summarize_tensor(stats, "selected_contrib_total", contrib_total[selected_indices])
+                summarize_tensor(stats, "selected_contrib_masked", contrib_masked[selected_indices])
+                summarize_tensor(stats, "selected_contrib_ratio", contrib_ratio[selected_indices])
+                summarize_tensor(stats, "selected_score", score[selected_indices])
+            camera_center = getattr(viewpoint_cam, "camera_center", None)
+            if camera_center is not None:
+                camera_center = camera_center.to(device=device, dtype=means3D.dtype).view(1, 3)
+                distance = torch.linalg.norm(means3D[selected_indices] - camera_center, dim=1)
+                summarize_tensor(stats, "selected_camera_distance", distance)
+            scale_max = torch.max(self.get_scaling[selected_indices].detach().float(), dim=1).values
+            summarize_tensor(stats, "selected_scale_max", scale_max)
+            if radii is not None and radii.shape[0] == self._xyz.shape[0]:
+                summarize_tensor(stats, "selected_screen_radius", radii.to(device=device).detach().float()[selected_indices])
+            summarize_tensor(stats, "selected_screen_x", x_idx[selected_indices].float())
+            summarize_tensor(stats, "selected_screen_y", y_idx[selected_indices].float())
+            summarize_tensor(stats, "selected_world_x", means3D[selected_indices, 0])
+            summarize_tensor(stats, "selected_world_y", means3D[selected_indices, 1])
+            summarize_tensor(stats, "selected_world_z", means3D[selected_indices, 2])
+            if return_stats:
+                stats["_debug_masks"]["reset_points"][y_idx[selected_indices], x_idx[selected_indices]] = True
+
+            for group in self.optimizer.param_groups:
+                if group.get("name", None) != "opacity" or len(group["params"]) != 1:
+                    continue
+                stored_state = self.optimizer.state.get(group["params"][0], None)
+                if stored_state is None:
+                    continue
+                if "exp_avg" in stored_state:
+                    stored_state["exp_avg"][selected_indices] = 0
+                if "exp_avg_sq" in stored_state:
+                    stored_state["exp_avg_sq"][selected_indices] = 0
+            if return_stats:
+                return stats
+            return int(selected_indices.numel())
+
+    def reset_observation_score_opacity(self, reset_score, reset_hits, iteration, return_stats=False):
+        def make_result(reason, stats=None):
+            if not return_stats:
+                return 0
+            result = {
+                "reason": reason,
+                "selected_points": 0,
+                "candidate_points": 0,
+                "total_points": int(self._xyz.shape[0]),
+            }
+            if stats is not None:
+                result.update(stats)
+            result["reason"] = reason
+            return result
+
+        def summarize_tensor(stats, prefix, values):
+            if values is None:
+                return
+            values = values.detach().float()
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                return
+            stats[f"{prefix}_mean"] = float(values.mean().item())
+            stats[f"{prefix}_min"] = float(values.min().item())
+            stats[f"{prefix}_max"] = float(values.max().item())
+            stats[f"{prefix}_p50"] = float(torch.quantile(values, 0.50).item())
+            stats[f"{prefix}_p90"] = float(torch.quantile(values, 0.90).item())
+
+        if not bool(getattr(self, "field_obs_reset", False)):
+            return make_result("disabled")
+        if reset_score is None or reset_hits is None:
+            return make_result("missing_score")
+        if reset_score.shape[0] != self._xyz.shape[0] or reset_hits.shape[0] != self._xyz.shape[0]:
+            return make_result("invalid_score_shape")
+
+        with torch.no_grad():
+            device = self._xyz.device
+            reset_score = reset_score.to(device=device, dtype=torch.float32)
+            reset_hits = reset_hits.to(device=device)
+            opacity = self.get_opacity.squeeze(1)
+            min_hits = max(int(getattr(self, "field_obs_reset_scan_min_hits", 2)), 1)
+            min_opacity = max(float(getattr(self, "field_obs_reset_min_opacity", 0.05)), 0.0)
+            candidate = (
+                torch.isfinite(reset_score)
+                & (reset_score > 0.0)
+                & (reset_hits >= min_hits)
+                & (opacity > min_opacity)
+            )
+            candidate_indices = torch.nonzero(candidate, as_tuple=False).squeeze(1)
+            stats = {
+                "reason": "ok",
+                "iteration": int(iteration),
+                "selection_mode": "multiview_contribution",
+                "total_points": int(self._xyz.shape[0]),
+                "candidate_points": int(candidate_indices.numel()),
+                "min_hits": int(min_hits),
+                "top_ratio": float(getattr(self, "field_obs_reset_scan_top_ratio", 0.2)),
+            }
+            summarize_tensor(stats, "candidate_score", reset_score[candidate])
+            summarize_tensor(stats, "candidate_hits", reset_hits[candidate].float())
+            summarize_tensor(stats, "candidate_opacity", opacity[candidate])
+            if candidate_indices.numel() == 0:
+                return make_result("no_candidate", stats)
+
+            top_ratio = max(0.0, min(float(getattr(self, "field_obs_reset_scan_top_ratio", 0.2)), 1.0))
+            select_count = max(int(torch.ceil(torch.tensor(float(candidate_indices.numel()) * top_ratio)).item()), 1)
+            max_points = int(getattr(self, "field_obs_reset_scan_max_points", 0))
+            if max_points > 0:
+                select_count = min(select_count, max_points)
+            select_count = min(select_count, int(candidate_indices.numel()))
+            _, topk = torch.topk(reset_score[candidate_indices].float(), k=select_count, largest=True)
+            selected_indices = candidate_indices[topk]
+
+            reset_opacity = max(min(float(getattr(self, "field_obs_reset_opacity", 0.01)), 1.0 - 1e-6), 1e-6)
+            old_opacity = self.get_opacity[selected_indices].clamp(1e-6, 1.0 - 1e-6)
+            new_opacity = torch.minimum(old_opacity, torch.full_like(old_opacity, reset_opacity))
+            self._opacity[selected_indices] = inverse_sigmoid(new_opacity)
+            stats["selected_points"] = int(selected_indices.numel())
+            stats["reset_opacity"] = float(reset_opacity)
+            stats["limited_by_max_points"] = int(max_points > 0 and int(candidate_indices.numel()) * top_ratio > max_points)
+            summarize_tensor(stats, "selected_score", reset_score[selected_indices])
+            summarize_tensor(stats, "selected_hits", reset_hits[selected_indices].float())
+            summarize_tensor(stats, "selected_opacity_before", old_opacity.squeeze(1))
+            summarize_tensor(stats, "selected_opacity_after", new_opacity.squeeze(1))
+            summarize_tensor(stats, "selected_scale_max", torch.max(self.get_scaling[selected_indices].detach().float(), dim=1).values)
+            summarize_tensor(stats, "selected_world_x", self._xyz[selected_indices, 0])
+            summarize_tensor(stats, "selected_world_y", self._xyz[selected_indices, 1])
+            summarize_tensor(stats, "selected_world_z", self._xyz[selected_indices, 2])
+
+            for group in self.optimizer.param_groups:
+                if group.get("name", None) != "opacity" or len(group["params"]) != 1:
+                    continue
+                stored_state = self.optimizer.state.get(group["params"][0], None)
+                if stored_state is None:
+                    continue
+                if "exp_avg" in stored_state:
+                    stored_state["exp_avg"][selected_indices] = 0
+                if "exp_avg_sq" in stored_state:
+                    stored_state["exp_avg_sq"][selected_indices] = 0
+            if return_stats:
+                return stats
+            return int(selected_indices.numel())
     
     def zero_omega(self, threhold=0.15):
         scales = self.get_scaling
@@ -3158,7 +4760,7 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            if len(group["params"]) == 1 and group["name"] not in ['decoder', 'field_gate', 'field_temporal_opacity']:
+            if len(group["params"]) == 1 and group["name"] not in ['decoder', 'field_gate', 'field_temporal_opacity', 'static_radiance_level_logits']:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 if stored_state is not None:
                     stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -3230,6 +4832,16 @@ class GaussianModel:
             self._static_support_mask = self._static_support_mask[valid_points_mask]
         if self._visibility_persistence_ema is not None and self._visibility_persistence_ema.numel() > 0:
             self._visibility_persistence_ema = self._visibility_persistence_ema[valid_points_mask]
+        if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() > 0:
+            if self._bg_candidate_mask.shape[0] == valid_points_mask.shape[0]:
+                self._bg_candidate_mask = self._bg_candidate_mask[valid_points_mask]
+            else:
+                self._bg_candidate_mask = torch.zeros((int(torch.count_nonzero(valid_points_mask).item()), 1), device="cuda", dtype=torch.float32)
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0:
+            if self._bg_birth_iter.shape[0] == valid_points_mask.shape[0]:
+                self._bg_birth_iter = self._bg_birth_iter[valid_points_mask]
+            else:
+                self._bg_birth_iter = torch.full((int(torch.count_nonzero(valid_points_mask).item()), 1), -1.0, device="cuda", dtype=torch.float32)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -3253,7 +4865,8 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None):
+        old_count = self._xyz.shape[0]
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "opacity": new_opacities,
@@ -3366,6 +4979,20 @@ class GaussianModel:
             self._visibility_persistence_ema = new_visibility
         else:
             self._visibility_persistence_ema = torch.cat((self._visibility_persistence_ema, new_visibility), dim=0)
+        if new_bg_candidate_mask is None:
+            new_bg_candidate_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        if new_bg_birth_iter is None:
+            new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), -1.0, device="cuda", dtype=torch.float32)
+        if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() > 0 and self._bg_candidate_mask.shape[0] == old_count:
+            self._bg_candidate_mask = torch.cat((self._bg_candidate_mask, new_bg_candidate_mask), dim=0)
+        else:
+            old_bg_candidate = torch.zeros((old_count, 1), device="cuda", dtype=torch.float32)
+            self._bg_candidate_mask = torch.cat((old_bg_candidate, new_bg_candidate_mask), dim=0)
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0 and self._bg_birth_iter.shape[0] == old_count:
+            self._bg_birth_iter = torch.cat((self._bg_birth_iter, new_bg_birth_iter), dim=0)
+        else:
+            old_bg_birth = torch.full((old_count, 1), -1.0, device="cuda", dtype=torch.float32)
+            self._bg_birth_iter = torch.cat((old_bg_birth, new_bg_birth_iter), dim=0)
 
     
 
@@ -3768,6 +5395,631 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega,new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
         return new_xyz.shape[0]
+
+    def suppress_background_explainers(self, region_mask, viewpoint_cam, bg_depth, iteration):
+        if not self.field_bg_prior or not bool(getattr(self, "field_bg_prior_suppress", False)):
+            return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+        if region_mask is None or torch.count_nonzero(region_mask) == 0:
+            return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+        if self.get_xyz.numel() == 0:
+            return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+
+        with torch.no_grad():
+            xyz = self.get_xyz
+            device = xyz.device
+            region_mask = region_mask.to(device=device, dtype=torch.bool)
+            height, width = region_mask.shape
+
+            projected = geom_transform_points(xyz, viewpoint_cam.full_proj_transform)
+            ndc = projected[:, :2]
+            valid = (
+                torch.isfinite(ndc[:, 0])
+                & torch.isfinite(ndc[:, 1])
+                & (ndc[:, 0] >= -1.0)
+                & (ndc[:, 0] <= 1.0)
+                & (ndc[:, 1] >= -1.0)
+                & (ndc[:, 1] <= 1.0)
+            )
+            if torch.count_nonzero(valid) == 0:
+                return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+
+            x = (((ndc[:, 0] + 1.0) * float(width)) - 1.0) * 0.5
+            y = (((ndc[:, 1] + 1.0) * float(height)) - 1.0) * 0.5
+            x_idx = torch.round(x).long().clamp(0, width - 1)
+            y_idx = torch.round(y).long().clamp(0, height - 1)
+            in_region = torch.zeros_like(valid)
+            in_region[valid] = region_mask[y_idx[valid], x_idx[valid]]
+
+            camera_center = viewpoint_cam.camera_center.to(device=device, dtype=xyz.dtype)
+            depth_like = torch.linalg.norm(xyz - camera_center.view(1, 3), dim=1)
+            bg_depth_value = torch.as_tensor(bg_depth, device=device, dtype=xyz.dtype).reshape(()).clamp_min(1e-4)
+            depth_margin = max(float(getattr(self, "field_bg_prior_suppress_depth_margin", 1.0)), 0.0)
+            in_front = depth_like < (bg_depth_value - depth_margin)
+
+            opacity = self.get_opacity.squeeze(1)
+            opacity_gate = opacity > float(getattr(self, "field_bg_prior_suppress_opacity_threshold", 0.05))
+            candidate = in_region & in_front & opacity_gate
+
+            if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() == candidate.shape[0]:
+                candidate = candidate & (self._bg_candidate_mask.squeeze(1) <= 0.5)
+
+            if torch.count_nonzero(candidate) == 0:
+                return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+
+            scale = self.get_scaling.max(dim=1).values
+            scale_quantile = float(getattr(self, "field_bg_prior_suppress_scale_quantile", 0.75))
+            if 0.0 <= scale_quantile <= 1.0 and torch.count_nonzero(candidate) > 8:
+                scale_threshold = torch.quantile(scale[candidate].float(), scale_quantile)
+                candidate = candidate & (scale >= scale_threshold)
+
+            selected_indices = torch.nonzero(candidate, as_tuple=False).squeeze(1)
+            if selected_indices.numel() == 0:
+                return 0, torch.zeros_like(region_mask, dtype=torch.bool)
+
+            max_points = max(int(getattr(self, "field_bg_prior_suppress_max_points", 512)), 1)
+            if selected_indices.numel() > max_points:
+                scores = opacity[selected_indices] * torch.clamp(scale[selected_indices], min=1e-6)
+                _, topk = torch.topk(scores.float(), k=max_points, largest=True)
+                selected_indices = selected_indices[topk]
+
+            decay = max(0.0, min(float(getattr(self, "field_bg_prior_suppress_decay", 0.02)), 0.95))
+            old_opacity = self.get_opacity[selected_indices].clamp(1e-6, 1.0 - 1e-6)
+            new_opacity = torch.clamp(old_opacity * (1.0 - decay), 1e-6, 1.0 - 1e-6)
+            self._opacity[selected_indices] = inverse_sigmoid(new_opacity)
+
+            suppressed_pixels = torch.zeros_like(region_mask, dtype=torch.bool)
+            suppressed_pixels[y_idx[selected_indices], x_idx[selected_indices]] = True
+            return int(selected_indices.numel()), suppressed_pixels
+
+    def add_static_background_gaussians(self, pixel_indices, viewpoint_cam, depthmap, bg_image, iteration,
+                                        numperay=1, depth_scale=1.02, depth_values=None, depth_scales=None):
+        if pixel_indices is None or pixel_indices.numel() == 0:
+            return 0
+
+        def pix2ndc(v, S):
+            return (v * 2.0 + 1.0) / S - 1.0
+
+        def clip_to_bbox(xyz):
+            if not bool(getattr(self, "field_bg_dense_clip_to_bbox", 0)):
+                return xyz
+            if not self.use_euler_field or self.euler_field is None:
+                return xyz
+            if not hasattr(self.euler_field, "bbox_min") or not hasattr(self.euler_field, "bbox_max"):
+                return xyz
+            if xyz.numel() == 0:
+                return xyz
+
+            bbox_min = self.euler_field.bbox_min.to(device=xyz.device, dtype=xyz.dtype).view(1, 3)
+            bbox_max = self.euler_field.bbox_max.to(device=xyz.device, dtype=xyz.dtype).view(1, 3)
+            inside = torch.all((xyz >= bbox_min) & (xyz <= bbox_max), dim=1)
+            if torch.all(inside):
+                return xyz
+
+            origin = viewpoint_cam.camera_center.to(device=xyz.device, dtype=xyz.dtype).view(1, 3)
+            direction = xyz - origin
+            eps = torch.tensor(1e-6, device=xyz.device, dtype=xyz.dtype)
+            inv_dir = torch.where(torch.abs(direction) > eps, 1.0 / direction, torch.full_like(direction, float("inf")))
+            t0 = (bbox_min - origin) * inv_dir
+            t1 = (bbox_max - origin) * inv_dir
+            t_min_axis = torch.minimum(t0, t1)
+            t_max_axis = torch.maximum(t0, t1)
+
+            parallel = torch.abs(direction) <= eps
+            origin_inside_axis = (origin >= bbox_min) & (origin <= bbox_max)
+            t_min_axis = torch.where(parallel & origin_inside_axis, torch.full_like(t_min_axis, -float("inf")), t_min_axis)
+            t_max_axis = torch.where(parallel & origin_inside_axis, torch.full_like(t_max_axis, float("inf")), t_max_axis)
+
+            t_enter = torch.max(t_min_axis, dim=1).values
+            t_exit = torch.min(t_max_axis, dim=1).values
+            intersects = (t_exit >= torch.clamp_min(t_enter, 0.0)) & torch.isfinite(t_exit) & (t_exit > 0.0)
+            margin = max(0.0, min(float(getattr(self, "field_bg_dense_bbox_clip_margin", 0.999)), 1.0))
+            t_clip = torch.clamp(t_exit * margin, min=0.0, max=1.0).view(-1, 1)
+            clipped = origin + direction * t_clip
+            should_clip = (~inside) & intersects & (t_exit < 1.0)
+            return torch.where(should_clip.view(-1, 1), clipped, xyz)
+
+        if depthmap.dim() == 2:
+            depthmap = depthmap.unsqueeze(0)
+        if bg_image.dim() != 3:
+            raise ValueError("bg_image must have shape [3, H, W]")
+
+        numperay = max(int(numperay), 1)
+        absolute_depths = None
+        if depth_values is not None:
+            if not torch.is_tensor(depth_values):
+                depth_values = torch.tensor(depth_values, device="cuda", dtype=depthmap.dtype)
+            absolute_depths = depth_values.to(device="cuda", dtype=depthmap.dtype).flatten()
+            absolute_depths = absolute_depths[torch.isfinite(absolute_depths) & (absolute_depths > 0.0)]
+            if absolute_depths.numel() == 0:
+                absolute_depths = None
+        if absolute_depths is None:
+            if depth_scales is not None:
+                if not torch.is_tensor(depth_scales):
+                    depth_scales = torch.tensor(depth_scales, device="cuda", dtype=depthmap.dtype)
+                depth_scales = depth_scales.to(device="cuda", dtype=depthmap.dtype).flatten()
+                depth_scales = depth_scales[torch.isfinite(depth_scales) & (depth_scales > 0.0)]
+                if depth_scales.numel() == 0:
+                    depth_scales = None
+            if depth_scales is not None:
+                pass
+            elif numperay == 1:
+                depth_scales = torch.tensor([float(depth_scale)], device="cuda", dtype=depthmap.dtype)
+            else:
+                depth_scales = torch.linspace(1.0, float(depth_scale), numperay, device="cuda", dtype=depthmap.dtype)
+        else:
+            depth_scales = absolute_depths
+
+        u = pixel_indices[:, 0].long()
+        v = pixel_indices[:, 1].long()
+        base_depths = depthmap[:, u, v].permute(1, 0).clamp_min(1e-4)
+        rgbs = bg_image[:, u, v].permute(1, 0).clamp(0.0, 1.0)
+        color_init = str(getattr(self, "field_bg_prior_color_init", "gt")).lower()
+        if color_init == "zero":
+            featuredc = torch.zeros((rgbs.shape[0], 6), device="cuda", dtype=rgbs.dtype)
+        else:
+            featuredc = torch.cat((rgbs, torch.zeros_like(rgbs)), dim=1)
+
+        camera2wold = viewpoint_cam.world_view_transform.T.inverse()
+        projectinverse = viewpoint_cam.projection_matrix.T.inverse()
+        ndcu = pix2ndc(u, viewpoint_cam.image_height).unsqueeze(1)
+        ndcv = pix2ndc(v, viewpoint_cam.image_width).unsqueeze(1)
+        ndccamera = torch.cat((ndcv, ndcu, torch.ones_like(ndcu), torch.ones_like(ndcu)), dim=1)
+        localpointuv = ndccamera @ projectinverse.T
+        direction_local = localpointuv / localpointuv[:, 3:]
+
+        new_xyz = []
+        new_features_dc = []
+        new_trbf_center = []
+        new_trbf_scale = []
+        new_motion = []
+        new_omega = []
+        new_featuret = []
+        new_depth_scale_tags = []
+        new_static_level_logits = []
+        new_dynamic_level_logits = []
+        new_dynamic_level_time_coeff = []
+
+        for depth_item in depth_scales:
+            if absolute_depths is None:
+                targetPz = base_depths * depth_item
+            else:
+                targetPz = torch.full_like(base_depths, float(depth_item.detach().cpu()))
+            denom = direction_local[:, 2:3]
+            denom = torch.where(torch.abs(denom) < 1e-6, torch.full_like(denom, 1e-6), denom)
+            rate = targetPz / denom
+            localpoint = direction_local * rate
+            localpoint[:, -1] = 1.0
+            worldpointH = localpoint @ camera2wold.T
+            worldpoint = worldpointH / worldpointH[:, 3:]
+            xyz = clip_to_bbox(worldpoint[:, :3])
+
+            selectnumpoints = xyz.shape[0]
+            new_xyz.append(xyz)
+            new_features_dc.append(featuredc)
+            if absolute_depths is None:
+                depth_scale_value = float(depth_item.detach().cpu())
+            else:
+                depth_scale_value = float("inf")
+            new_depth_scale_tags.append(torch.full((selectnumpoints, 1), depth_scale_value, device="cuda", dtype=xyz.dtype))
+            new_trbf_center.append(torch.full((selectnumpoints, 1), float(self.field_bg_prior_trbf_center), device="cuda"))
+            new_trbf_scale.append(torch.full((selectnumpoints, 1), float(self.field_bg_prior_trbf_scale), device="cuda"))
+            new_motion.append(torch.zeros((selectnumpoints, 9), device="cuda"))
+            new_omega.append(torch.zeros((selectnumpoints, 4), device="cuda"))
+            new_featuret.append(torch.zeros((selectnumpoints, 3), device="cuda"))
+            if self.use_euler_field:
+                new_static_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
+                new_dynamic_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
+                if self.field_level_fourier_degree > 0:
+                    coeff_dim = 2 * self.field_level_fourier_degree
+                    new_dynamic_level_time_coeff.append(torch.zeros((selectnumpoints, self.field_num_levels, coeff_dim), device="cuda"))
+
+        new_xyz = torch.cat(new_xyz, dim=0)
+        new_features_dc = torch.cat(new_features_dc, dim=0)
+        new_trbf_center = torch.cat(new_trbf_center, dim=0)
+        new_trbf_scale = torch.cat(new_trbf_scale, dim=0)
+        new_motion = torch.cat(new_motion, dim=0)
+        new_omega = torch.cat(new_omega, dim=0)
+        new_featuret = torch.cat(new_featuret, dim=0)
+        new_depth_scale_tags = torch.cat(new_depth_scale_tags, dim=0).reshape(-1)
+
+        new_rotation = torch.zeros((new_xyz.shape[0], 4), device="cuda")
+        new_rotation[:, 1] = 0.0
+        new_opacity = inverse_sigmoid(float(self.field_bg_prior_opacity) * torch.ones((new_xyz.shape[0], 1), device="cuda"))
+
+        if self.use_euler_field:
+            new_static_level_logits = torch.cat(new_static_level_logits, dim=0)
+            new_dynamic_level_logits = torch.cat(new_dynamic_level_logits, dim=0)
+            if len(new_dynamic_level_time_coeff) > 0:
+                new_dynamic_level_time_coeff = torch.cat(new_dynamic_level_time_coeff, dim=0)
+            else:
+                new_dynamic_level_time_coeff = None
+        else:
+            new_static_level_logits = None
+            new_dynamic_level_logits = None
+            new_dynamic_level_time_coeff = None
+
+        scale_init = str(getattr(self, "field_bg_prior_scale_init", "knn")).lower()
+        if scale_init == "fixed":
+            fixed_scale = max(float(getattr(self, "field_bg_prior_fixed_scale", 0.01)), 1e-6)
+            new_scaling = torch.full((new_xyz.shape[0], 3), math.log(fixed_scale), device="cuda", dtype=new_xyz.dtype)
+        elif scale_init in ("hybrid_far_knn", "hybrid_knn", "fixed_near_knn_far"):
+            fixed_scale = max(float(getattr(self, "field_bg_prior_fixed_scale", 0.01)), 1e-6)
+            threshold = float(getattr(self, "field_bg_prior_hybrid_knn_scale_threshold", 5.0))
+            tmpxyz = torch.cat((new_xyz, self._xyz), dim=0)
+            dist2 = torch.clamp_min(distCUDA2(tmpxyz), 1e-7)
+            dist2 = dist2[:new_xyz.shape[0]]
+            knn_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+            fixed_scaling = torch.full((new_xyz.shape[0], 3), math.log(fixed_scale), device="cuda", dtype=new_xyz.dtype)
+            far_mask = (new_depth_scale_tags > threshold).view(-1, 1)
+            new_scaling = torch.where(far_mask, knn_scaling, fixed_scaling)
+            new_scaling = torch.clamp(new_scaling, -10, 1.0)
+        else:
+            tmpxyz = torch.cat((new_xyz, self._xyz), dim=0)
+            dist2 = torch.clamp_min(distCUDA2(tmpxyz), 1e-7)
+            dist2 = dist2[:new_xyz.shape[0]]
+            new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+            new_scaling = torch.clamp(new_scaling, -10, 1.0)
+
+        new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), float(iteration), device="cuda", dtype=torch.float32)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+        )
+        return new_xyz.shape[0]
+
+    def get_background_candidate_mask(self, iteration=None, min_age=0):
+        n_points = self.get_xyz.shape[0]
+        if self._bg_candidate_mask is None or self._bg_candidate_mask.numel() == 0:
+            return torch.zeros((n_points,), device=self._xyz.device, dtype=torch.bool)
+        if self._bg_candidate_mask.shape[0] != n_points:
+            return torch.zeros((n_points,), device=self._xyz.device, dtype=torch.bool)
+        mask = self._bg_candidate_mask.squeeze(1) > 0.5
+        if iteration is not None and min_age > 0:
+            if self._bg_birth_iter is None or self._bg_birth_iter.numel() == 0 or self._bg_birth_iter.shape[0] != n_points:
+                return torch.zeros_like(mask)
+            birth = self._bg_birth_iter.squeeze(1)
+            mask = mask & (birth >= 0.0) & ((float(iteration) - birth) >= float(min_age))
+        return mask
+
+    def keep_background_candidate_gradients_only(self, update_modules=False):
+        candidate = self.get_background_candidate_mask()
+        if torch.count_nonzero(candidate) == 0:
+            return 0
+
+        def mask_point_grad(param):
+            if param is None:
+                return
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            if param.grad.shape[0] == candidate.shape[0]:
+                view_shape = [candidate.shape[0]] + [1] * (param.grad.dim() - 1)
+                param.grad.mul_(candidate.view(*view_shape).to(device=param.grad.device, dtype=param.grad.dtype))
+
+        for param in (
+            self._xyz,
+            self._features_dc,
+            self._features_t,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self._trbf_center,
+            self._trbf_scale,
+            self._motion,
+            self._omega,
+            self._static_level_logits,
+            self._dynamic_level_logits,
+            self._dynamic_level_time_coeff,
+            self._static_route_logits,
+            self._field_residual_gate,
+        ):
+            mask_point_grad(param)
+
+        if not update_modules:
+            if self.use_euler_field and self.euler_field is not None:
+                for name, param in self.euler_field.named_parameters():
+                    if name.startswith("static_grids") or name.startswith("static_temporal_grids"):
+                        continue
+                    if param.grad is not None:
+                        param.grad.zero_()
+            modules = [
+                self.rgbdecoder,
+                self.field_router if self.use_euler_field else None,
+                self.field_query_gate if self.use_euler_field else None,
+                self.field_decoder if self.use_euler_field else None,
+                self.field_temporal_opacity_head if self.use_euler_field else None,
+                self.field_static_view_mapper if self.use_euler_field else None,
+                self.field_static_app_head if self.use_euler_field else None,
+            ]
+            for module in modules:
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+        return int(torch.count_nonzero(candidate).item())
+
+    def background_candidate_stats_enabled(self, iteration):
+        if not bool(getattr(self, "field_bg_prior_clone_split", False)):
+            return False
+        if self._bg_candidate_mask is None or self._bg_candidate_mask.numel() == 0:
+            return False
+        start = int(getattr(self, "field_bg_prior_clone_stat_start", 9000))
+        until = int(getattr(self, "field_bg_prior_clone_until", 16000))
+        return int(iteration) >= start and int(iteration) <= until
+
+    def densify_background_candidates(self, iteration, grad_threshold, scene_extent):
+        stats = {
+            "eligible": 0,
+            "selected": 0,
+            "cloned": 0,
+            "split_parents": 0,
+            "new_points": 0,
+        }
+        if not bool(getattr(self, "field_bg_prior_clone_split", False)):
+            return stats
+        if self._bg_candidate_mask is None or self._bg_candidate_mask.numel() == 0:
+            return stats
+        iteration = int(iteration)
+        start = int(getattr(self, "field_bg_prior_clone_start", 9500))
+        until = int(getattr(self, "field_bg_prior_clone_until", 16000))
+        interval = max(int(getattr(self, "field_bg_prior_clone_interval", 500)), 1)
+        if iteration < start or iteration > until or iteration % interval != 0:
+            return stats
+        if self.xyz_gradient_accum is None or self.xyz_gradient_accum.numel() == 0:
+            return stats
+        if self.denom is None or self.denom.numel() == 0:
+            return stats
+        if self.xyz_gradient_accum.shape[0] != self.get_xyz.shape[0]:
+            return stats
+
+        min_age = int(getattr(self, "field_bg_prior_clone_min_age", 500))
+        candidate = self.get_background_candidate_mask(iteration=iteration, min_age=min_age)
+        if torch.count_nonzero(candidate) == 0:
+            return stats
+
+        denom = torch.clamp(self.denom, min=1.0)
+        grads = self.xyz_gradient_accum / denom
+        grads[grads.isnan()] = 0.0
+        grad_norm = torch.norm(grads, dim=-1)
+
+        threshold = float(getattr(self, "field_bg_prior_clone_grad_threshold", grad_threshold))
+        if threshold <= 0.0:
+            threshold = float(grad_threshold)
+        eligible = candidate & (grad_norm >= threshold)
+
+        min_opacity = float(getattr(self, "field_bg_prior_clone_min_opacity", 0.01))
+        if min_opacity > 0.0:
+            eligible = eligible & (self.get_opacity.squeeze(1) >= min_opacity)
+
+        min_visibility = float(getattr(self, "field_bg_prior_clone_min_visibility", 0.0))
+        if min_visibility > 0.0 and self._visibility_persistence_ema is not None and self._visibility_persistence_ema.numel() == self.get_xyz.shape[0]:
+            eligible = eligible & (self._visibility_persistence_ema.squeeze(1) >= min_visibility)
+
+        eligible_indices = torch.nonzero(eligible, as_tuple=False).squeeze(1)
+        stats["eligible"] = int(eligible_indices.numel())
+        if eligible_indices.numel() == 0:
+            return stats
+
+        bg_count = int(torch.count_nonzero(candidate).item())
+        max_ratio = max(float(getattr(self, "field_bg_prior_clone_max_ratio", 0.05)), 0.0)
+        ratio_limit = eligible_indices.numel()
+        if max_ratio > 0.0:
+            ratio_limit = max(1, int(math.ceil(float(bg_count) * max_ratio)))
+        max_points = int(getattr(self, "field_bg_prior_clone_max_points", 3000))
+        if max_points > 0:
+            ratio_limit = min(ratio_limit, max_points)
+        select_count = min(int(eligible_indices.numel()), int(ratio_limit))
+        if select_count <= 0:
+            return stats
+
+        if eligible_indices.numel() > select_count:
+            _, topk = torch.topk(grad_norm[eligible_indices].float(), k=select_count, largest=True)
+            selected_indices = eligible_indices[topk]
+        else:
+            selected_indices = eligible_indices
+        selected = torch.zeros_like(eligible)
+        selected[selected_indices] = True
+        stats["selected"] = int(selected_indices.numel())
+
+        scale_gate = self.percent_dense * scene_extent
+        max_scaling = torch.max(self.get_scaling, dim=1).values
+        clone_mask = selected & (max_scaling <= scale_gate)
+        split_mask = selected & (max_scaling > scale_gate)
+        split_children = max(int(getattr(self, "field_bg_prior_clone_split_children", 2)), 2)
+
+        new_xyz_parts = []
+        new_features_parts = []
+        new_opacity_parts = []
+        new_scaling_parts = []
+        new_rotation_parts = []
+        new_trbf_center_parts = []
+        new_trbf_scale_parts = []
+        new_motion_parts = []
+        new_omega_parts = []
+        new_featuret_parts = []
+        new_static_logits_parts = []
+        new_dynamic_logits_parts = []
+        new_dynamic_time_parts = []
+        new_ems_parts = []
+
+        clone_count = int(torch.count_nonzero(clone_mask).item())
+        if clone_count > 0:
+            new_xyz_parts.append(self._xyz[clone_mask])
+            new_features_parts.append(self._features_dc[clone_mask])
+            new_opacity_parts.append(self._opacity[clone_mask])
+            new_scaling_parts.append(self._scaling[clone_mask])
+            new_rotation_parts.append(self._rotation[clone_mask])
+            new_trbf_center_parts.append(self._trbf_center[clone_mask])
+            new_trbf_scale_parts.append(self._trbf_scale[clone_mask])
+            new_motion_parts.append(self._motion[clone_mask])
+            new_omega_parts.append(self._omega[clone_mask])
+            new_featuret_parts.append(self._features_t[clone_mask])
+            if self.use_euler_field:
+                new_static_logits_parts.append(self._static_level_logits[clone_mask])
+                new_dynamic_logits_parts.append(self._dynamic_level_logits[clone_mask])
+                if self._dynamic_level_time_coeff.numel() > 0:
+                    new_dynamic_time_parts.append(self._dynamic_level_time_coeff[clone_mask])
+            if self.maskforems is not None and self.maskforems.numel() > 0 and self.maskforems.shape[0] == self.get_xyz.shape[0]:
+                new_ems_parts.append(self.maskforems[clone_mask])
+            else:
+                new_ems_parts.append(torch.ones((clone_count, 1), device="cuda", dtype=torch.float32))
+
+        split_count = int(torch.count_nonzero(split_mask).item())
+        if split_count > 0:
+            stds = self.get_scaling[split_mask].repeat(split_children, 1)
+            means = torch.zeros((stds.size(0), 3), device="cuda")
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(self._rotation[split_mask]).repeat(split_children, 1, 1)
+            new_xyz_parts.append(torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[split_mask].repeat(split_children, 1))
+            new_features_parts.append(self._features_dc[split_mask].repeat(split_children, 1))
+            new_opacity_parts.append(self._opacity[split_mask].repeat(split_children, 1))
+            new_scaling_parts.append(self.scaling_inverse_activation(self.get_scaling[split_mask].repeat(split_children, 1) / (0.8 * split_children)))
+            new_rotation_parts.append(self._rotation[split_mask].repeat(split_children, 1))
+
+            parent_trbf_center = self._trbf_center[split_mask]
+            parent_trbf_scale = self._trbf_scale[split_mask]
+            parent_motion = self._motion[split_mask]
+            parent_ems_mask = self.maskforems[split_mask] if self.maskforems is not None and self.maskforems.numel() > 0 and self.maskforems.shape[0] == self.get_xyz.shape[0] else None
+            new_trbf_center, new_trbf_scale = self._get_temporal_child_support(
+                parent_trbf_center,
+                parent_trbf_scale,
+                parent_motion,
+                error_prior=parent_ems_mask,
+                copies_per_parent=split_children,
+            )
+            new_trbf_center_parts.append(new_trbf_center)
+            new_trbf_scale_parts.append(new_trbf_scale)
+            new_motion_parts.append(parent_motion.repeat(split_children, 1))
+            new_omega_parts.append(self._omega[split_mask].repeat(split_children, 1))
+            new_featuret_parts.append(self._features_t[split_mask].repeat(split_children, 1))
+            if self.use_euler_field:
+                new_static_logits_parts.append(self._static_level_logits[split_mask].repeat(split_children, 1))
+                new_dynamic_logits_parts.append(self._dynamic_level_logits[split_mask].repeat(split_children, 1))
+                if self._dynamic_level_time_coeff.numel() > 0:
+                    new_dynamic_time_parts.append(self._dynamic_level_time_coeff[split_mask].repeat(split_children, 1, 1))
+            if parent_ems_mask is not None:
+                new_ems_parts.append(parent_ems_mask.repeat(split_children, 1) * 0.75)
+            else:
+                new_ems_parts.append(torch.ones((split_count * split_children, 1), device="cuda", dtype=torch.float32))
+
+        if len(new_xyz_parts) == 0:
+            return stats
+
+        new_xyz = torch.cat(new_xyz_parts, dim=0)
+        new_features_dc = torch.cat(new_features_parts, dim=0)
+        new_opacity = torch.cat(new_opacity_parts, dim=0)
+        new_scaling = torch.cat(new_scaling_parts, dim=0)
+        new_rotation = torch.cat(new_rotation_parts, dim=0)
+        new_trbf_center = torch.cat(new_trbf_center_parts, dim=0)
+        new_trbf_scale = torch.cat(new_trbf_scale_parts, dim=0)
+        new_motion = torch.cat(new_motion_parts, dim=0)
+        new_omega = torch.cat(new_omega_parts, dim=0)
+        new_featuret = torch.cat(new_featuret_parts, dim=0)
+        new_ems_mask = torch.cat(new_ems_parts, dim=0)
+
+        if self.use_euler_field:
+            new_static_level_logits = torch.cat(new_static_logits_parts, dim=0) if len(new_static_logits_parts) > 0 else None
+            new_dynamic_level_logits = torch.cat(new_dynamic_logits_parts, dim=0) if len(new_dynamic_logits_parts) > 0 else None
+            new_dynamic_level_time_coeff = torch.cat(new_dynamic_time_parts, dim=0) if len(new_dynamic_time_parts) > 0 else None
+        else:
+            new_static_level_logits = None
+            new_dynamic_level_logits = None
+            new_dynamic_level_time_coeff = None
+
+        new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), float(iteration), device="cuda", dtype=torch.float32)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+        )
+
+        if split_count > 0 and not bool(getattr(self, "field_bg_prior_keep_split_parent", False)):
+            prune_filter = torch.cat((split_mask, torch.zeros(new_xyz.shape[0], device="cuda", dtype=torch.bool)))
+            self.prune_points(prune_filter)
+
+        stats["cloned"] = clone_count
+        stats["split_parents"] = split_count
+        stats["new_points"] = int(new_xyz.shape[0])
+        return stats
+
+    def protect_background_candidates_from_prune(self, prune_mask, iteration):
+        if self._bg_candidate_mask is None or self._bg_candidate_mask.numel() == 0:
+            return prune_mask
+        if self._bg_candidate_mask.shape[0] != prune_mask.shape[0]:
+            return prune_mask
+        candidate = self._bg_candidate_mask.squeeze(1) > 0.5
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0:
+            birth = self._bg_birth_iter.squeeze(1)
+        else:
+            birth = torch.full_like(prune_mask.float(), -1.0)
+        young = candidate & (birth >= 0.0) & ((float(iteration) - birth) < float(self.field_bg_prior_protect_iters))
+        return prune_mask & (~young)
+
+    def prune_mature_background_candidates(self, iteration):
+        if not self.field_bg_prior:
+            return 0
+        if not bool(getattr(self, "field_bg_prior_mature_prune", True)):
+            return 0
+        interval = max(int(self.field_bg_prior_mature_prune_interval), 1)
+        if iteration < self.field_bg_prior_start or iteration % interval != 0:
+            return 0
+        if self._bg_candidate_mask is None or self._bg_candidate_mask.numel() == 0:
+            return 0
+        if self._bg_candidate_mask.shape[0] != self.get_xyz.shape[0]:
+            return 0
+
+        candidate = self._bg_candidate_mask.squeeze(1) > 0.5
+        birth = self._bg_birth_iter.squeeze(1)
+        age = float(iteration) - birth
+        mature = candidate & (birth >= 0.0) & (age >= float(self.field_bg_prior_protect_iters))
+        if torch.count_nonzero(mature) == 0:
+            return 0
+
+        opacity = self.get_opacity.squeeze(1)
+        low_opacity = opacity < float(self.field_bg_prior_mature_min_opacity)
+        if self._visibility_persistence_ema is not None and self._visibility_persistence_ema.numel() == self.get_xyz.shape[0]:
+            visibility = self._visibility_persistence_ema.squeeze(1)
+            low_visibility = visibility < float(self.field_bg_prior_mature_min_visibility)
+        else:
+            low_visibility = torch.zeros_like(low_opacity)
+        stale = age >= float(self.field_bg_prior_protect_iters * 2)
+        prune_mask = mature & (low_opacity | (stale & low_visibility & (opacity < max(float(self.field_bg_prior_opacity), 1e-4))))
+        prune_count = int(torch.count_nonzero(prune_mask).item())
+        if prune_count > 0:
+            self.prune_points(prune_mask)
+            torch.cuda.empty_cache()
+        return prune_count
 
 
 

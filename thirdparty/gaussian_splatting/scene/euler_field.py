@@ -16,6 +16,9 @@ class EulerField(nn.Module):
         fourier_degree=10,
         level_resolutions=None,
         enable_dynamic_grid=True,
+        enable_static_temporal_residual=False,
+        static_temporal_frames=50,
+        static_temporal_scale=1.0,
     ):
         super().__init__()
         self.base_resolution = base_resolution
@@ -24,6 +27,9 @@ class EulerField(nn.Module):
         self.feature_dim = feature_dim
         self.fourier_degree = fourier_degree
         self.enable_dynamic_grid = enable_dynamic_grid
+        self.enable_static_temporal_residual = enable_static_temporal_residual
+        self.static_temporal_frames = max(int(static_temporal_frames), 1)
+        self.static_temporal_scale = float(static_temporal_scale)
 
         bbox_min = torch.as_tensor(bbox_min, dtype=torch.float32, device="cuda").view(1, 3)
         bbox_max = torch.as_tensor(bbox_max, dtype=torch.float32, device="cuda").view(1, 3)
@@ -35,19 +41,40 @@ class EulerField(nn.Module):
         dynamic_channels = feature_dim * 2 * fourier_degree
         self.static_grids = nn.ParameterList()
         self.dynamic_grids = nn.ParameterList()
+        self.static_temporal_grids = nn.ParameterList()
+        self.static_temporal_bins = self._resolve_static_temporal_bins(
+            self.num_levels,
+            self.static_temporal_frames,
+        )
         for resolution in self.level_resolutions:
+            level_index = len(self.static_grids)
             res_x, res_y, res_z = resolution
             static_grid = nn.Parameter(
                 torch.empty(1, feature_dim, res_z, res_y, res_x, device="cuda")
             )
             nn.init.normal_(static_grid, mean=0.0, std=1e-4)
             self.static_grids.append(static_grid)
+            if enable_static_temporal_residual:
+                temporal_bins = self.static_temporal_bins[level_index]
+                temporal_grid = nn.Parameter(
+                    torch.zeros(temporal_bins, feature_dim, res_z, res_y, res_x, device="cuda")
+                )
+                self.static_temporal_grids.append(temporal_grid)
             if enable_dynamic_grid:
                 dynamic_grid = nn.Parameter(
                     torch.empty(1, dynamic_channels, res_z, res_y, res_x, device="cuda")
                 )
                 nn.init.normal_(dynamic_grid, mean=0.0, std=1e-4)
                 self.dynamic_grids.append(dynamic_grid)
+
+    @staticmethod
+    def _resolve_static_temporal_bins(num_levels, max_frames):
+        max_frames = max(int(max_frames), 1)
+        bins = []
+        for level in range(max(int(num_levels), 1)):
+            divisor = 2 ** max(int(num_levels) - 1 - level, 0)
+            bins.append(max(int(math.ceil(max_frames / divisor)), 1))
+        return bins
 
     @staticmethod
     def _resolve_level_resolutions(base_resolution, num_levels, level_resolutions):
@@ -202,18 +229,43 @@ class EulerField(nn.Module):
         feature_delta = feature_delta.permute(0, 4, 1, 2, 3).contiguous()
         return static_grid + view_scale * feature_delta
 
-    def query_static_level_features(self, points, camera_center=None, view_mapper=None, view_scale=0.0):
+    def _static_temporal_bin_index(self, timestamp, temporal_bins, device):
+        if not torch.is_tensor(timestamp):
+            timestamp = torch.tensor(timestamp, device=device, dtype=torch.float32)
+        timestamp = timestamp.detach().float().reshape(-1)[0].to(device=device)
+        if timestamp > 1.0:
+            timestamp = timestamp / max(float(self.static_temporal_frames - 1), 1.0)
+        timestamp = torch.clamp(timestamp, 0.0, 1.0)
+        index = torch.floor(timestamp * float(temporal_bins)).long()
+        return torch.clamp(index, 0, temporal_bins - 1)
+
+    def query_static_level_features(self, points, camera_center=None, view_mapper=None, view_scale=0.0, timestamp=None):
         coords = self._normalize_points_grid(points)
         view_direction = self._global_view_direction(camera_center, points.device, points.dtype)
         level_features = []
-        for static_grid in self.static_grids:
+        for level_index, static_grid in enumerate(self.static_grids):
             static_grid = self._view_condition_static_grid(
                 static_grid,
                 view_direction,
                 view_mapper,
                 view_scale,
             )
-            level_features.append(self._sample_grid(static_grid, coords))
+            feature = self._sample_grid(static_grid, coords)
+            if (
+                self.enable_static_temporal_residual
+                and timestamp is not None
+                and level_index < len(self.static_temporal_grids)
+                and self.static_temporal_scale != 0.0
+            ):
+                temporal_grid = self.static_temporal_grids[level_index]
+                bin_index = self._static_temporal_bin_index(
+                    timestamp,
+                    temporal_grid.shape[0],
+                    points.device,
+                )
+                temporal_feature = self._sample_grid(temporal_grid[bin_index].unsqueeze(0), coords)
+                feature = feature + self.static_temporal_scale * temporal_feature
+            level_features.append(feature)
         return torch.stack(level_features, dim=1)
 
     def query_dynamic_level_features(self, points, timestamp, mode="nearest"):

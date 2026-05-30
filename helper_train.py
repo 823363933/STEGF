@@ -161,6 +161,8 @@ def controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filt
                 else:
                     if iteration < 7000 : # defalt 7000. 
                         prune_mask =  (gaussians.get_opacity < opt.opthr).squeeze()
+                        if hasattr(gaussians, "protect_background_candidates_from_prune"):
+                            prune_mask = gaussians.protect_background_candidates_from_prune(prune_mask, iteration)
                         gaussians.prune_points(prune_mask)
                         torch.cuda.empty_cache()
                         scene.recordpoints(iteration, "addionally prune_mask")
@@ -198,6 +200,8 @@ def controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filt
                     scene.recordpoints(iteration, "after densify")
                 else:
                     prune_mask =  (gaussians.get_opacity < opt.opthr).squeeze()
+                    if hasattr(gaussians, "protect_background_candidates_from_prune"):
+                        prune_mask = gaussians.protect_background_candidates_from_prune(prune_mask, iteration)
                     gaussians.prune_points(prune_mask)
                     torch.cuda.empty_cache()
                     scene.recordpoints(iteration, "addionally prune_mask")
@@ -223,6 +227,8 @@ def controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filt
                 else:
                     if iteration < 7000 : # defalt 7000. 
                         prune_mask =  (gaussians.get_opacity < opt.opthr).squeeze()
+                        if hasattr(gaussians, "protect_background_candidates_from_prune"):
+                            prune_mask = gaussians.protect_background_candidates_from_prune(prune_mask, iteration)
                         gaussians.prune_points(prune_mask)
                         torch.cuda.empty_cache()
                         scene.recordpoints(iteration, "addionally prune_mask")

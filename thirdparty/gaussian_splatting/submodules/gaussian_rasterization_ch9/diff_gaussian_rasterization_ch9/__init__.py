@@ -37,6 +37,40 @@ def rasterize_gaussians(
         raster_settings,
     )
 
+def rasterize_gaussians_contribution(
+    means3D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    rotations,
+    cov3Ds_precomp,
+    unreliable_mask,
+    raster_settings,
+):
+    args = (
+        raster_settings.bg,
+        means3D,
+        colors_precomp,
+        opacities,
+        scales,
+        rotations,
+        raster_settings.scale_modifier,
+        cov3Ds_precomp,
+        raster_settings.viewmatrix,
+        raster_settings.projmatrix,
+        raster_settings.tanfovx,
+        raster_settings.tanfovy,
+        raster_settings.image_height,
+        raster_settings.image_width,
+        sh,
+        raster_settings.sh_degree,
+        raster_settings.campos,
+        raster_settings.prefiltered,
+        unreliable_mask,
+    )
+    return _C.rasterize_gaussians_contribution(*args)
+
 class _RasterizeGaussians(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -195,3 +229,35 @@ class GaussianRasterizer(nn.Module):
             raster_settings, 
         )
 
+    def contribution(self, means3D, opacities, unreliable_mask, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None):
+        raster_settings = self.raster_settings
+
+        if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+            raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+
+        if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+
+        if scales is None:
+            scales = torch.Tensor([])
+        if rotations is None:
+            rotations = torch.Tensor([])
+        if cov3D_precomp is None:
+            cov3D_precomp = torch.Tensor([])
+
+        return rasterize_gaussians_contribution(
+            means3D,
+            shs,
+            colors_precomp,
+            opacities,
+            scales,
+            rotations,
+            cov3D_precomp,
+            unreliable_mask,
+            raster_settings,
+        )
