@@ -5,6 +5,7 @@ OldVision/
 log/
 model/
 tmp/
+dataset/
 
 # Python cache/build artifacts
 __pycache__/
