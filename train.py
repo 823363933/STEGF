@@ -654,17 +654,35 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         if scales.shape[0] != means3D.shape[0]:
             return None
 
-        camera_center = getattr(camera, "camera_center", None)
-        if camera_center is None:
-            return None
-        camera_center = camera_center.to(device=means3D.device, dtype=means3D.dtype).view(1, 3)
-        distance = torch.linalg.norm(means3D - camera_center, dim=1).detach().clamp_min(1e-6)
+        depth_mode = str(getattr(gaussians, "field_scale_reg_depth_mode", "euclidean")).lower()
+        if depth_mode in ("euclidean", "distance", "camera_distance", "camera_center"):
+            camera_center = getattr(camera, "camera_center", None)
+            if camera_center is None:
+                return None
+            camera_center = camera_center.to(device=means3D.device, dtype=means3D.dtype).view(1, 3)
+            depth = torch.linalg.norm(means3D - camera_center, dim=1).detach()
+        else:
+            view_transform = getattr(camera, "world_view_transform", None)
+            if view_transform is not None:
+                ones = torch.ones((means3D.shape[0], 1), device=means3D.device, dtype=means3D.dtype)
+                means_h = torch.cat((means3D, ones), dim=1)
+                view_transform = view_transform.to(device=means3D.device, dtype=means3D.dtype)
+                depth = torch.abs((means_h @ view_transform)[:, 2]).detach()
+                if not torch.all(torch.isfinite(depth)):
+                    depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                camera_center = getattr(camera, "camera_center", None)
+                if camera_center is None:
+                    return None
+                camera_center = camera_center.to(device=means3D.device, dtype=means3D.dtype).view(1, 3)
+                depth = torch.linalg.norm(means3D - camera_center, dim=1).detach()
+        depth = depth.clamp_min(1e-6)
 
         base_limit = max(float(getattr(gaussians, "field_scale_reg_base_limit", 0.3)), 1e-8)
         depth_ref = max(float(getattr(gaussians, "field_scale_reg_depth_ref", 8.0)), 1e-6)
         gamma = max(float(getattr(gaussians, "field_scale_reg_depth_gamma", 0.75)), 0.0)
         max_boost = max(float(getattr(gaussians, "field_scale_reg_max_boost", 8.0)), 1.0)
-        depth_boost = torch.clamp((distance / depth_ref).pow(gamma), min=1.0, max=max_boost)
+        depth_boost = torch.clamp((depth / depth_ref).pow(gamma), min=1.0, max=max_boost)
         scale_limit = (base_limit * depth_boost).to(device=scales.device, dtype=scales.dtype)
 
         scale_max = torch.max(scales, dim=1).values
@@ -2072,6 +2090,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "mean_candidates_per_cell": 0.0,
             "level": int(getattr(gaussians, "field_bg_dense_dedup_level", 3)),
             "max_per_cell": int(getattr(gaussians, "field_bg_dense_max_per_cell", 1)),
+            "priority": str(getattr(gaussians, "field_bg_dense_dedup_priority", "center")),
         }
         if not bool(getattr(gaussians, "field_bg_dense_cell_dedup", 0)):
             stats["reason"] = "disabled"
@@ -2112,6 +2131,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         level = max(0, min(int(getattr(gaussians, "field_bg_dense_dedup_level", 3)), len(level_resolutions) - 1))
         max_per_cell = max(int(getattr(gaussians, "field_bg_dense_max_per_cell", 1)), 1)
+        dedup_priority = str(getattr(gaussians, "field_bg_dense_dedup_priority", "center")).lower()
         resolution = tuple(int(v) for v in level_resolutions[level])
         bbox_min = euler_field.bbox_min.detach().view(3).float()
         bbox_span = torch.clamp(euler_field.bbox_span.detach().view(3).float(), min=1e-6)
@@ -2187,6 +2207,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     local_idx = int(valid_indices_cpu[valid_local_idx].item())
                     cell_key = tuple(int(v) for v in cell_coords_cpu[valid_local_idx].tolist())
                     candidates_by_cell.setdefault(cell_key, []).append((
+                        float(value),
                         float(center_distance_cpu[valid_local_idx].item()),
                         payload_idx,
                         local_idx,
@@ -2200,12 +2221,17 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             torch.cuda.empty_cache()
 
         for cell_key, items in candidates_by_cell.items():
-            items.sort(key=lambda item: item[0])
+            if dedup_priority in ("far", "far_first", "depth_far", "depth_desc"):
+                items.sort(key=lambda item: (-item[0], item[1]))
+            elif dedup_priority in ("near", "near_first", "depth_near", "depth_asc"):
+                items.sort(key=lambda item: (item[0], item[1]))
+            else:
+                items.sort(key=lambda item: item[1])
             existing_count = int(existing_counts_by_cell.get(cell_key, 0))
             remaining = max_per_cell - existing_count
             if remaining <= 0:
                 continue
-            for _, payload_idx, local_idx, kind, value in items[:remaining]:
+            for _, _, payload_idx, local_idx, kind, value in items[:remaining]:
                 selected_by_payload[payload_idx][(kind, float(value))][local_idx] = True
 
         post_pixel_total = 0
@@ -2256,6 +2282,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "level": int(level),
             "resolution": resolution,
             "max_per_cell": int(max_per_cell),
+            "priority": dedup_priority,
             "post_pixels": int(post_pixel_total),
             "post_candidates": int(post_candidate_total),
             "removed_pixels": int(stats["pre_pixels"] - post_pixel_total),
@@ -2267,7 +2294,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         })
         print(
             f"[STEGF] Dense cell dedup: level={level}, resolution={resolution}, "
-            f"max_per_cell={max_per_cell}, candidates {stats['pre_candidates']} -> {stats['post_candidates']}, "
+            f"max_per_cell={max_per_cell}, priority={dedup_priority}, "
+            f"candidates {stats['pre_candidates']} -> {stats['post_candidates']}, "
             f"pixels {stats['pre_pixels']} -> {stats['post_pixels']}, cells={stats['cells']}, "
             f"existing_cells={stats['existing_occupied_cells']}, multi_view_cells={stats['multi_view_cells']}"
         )
@@ -2403,10 +2431,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         depth_values = parse_float_list(getattr(gaussians, "field_bg_dense_depth_values", ""), default=[])
         depth_values = [float(v) for v in depth_values if float(v) > 0.0]
-        depth_scales = parse_float_list(getattr(gaussians, "field_bg_dense_depth_scales", ""), default=[1.0, 1.5, 2.0, 2.5, 4.0])
+        depth_scales = parse_float_list(getattr(gaussians, "field_bg_dense_depth_scales", ""), default=[0.75, 1.09, 1.58, 2.29, 3.32, 4.82, 7.0])
         depth_scales = [float(v) for v in depth_scales if float(v) > 0.0]
         if len(depth_scales) == 0:
-            depth_scales = [1.0, 1.5, 2.0, 2.5, 4.0]
+            depth_scales = [0.75, 1.09, 1.58, 2.29, 3.32, 4.82, 7.0]
         mask_source = str(getattr(gaussians, "field_bg_dense_mask_source", "instant")).lower()
         use_accumulated_mask = mask_source in ("accumulated", "ema", "history")
         time_indices = parse_dense_add_time_indices()
@@ -2419,6 +2447,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         total_sampled = 0
         camera_events = 0
         bg_dense_add_done = True
+        dense_debug_enabled = bool(getattr(gaussians, "field_bg_dense_debug", 0))
 
         print(
             f"[STEGF] Dense background add at iter {int(iteration)}: "
@@ -2567,25 +2596,32 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 da3_stats["depth_base"] = "render"
             sample_mask = sample_dense_union_mask(filtered_mask)
             pixel_indices = torch.nonzero(sample_mask, as_tuple=False)
-            dense_payloads.append({
+            payload = {
                 "image_name": image_name,
                 "camera": reference_camera,
-                "gt_image": reference_gt.detach().cpu(),
-                "render_image": reference_image.detach().cpu(),
                 "color_image": color_image.detach().cpu(),
-                "union_mask": union_mask.detach().cpu(),
-                "filtered_mask": filtered_mask.detach().cpu(),
                 "sample_mask": sample_mask.detach().cpu(),
                 "depth_base": depth_base.detach().cpu(),
-                "da3_depth": da3_depth.detach().cpu() if da3_depth is not None else None,
-                "da3_foreground_mask": da3_foreground_mask.detach().cpu() if da3_foreground_mask is not None else None,
-                "da3_stats": da3_stats,
-                "beit_band": beit_band.detach().cpu() if beit_band is not None else None,
-                "beit_foreground_mask": beit_foreground_mask.detach().cpu() if beit_foreground_mask is not None else None,
-                "beit_stats": beit_stats,
                 "pixel_indices": pixel_indices.detach().cpu(),
-                "frame_stats": frame_stats,
-            })
+                "union_pixels": int(torch.count_nonzero(union_mask).item()),
+                "candidate_pixels": int(torch.count_nonzero(filtered_mask).item()),
+                "pre_dedup_pixels": int(torch.count_nonzero(sample_mask).item()),
+            }
+            if dense_debug_enabled:
+                payload.update({
+                    "gt_image": reference_gt.detach().cpu(),
+                    "render_image": reference_image.detach().cpu(),
+                    "union_mask": union_mask.detach().cpu(),
+                    "filtered_mask": filtered_mask.detach().cpu(),
+                    "da3_depth": da3_depth.detach().cpu() if da3_depth is not None else None,
+                    "da3_foreground_mask": da3_foreground_mask.detach().cpu() if da3_foreground_mask is not None else None,
+                    "da3_stats": da3_stats,
+                    "beit_band": beit_band.detach().cpu() if beit_band is not None else None,
+                    "beit_foreground_mask": beit_foreground_mask.detach().cpu() if beit_foreground_mask is not None else None,
+                    "beit_stats": beit_stats,
+                    "frame_stats": frame_stats,
+                })
+            dense_payloads.append(payload)
             del reference_gt, reference_image, union_mask, filtered_mask, sample_mask, color_accum, color_count, depth_base, fallback_depth, color_image, pixel_indices
             if da3_depth is not None:
                 del da3_depth
@@ -2599,11 +2635,87 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         cell_dedup_stats = apply_dense_cell_dedup(dense_payloads, depth_values, depth_scales)
 
+        all_dense_xyz = []
+        all_dense_rgb = []
+        all_dense_depth_scale_tags = []
+
         for payload in dense_payloads:
             image_name = payload["image_name"]
             pixel_indices = payload["pixel_indices"]
             total_sampled += int(pixel_indices.shape[0])
+            payload["pending_added_count"] = 0
             if pixel_indices.numel() == 0:
+                continue
+
+            depth_base_cuda = payload["depth_base"].cuda(non_blocking=True)
+            color_image_cuda = payload["color_image"].cuda(non_blocking=True)
+            added = 0
+
+            def append_dense_candidates(selected_pixels, depth_value=None, depth_scale=None):
+                if selected_pixels.numel() == 0:
+                    return 0
+                selected_pixels_cuda = selected_pixels.cuda(non_blocking=True)
+                xyz = dense_candidate_worldpoints(
+                    selected_pixels_cuda,
+                    payload["camera"],
+                    depth_base_cuda,
+                    depth_value=depth_value,
+                    depth_scale=depth_scale,
+                )
+                u = selected_pixels_cuda[:, 0].long()
+                v = selected_pixels_cuda[:, 1].long()
+                rgb = color_image_cuda[:, u, v].permute(1, 0).clamp(0.0, 1.0)
+                if depth_value is not None:
+                    scale_tag_value = float("inf")
+                else:
+                    scale_tag_value = float(depth_scale) if depth_scale is not None else 1.0
+                all_dense_xyz.append(xyz.detach())
+                all_dense_rgb.append(rgb.detach())
+                all_dense_depth_scale_tags.append(torch.full((xyz.shape[0],), scale_tag_value, device=xyz.device, dtype=xyz.dtype))
+                count = int(xyz.shape[0])
+                del selected_pixels_cuda, xyz, rgb
+                return count
+
+            selected_depth_values = payload.get("selected_depth_values", {})
+            selected_depth_scales = payload.get("selected_depth_scales", {})
+            if selected_depth_values or selected_depth_scales:
+                for depth_value, selected_pixels in sorted(selected_depth_values.items(), key=lambda item: float(item[0])):
+                    added += append_dense_candidates(selected_pixels, depth_value=float(depth_value), depth_scale=None)
+                for depth_scale_value, selected_pixels in sorted(selected_depth_scales.items(), key=lambda item: float(item[0])):
+                    added += append_dense_candidates(selected_pixels, depth_value=None, depth_scale=float(depth_scale_value))
+            else:
+                if len(depth_values) > 0:
+                    for depth_value in depth_values:
+                        added += append_dense_candidates(pixel_indices, depth_value=float(depth_value), depth_scale=None)
+                else:
+                    for depth_scale_value in depth_scales:
+                        added += append_dense_candidates(pixel_indices, depth_value=None, depth_scale=float(depth_scale_value))
+            payload["pending_added_count"] = int(added)
+            if added > 0:
+                camera_events += 1
+            del depth_base_cuda, color_image_cuda
+            torch.cuda.empty_cache()
+
+        if len(all_dense_xyz) > 0:
+            if not hasattr(gaussians, "add_static_background_gaussians_xyz"):
+                raise RuntimeError("Gaussian model has no add_static_background_gaussians_xyz.")
+            dense_xyz = torch.cat(all_dense_xyz, dim=0)
+            dense_rgb = torch.cat(all_dense_rgb, dim=0)
+            dense_depth_scale_tags = torch.cat(all_dense_depth_scale_tags, dim=0)
+            total_added = int(gaussians.add_static_background_gaussians_xyz(
+                dense_xyz,
+                dense_rgb,
+                iteration,
+                depth_scale_tags=dense_depth_scale_tags,
+            ))
+            del dense_xyz, dense_rgb, dense_depth_scale_tags
+            torch.cuda.empty_cache()
+
+        for payload in dense_payloads:
+            image_name = payload["image_name"]
+            pixel_indices = payload["pixel_indices"]
+            added = int(payload.get("pending_added_count", 0))
+            if dense_debug_enabled:
                 save_dense_background_add_debug(
                     iteration,
                     payload["camera"],
@@ -2614,7 +2726,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     payload["sample_mask"],
                     payload["depth_base"],
                     depth_scales,
-                    0,
+                    added,
                     payload["frame_stats"],
                     filtered_mask=payload["filtered_mask"],
                     da3_depth=payload["da3_depth"],
@@ -2626,121 +2738,44 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     pre_dedup_sample_mask=payload.get("pre_dedup_sample_mask"),
                     dedup_stats=payload.get("dedup_stats"),
                 )
-                continue
-
-            pixel_indices_cuda = pixel_indices.cuda(non_blocking=True)
-            depth_base_cuda = payload["depth_base"].cuda(non_blocking=True)
-            color_image_cuda = payload["color_image"].cuda(non_blocking=True)
-            added = 0
-            selected_depth_values = payload.get("selected_depth_values", {})
-            selected_depth_scales = payload.get("selected_depth_scales", {})
-            if selected_depth_values or selected_depth_scales:
-                for depth_value, selected_pixels in sorted(selected_depth_values.items(), key=lambda item: float(item[0])):
-                    if selected_pixels.numel() == 0:
-                        continue
-                    selected_pixels_cuda = selected_pixels.cuda(non_blocking=True)
-                    added += int(gaussians.add_static_background_gaussians(
-                        selected_pixels_cuda,
-                        payload["camera"],
-                        depth_base_cuda.unsqueeze(0),
-                        color_image_cuda,
-                        iteration,
-                        numperay=1,
-                        depth_scale=1.0,
-                        depth_values=[float(depth_value)],
-                        depth_scales=None,
-                    ))
-                    del selected_pixels_cuda
-                for depth_scale_value, selected_pixels in sorted(selected_depth_scales.items(), key=lambda item: float(item[0])):
-                    if selected_pixels.numel() == 0:
-                        continue
-                    selected_pixels_cuda = selected_pixels.cuda(non_blocking=True)
-                    added += int(gaussians.add_static_background_gaussians(
-                        selected_pixels_cuda,
-                        payload["camera"],
-                        depth_base_cuda.unsqueeze(0),
-                        color_image_cuda,
-                        iteration,
-                        numperay=1,
-                        depth_scale=float(depth_scale_value),
-                        depth_values=None,
-                        depth_scales=[float(depth_scale_value)],
-                    ))
-                    del selected_pixels_cuda
-            else:
-                added = gaussians.add_static_background_gaussians(
-                    pixel_indices_cuda,
-                    payload["camera"],
-                    depth_base_cuda.unsqueeze(0),
-                    color_image_cuda,
-                    iteration,
-                    numperay=len(depth_values) if len(depth_values) > 0 else len(depth_scales),
-                    depth_scale=max(depth_scales),
-                    depth_values=depth_values,
-                    depth_scales=depth_scales,
-                )
-            total_added += int(added)
-            camera_events += 1
-            save_dense_background_add_debug(
-                iteration,
-                payload["camera"],
-                payload["gt_image"],
-                payload["render_image"],
-                payload["color_image"],
-                payload["union_mask"],
-                payload["sample_mask"],
-                payload["depth_base"],
-                depth_scales,
-                added,
-                payload["frame_stats"],
-                filtered_mask=payload["filtered_mask"],
-                da3_depth=payload["da3_depth"],
-                da3_foreground_mask=payload["da3_foreground_mask"],
-                da3_stats=payload["da3_stats"],
-                beit_band=payload["beit_band"],
-                beit_foreground_mask=payload["beit_foreground_mask"],
-                beit_stats=payload["beit_stats"],
-                pre_dedup_sample_mask=payload.get("pre_dedup_sample_mask"),
-                dedup_stats=payload.get("dedup_stats"),
-            )
             print(
                 f"[STEGF] Dense add {image_name}: "
-                f"union_pixels={int(torch.count_nonzero(payload['union_mask']).item())}, "
-                f"candidate_pixels={int(torch.count_nonzero(payload['filtered_mask']).item())}, "
+                f"union_pixels={int(payload.get('union_pixels', 0))}, "
+                f"candidate_pixels={int(payload.get('candidate_pixels', 0))}, "
                 f"sample_pixels={int(pixel_indices.shape[0])}, "
-                f"pre_dedup_pixels={int(torch.count_nonzero(payload.get('pre_dedup_sample_mask', payload['sample_mask'])).item())}, "
+                f"pre_dedup_pixels={int(payload.get('pre_dedup_pixels', int(pixel_indices.shape[0])))}, "
                 f"new_points={int(added)}"
             )
-            del pixel_indices_cuda, depth_base_cuda, color_image_cuda
-            torch.cuda.empty_cache()
+        del all_dense_xyz, all_dense_rgb, all_dense_depth_scale_tags
 
-        dense_log_dir = os.path.join(args.model_path, "bg_dense_add_debug")
-        os.makedirs(dense_log_dir, exist_ok=True)
-        with open(os.path.join(dense_log_dir, "events.jsonl"), "a") as f:
-            f.write(json.dumps({
-                "iteration": int(iteration),
-                "train_cameras": int(len(image_names)),
-                "camera_events": int(camera_events),
-                "time_indices": reference_time_indices,
-                "configured_time_indices": time_indices,
-                "depth_base": str(getattr(gaussians, "field_bg_dense_depth_base", "render")),
-                "depth_values": depth_values,
-                "depth_scales": depth_scales,
-                "mask_source": mask_source,
-                "da3_filter": int(getattr(gaussians, "field_bg_dense_da3_filter", 0)),
-                "da3_path": bg_dense_da3_cache.get("path"),
-                "beit_filter": int(getattr(gaussians, "field_bg_dense_beit_filter", 0)),
-                "beit_path": bg_dense_beit_cache.get("path"),
-                "sample_block_size": int(getattr(gaussians, "field_bg_dense_sample_block_size", 3)),
-                "pixels_per_block": int(getattr(gaussians, "field_bg_dense_pixels_per_block", 1)),
-                "max_pixels_per_camera": int(getattr(gaussians, "field_bg_dense_max_pixels_per_camera", 0)),
-                "sample_pixels": int(total_sampled),
-                "added_points": int(total_added),
-                "cell_dedup": cell_dedup_stats,
-                "union_map_dir": "unreliable_union_by_camera",
-                "sample_map_dir": "sampled_pixels_by_camera",
-                "pre_dedup_sample_map_dir": "sampled_pixels_before_cell_dedup_by_camera",
-            }, sort_keys=True) + "\n")
+        if dense_debug_enabled:
+            dense_log_dir = os.path.join(args.model_path, "bg_dense_add_debug")
+            os.makedirs(dense_log_dir, exist_ok=True)
+            with open(os.path.join(dense_log_dir, "events.jsonl"), "a") as f:
+                f.write(json.dumps({
+                    "iteration": int(iteration),
+                    "train_cameras": int(len(image_names)),
+                    "camera_events": int(camera_events),
+                    "time_indices": reference_time_indices,
+                    "configured_time_indices": time_indices,
+                    "depth_base": str(getattr(gaussians, "field_bg_dense_depth_base", "render")),
+                    "depth_values": depth_values,
+                    "depth_scales": depth_scales,
+                    "mask_source": mask_source,
+                    "da3_filter": int(getattr(gaussians, "field_bg_dense_da3_filter", 0)),
+                    "da3_path": bg_dense_da3_cache.get("path"),
+                    "beit_filter": int(getattr(gaussians, "field_bg_dense_beit_filter", 0)),
+                    "beit_path": bg_dense_beit_cache.get("path"),
+                    "sample_block_size": int(getattr(gaussians, "field_bg_dense_sample_block_size", 3)),
+                    "pixels_per_block": int(getattr(gaussians, "field_bg_dense_pixels_per_block", 1)),
+                    "max_pixels_per_camera": int(getattr(gaussians, "field_bg_dense_max_pixels_per_camera", 0)),
+                    "sample_pixels": int(total_sampled),
+                    "added_points": int(total_added),
+                    "cell_dedup": cell_dedup_stats,
+                    "union_map_dir": "unreliable_union_by_camera",
+                    "sample_map_dir": "sampled_pixels_by_camera",
+                    "pre_dedup_sample_map_dir": "sampled_pixels_before_cell_dedup_by_camera",
+                }, sort_keys=True) + "\n")
         print(f"[STEGF] Dense background add finished: cameras={camera_events}, sample_pixels={total_sampled}, added_points={total_added}")
         return total_added
 

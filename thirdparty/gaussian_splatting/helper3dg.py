@@ -29,6 +29,149 @@ from argparse import ArgumentParser, Namespace
 from thirdparty.gaussian_splatting.arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 
 
+def _truthy(value):
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "none", "no")
+    return bool(value)
+
+
+def _format_summary_value(value):
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(str(item) for item in value) + "]"
+    return str(value)
+
+
+def _format_summary_items(values, keys):
+    parts = []
+    for key in keys:
+        if key in values:
+            parts.append(f"{key}={_format_summary_value(values[key])}")
+    return ", ".join(parts)
+
+
+def _format_labeled_items(values, items):
+    parts = []
+    for label, key in items:
+        if key in values:
+            parts.append(f"{label}={_format_summary_value(values[key])}")
+    return ", ".join(parts)
+
+
+def _print_args_summary(args, title):
+    values = vars(args)
+    path_keys = ["model_path", "source_path", "configpath"]
+    core_keys = ["model", "loader", "valloader", "iterations", "test_iteration", "save_iterations", "duration", "batch", "densify", "rdpip", "rgbfunction", "timing_repeats"]
+
+    print(f"[STEGF] {title} args: {_format_summary_items(values, path_keys)}")
+    core_summary = _format_summary_items(values, core_keys)
+    if core_summary:
+        print(f"[STEGF] {title} core: {core_summary}")
+
+    bbox_summary = _format_labeled_items(
+        values,
+        [
+            ("expand_xyz", "field_bbox_expand_xyz"),
+            ("expand_scale", "field_bbox_expand_scale"),
+            ("frustum", "field_bbox_frustum_expand"),
+            ("preserve_cell", "field_bbox_preserve_cell_size"),
+        ],
+    )
+    if bbox_summary:
+        print(f"[STEGF] Field bbox: {bbox_summary}")
+
+    active_modules = []
+    disabled_modules = []
+    if _truthy(values.get("field_bg_dense_add", 0)):
+        scale_init = str(values.get("field_bg_prior_scale_init", "")).lower()
+        bg_dense_items = [
+            ("iter", "field_bg_dense_add_iter"),
+            ("mask", "field_bg_dense_mask_source"),
+            ("scales", "field_bg_dense_depth_scales"),
+            ("beit", "field_bg_dense_beit_filter"),
+            ("band_low", "field_bg_dense_beit_band_low"),
+            ("band_high", "field_bg_dense_beit_band_high"),
+            ("dedup_level", "field_bg_dense_dedup_level"),
+            ("dedup_priority", "field_bg_dense_dedup_priority"),
+            ("max_per_cell", "field_bg_dense_max_per_cell"),
+            ("clip_bbox", "field_bg_dense_clip_to_bbox"),
+            ("scale_init", "field_bg_prior_scale_init"),
+        ]
+        if scale_init in ("hybrid_far_knn", "hybrid_knn", "fixed_near_knn_far"):
+            bg_dense_items.extend([
+                ("hybrid_threshold", "field_bg_prior_hybrid_knn_scale_threshold"),
+            ])
+        active_modules.append(
+            "bg_dense("
+            + _format_labeled_items(
+                values,
+                bg_dense_items,
+            )
+            + ")"
+        )
+    else:
+        disabled_modules.append("bg_dense")
+
+    if _truthy(values.get("field_obs_reliability", 0)):
+        active_modules.append(
+            "obs_reliability("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_obs_reliability_start"),
+                    ("until", "field_obs_reliability_until"),
+                    ("unreliable_thr", "field_obs_reliability_unreliable_threshold"),
+                    ("window", "field_obs_reliability_local_window"),
+                ],
+            )
+            + ")"
+        )
+    else:
+        disabled_modules.append("obs_reliability")
+
+    if _truthy(values.get("field_scale_reg", 0)):
+        active_modules.append(
+            "scale_reg("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_scale_reg_start"),
+                    ("until", "field_scale_reg_until"),
+                    ("limit", "field_scale_reg_base_limit"),
+                    ("weight", "field_scale_reg_weight"),
+                    ("depth_mode", "field_scale_reg_depth_mode"),
+                    ("gamma", "field_scale_reg_depth_gamma"),
+                ],
+            )
+            + ")"
+        )
+    else:
+        disabled_modules.append("scale_reg")
+
+    optional_switches = [
+        ("field_depthpro_supervision", "depthpro"),
+        ("field_static_radiance_branch", "static_radiance"),
+        ("field_bg_only_train", "bg_only"),
+        ("field_bg_prior", "bg_prior"),
+        ("field_obs_reset", "obs_reset"),
+        ("field_freq_prior", "freq_prior"),
+        ("field_bg_median_loss", "bg_median"),
+        ("field_obs_boost_unreliable_loss", "obs_boost"),
+        ("field_init_depth_only", "init_depth"),
+    ]
+    for switch_key, label in optional_switches:
+        if switch_key not in values:
+            continue
+        if _truthy(values.get(switch_key, 0)):
+            active_modules.append(label)
+        else:
+            disabled_modules.append(label)
+
+    if active_modules:
+        print("[STEGF] Active field modules: " + "; ".join(active_modules))
+    if disabled_modules:
+        print("[STEGF] Disabled field modules: " + ", ".join(disabled_modules))
+
+
 def getparser():
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
@@ -84,8 +227,7 @@ def getparser():
 
         print("Finished loading config.")
 
-    #
-    print(args)
+    _print_args_summary(args, "Training")
     print("Optimizing", args.model_path)
 
     safe_state(args.quiet)
@@ -117,6 +259,7 @@ def gettestparse():
     parser.add_argument("--rdpip", type=str, default = "v3")
     parser.add_argument("--valloader", type=str, default = "colmap")
     parser.add_argument("--configpath", type=str, default = "1")
+    parser.add_argument("--timing_repeats", default=0, type=int)
 
     parser.add_argument("--quiet", action="store_true")
     
@@ -137,11 +280,11 @@ def gettestparse():
             # not passed in by user
             if hasattr(args, k) and getattr(args, k) == defaults.get(k):
                 setattr(args, k, v)
-            else:
+            elif hasattr(args, k):
                 print(f"Keeping command line value for '{k}'")
 
         print("finish load config from " + args.configpath)
-        print("args: " + str(args))
+        _print_args_summary(args, "Testing")
 
     return args, model.extract(args), pipeline.extract(args), multiview
     

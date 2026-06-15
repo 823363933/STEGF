@@ -8,7 +8,14 @@ from pathlib import Path
 DEFAULT_SCENES = ("coffee_martini", "cook_spinach")
 
 
-def build_train_command(args, scene, repo_root):
+def get_model_path(args, scene, repeat_idx=None):
+    scene_output = scene
+    if repeat_idx is not None:
+        scene_output = f"{scene}-re{repeat_idx}"
+    return Path(args.output_root) / scene_output
+
+
+def build_train_command(args, scene, repo_root, model_path):
     cmd = [
         sys.executable,
         str(repo_root / "train.py"),
@@ -17,7 +24,7 @@ def build_train_command(args, scene, repo_root):
         "--configpath",
         str(Path(args.config_dir) / f"{scene}.json"),
         "--model_path",
-        str(Path(args.output_root) / scene),
+        str(model_path),
         "--source_path",
         str(Path(args.data_root) / scene / args.colmap_subdir),
         "--save_iterations",
@@ -26,12 +33,12 @@ def build_train_command(args, scene, repo_root):
     return cmd
 
 
-def build_test_command(args, scene, repo_root):
+def build_test_command(args, scene, repo_root, model_path):
     return [
         sys.executable,
         str(repo_root / "script" / "test_all_iterations.py"),
         "--iterations",
-        ",".join(str(iteration) for iteration in args.save_iterations),
+        ",".join(str(iteration) for iteration in args.test_iterations),
         "--quiet",
         "--eval",
         "--skip_train",
@@ -40,7 +47,7 @@ def build_test_command(args, scene, repo_root):
         "--configpath",
         str(Path(args.config_dir) / f"{scene}.json"),
         "--model_path",
-        str(Path(args.output_root) / scene),
+        str(model_path),
         "--source_path",
         str(Path(args.data_root) / scene / args.colmap_subdir),
     ]
@@ -89,15 +96,30 @@ def main():
         "--save_iterations",
         nargs="+",
         type=int,
-        default=[20000, 30000],
-        help="Checkpoint iterations to save and then test.",
+        default=[30000],
+        help="Checkpoint iterations to save during training.",
+    )
+    parser.add_argument(
+        "--test_iterations",
+        nargs="+",
+        type=int,
+        default=[30000],
+        help="Checkpoint iterations to test after training.",
     )
     parser.add_argument("--valloader", default="colmapvalid", help="Validation loader passed to test_all_iterations.py.")
     parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
     parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")
     parser.add_argument("--continue_on_error", action="store_true", help="Continue with later stages after a failure.")
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
+    parser.add_argument(
+        "--re",
+        type=int,
+        default=1,
+        help="Repeat each requested scene N times. N=1 keeps the original output path; N>1 writes <scene>-re1, <scene>-re2, ...",
+    )
     args = parser.parse_args()
+    if args.re < 1:
+        parser.error("--re must be >= 1")
 
     repo_root = Path(__file__).resolve().parents[1]
     scenes = [args.scene] if args.scene else list(args.scenes)
@@ -105,21 +127,30 @@ def main():
 
     failures = []
     for scene in scenes:
-        print(f"\n[STEGF] ===== Scene: {scene} =====", flush=True)
+        for repeat_idx in range(1, args.re + 1):
+            repeat_suffix = None if args.re == 1 else repeat_idx
+            model_path = get_model_path(args, scene, repeat_suffix)
+            if args.re == 1:
+                print(f"\n[STEGF] ===== Scene: {scene} =====", flush=True)
+            else:
+                print(f"\n[STEGF] ===== Scene: {scene} | repeat {repeat_idx}/{args.re} =====", flush=True)
+                print(f"[STEGF] Repeat output: {model_path}", flush=True)
 
-        if not args.skip_train_stage:
-            code = run_command(build_train_command(args, scene, repo_root), repo_root, args.dry_run)
-            if code != 0:
-                failures.append((scene, "train", code))
-                if not args.continue_on_error:
-                    break
+            if not args.skip_train_stage:
+                code = run_command(build_train_command(args, scene, repo_root, model_path), repo_root, args.dry_run)
+                if code != 0:
+                    failures.append((f"{scene}-re{repeat_idx}" if args.re > 1 else scene, "train", code))
+                    if not args.continue_on_error:
+                        break
 
-        if not args.skip_test_stage:
-            code = run_command(build_test_command(args, scene, repo_root), repo_root, args.dry_run)
-            if code != 0:
-                failures.append((scene, "test", code))
-                if not args.continue_on_error:
-                    break
+            if not args.skip_test_stage:
+                code = run_command(build_test_command(args, scene, repo_root, model_path), repo_root, args.dry_run)
+                if code != 0:
+                    failures.append((f"{scene}-re{repeat_idx}" if args.re > 1 else scene, "test", code))
+                    if not args.continue_on_error:
+                        break
+        if failures and not args.continue_on_error:
+            break
 
     if failures:
         print("\n[STEGF] Failed stages:", flush=True)
