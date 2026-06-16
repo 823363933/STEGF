@@ -302,7 +302,7 @@ class GaussianModel:
         self.field_bg_dense_add_iter = 3000
         self.field_bg_dense_add_time_indices = "0,12,25,37,49"
         self.field_bg_dense_depth_base = "render"
-        self.field_bg_dense_depth_scales = "1,1.5,2,2.5,4"
+        self.field_bg_dense_depth_scales = "0.75,1.09,1.58,2.29,3.32,4.82,7"
         self.field_bg_dense_depth_values = ""
         self.field_bg_dense_mask_source = "instant"
         self.field_bg_dense_sample_block_size = 3
@@ -320,6 +320,7 @@ class GaussianModel:
         self.field_bg_dense_beit_threshold = 0.50
         self.field_bg_dense_cell_dedup = False
         self.field_bg_dense_dedup_level = 3
+        self.field_bg_dense_dedup_priority = "center"
         self.field_bg_dense_max_per_cell = 1
         self.field_bg_dense_skip_control_at_add_iter = False
         self.field_bg_dense_clip_to_bbox = False
@@ -340,6 +341,7 @@ class GaussianModel:
         self.field_scale_reg_weight = 0.0
         self.field_scale_reg_base_limit = 0.3
         self.field_scale_reg_depth_ref = 8.0
+        self.field_scale_reg_depth_mode = "euclidean"
         self.field_scale_reg_depth_gamma = 0.75
         self.field_scale_reg_max_boost = 8.0
         self.field_bg_candidate_grad_boost = False
@@ -1380,7 +1382,7 @@ class GaussianModel:
         self.field_bg_dense_add_iter = int(getattr(args, "field_bg_dense_add_iter", 3000))
         self.field_bg_dense_add_time_indices = str(getattr(args, "field_bg_dense_add_time_indices", "0,12,25,37,49"))
         self.field_bg_dense_depth_base = str(getattr(args, "field_bg_dense_depth_base", "render"))
-        self.field_bg_dense_depth_scales = str(getattr(args, "field_bg_dense_depth_scales", "1,1.5,2,2.5,4"))
+        self.field_bg_dense_depth_scales = str(getattr(args, "field_bg_dense_depth_scales", "0.75,1.09,1.58,2.29,3.32,4.82,7"))
         self.field_bg_dense_depth_values = str(getattr(args, "field_bg_dense_depth_values", ""))
         self.field_bg_dense_mask_source = str(getattr(args, "field_bg_dense_mask_source", "instant"))
         self.field_bg_dense_sample_block_size = int(getattr(args, "field_bg_dense_sample_block_size", 3))
@@ -1398,6 +1400,7 @@ class GaussianModel:
         self.field_bg_dense_beit_threshold = float(getattr(args, "field_bg_dense_beit_threshold", 0.50))
         self.field_bg_dense_cell_dedup = bool(getattr(args, "field_bg_dense_cell_dedup", 0))
         self.field_bg_dense_dedup_level = int(getattr(args, "field_bg_dense_dedup_level", 3))
+        self.field_bg_dense_dedup_priority = str(getattr(args, "field_bg_dense_dedup_priority", "center"))
         self.field_bg_dense_max_per_cell = int(getattr(args, "field_bg_dense_max_per_cell", 1))
         self.field_bg_dense_skip_control_at_add_iter = bool(getattr(args, "field_bg_dense_skip_control_at_add_iter", 0))
         self.field_bg_dense_clip_to_bbox = bool(getattr(args, "field_bg_dense_clip_to_bbox", 0))
@@ -1418,6 +1421,7 @@ class GaussianModel:
         self.field_scale_reg_weight = float(getattr(args, "field_scale_reg_weight", 0.0))
         self.field_scale_reg_base_limit = float(getattr(args, "field_scale_reg_base_limit", 0.3))
         self.field_scale_reg_depth_ref = float(getattr(args, "field_scale_reg_depth_ref", 8.0))
+        self.field_scale_reg_depth_mode = str(getattr(args, "field_scale_reg_depth_mode", "euclidean"))
         self.field_scale_reg_depth_gamma = float(getattr(args, "field_scale_reg_depth_gamma", 0.75))
         self.field_scale_reg_max_boost = float(getattr(args, "field_scale_reg_max_boost", 8.0))
         self.field_bg_candidate_grad_boost = bool(getattr(args, "field_bg_candidate_grad_boost", 0))
@@ -3237,6 +3241,7 @@ class GaussianModel:
             "field_bg_dense_beit_threshold": self.field_bg_dense_beit_threshold,
             "field_bg_dense_cell_dedup": int(self.field_bg_dense_cell_dedup),
             "field_bg_dense_dedup_level": self.field_bg_dense_dedup_level,
+            "field_bg_dense_dedup_priority": self.field_bg_dense_dedup_priority,
             "field_bg_dense_max_per_cell": self.field_bg_dense_max_per_cell,
             "field_bg_dense_skip_control_at_add_iter": int(self.field_bg_dense_skip_control_at_add_iter),
             "field_bg_dense_clip_to_bbox": int(self.field_bg_dense_clip_to_bbox),
@@ -3257,6 +3262,7 @@ class GaussianModel:
             "field_scale_reg_weight": self.field_scale_reg_weight,
             "field_scale_reg_base_limit": self.field_scale_reg_base_limit,
             "field_scale_reg_depth_ref": self.field_scale_reg_depth_ref,
+            "field_scale_reg_depth_mode": self.field_scale_reg_depth_mode,
             "field_scale_reg_depth_gamma": self.field_scale_reg_depth_gamma,
             "field_scale_reg_max_boost": self.field_scale_reg_max_boost,
             "field_bg_candidate_grad_boost": int(self.field_bg_candidate_grad_boost),
@@ -3577,6 +3583,7 @@ class GaussianModel:
             self.field_bg_dense_beit_threshold = float(config.get("field_bg_dense_beit_threshold", self.field_bg_dense_beit_threshold))
             self.field_bg_dense_cell_dedup = bool(config.get("field_bg_dense_cell_dedup", int(self.field_bg_dense_cell_dedup)))
             self.field_bg_dense_dedup_level = int(config.get("field_bg_dense_dedup_level", self.field_bg_dense_dedup_level))
+            self.field_bg_dense_dedup_priority = str(config.get("field_bg_dense_dedup_priority", self.field_bg_dense_dedup_priority))
             self.field_bg_dense_max_per_cell = int(config.get("field_bg_dense_max_per_cell", self.field_bg_dense_max_per_cell))
             self.field_bg_dense_skip_control_at_add_iter = bool(config.get("field_bg_dense_skip_control_at_add_iter", int(self.field_bg_dense_skip_control_at_add_iter)))
             self.field_bg_dense_clip_to_bbox = bool(config.get("field_bg_dense_clip_to_bbox", int(self.field_bg_dense_clip_to_bbox)))
@@ -3597,6 +3604,7 @@ class GaussianModel:
             self.field_scale_reg_weight = float(config.get("field_scale_reg_weight", self.field_scale_reg_weight))
             self.field_scale_reg_base_limit = float(config.get("field_scale_reg_base_limit", self.field_scale_reg_base_limit))
             self.field_scale_reg_depth_ref = float(config.get("field_scale_reg_depth_ref", self.field_scale_reg_depth_ref))
+            self.field_scale_reg_depth_mode = str(config.get("field_scale_reg_depth_mode", self.field_scale_reg_depth_mode))
             self.field_scale_reg_depth_gamma = float(config.get("field_scale_reg_depth_gamma", self.field_scale_reg_depth_gamma))
             self.field_scale_reg_max_boost = float(config.get("field_scale_reg_max_boost", self.field_scale_reg_max_boost))
             self.field_bg_candidate_grad_boost = bool(config.get("field_bg_candidate_grad_boost", int(self.field_bg_candidate_grad_boost)))
@@ -5361,7 +5369,7 @@ class GaussianModel:
 
         new_xyz = torch.cat(new_xyz, dim=0)
         new_rotation = torch.zeros((new_xyz.shape[0],4), device="cuda")
-        new_rotation[:, 1]= 0
+        new_rotation[:, 0]= 1
         
         new_features_dc = torch.cat(new_features_dc, dim=0)
         new_opacity = inverse_sigmoid(0.1 *torch.ones_like(new_xyz[:, 0:1]))
@@ -5623,7 +5631,7 @@ class GaussianModel:
         new_depth_scale_tags = torch.cat(new_depth_scale_tags, dim=0).reshape(-1)
 
         new_rotation = torch.zeros((new_xyz.shape[0], 4), device="cuda")
-        new_rotation[:, 1] = 0.0
+        new_rotation[:, 0] = 1.0
         new_opacity = inverse_sigmoid(float(self.field_bg_prior_opacity) * torch.ones((new_xyz.shape[0], 1), device="cuda"))
 
         if self.use_euler_field:
@@ -5638,27 +5646,102 @@ class GaussianModel:
             new_dynamic_level_logits = None
             new_dynamic_level_time_coeff = None
 
+        new_scaling = self._init_background_gaussian_scaling(new_xyz, new_depth_scale_tags)
+
+        new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), float(iteration), device="cuda", dtype=torch.float32)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+        )
+        return new_xyz.shape[0]
+
+    def _init_background_gaussian_scaling(self, new_xyz, depth_scale_tags=None):
         scale_init = str(getattr(self, "field_bg_prior_scale_init", "knn")).lower()
+        fixed_scale = max(float(getattr(self, "field_bg_prior_fixed_scale", 0.01)), 1e-6)
+        fixed_scaling = torch.full((new_xyz.shape[0], 3), math.log(fixed_scale), device="cuda", dtype=new_xyz.dtype)
+
+        def knn_scaling():
+            tmpxyz = torch.cat((new_xyz, self._xyz), dim=0)
+            dist2 = torch.clamp_min(distCUDA2(tmpxyz), 1e-7)
+            dist2 = dist2[:new_xyz.shape[0]]
+            return torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
+
         if scale_init == "fixed":
-            fixed_scale = max(float(getattr(self, "field_bg_prior_fixed_scale", 0.01)), 1e-6)
-            new_scaling = torch.full((new_xyz.shape[0], 3), math.log(fixed_scale), device="cuda", dtype=new_xyz.dtype)
+            new_scaling = fixed_scaling
         elif scale_init in ("hybrid_far_knn", "hybrid_knn", "fixed_near_knn_far"):
-            fixed_scale = max(float(getattr(self, "field_bg_prior_fixed_scale", 0.01)), 1e-6)
             threshold = float(getattr(self, "field_bg_prior_hybrid_knn_scale_threshold", 5.0))
-            tmpxyz = torch.cat((new_xyz, self._xyz), dim=0)
-            dist2 = torch.clamp_min(distCUDA2(tmpxyz), 1e-7)
-            dist2 = dist2[:new_xyz.shape[0]]
-            knn_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-            fixed_scaling = torch.full((new_xyz.shape[0], 3), math.log(fixed_scale), device="cuda", dtype=new_xyz.dtype)
-            far_mask = (new_depth_scale_tags > threshold).view(-1, 1)
-            new_scaling = torch.where(far_mask, knn_scaling, fixed_scaling)
-            new_scaling = torch.clamp(new_scaling, -10, 1.0)
+            if depth_scale_tags is None:
+                depth_tags = torch.full((new_xyz.shape[0],), float("inf"), device="cuda", dtype=new_xyz.dtype)
+            else:
+                depth_tags = depth_scale_tags.to(device="cuda", dtype=new_xyz.dtype).reshape(-1)
+            far_mask = (depth_tags > threshold).view(-1, 1)
+            new_scaling = torch.where(far_mask, knn_scaling(), fixed_scaling)
         else:
-            tmpxyz = torch.cat((new_xyz, self._xyz), dim=0)
-            dist2 = torch.clamp_min(distCUDA2(tmpxyz), 1e-7)
-            dist2 = dist2[:new_xyz.shape[0]]
-            new_scaling = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-            new_scaling = torch.clamp(new_scaling, -10, 1.0)
+            new_scaling = knn_scaling()
+        return torch.clamp(new_scaling, -10, 1.0)
+
+    def add_static_background_gaussians_xyz(self, new_xyz, rgbs, iteration, depth_scale_tags=None):
+        if new_xyz is None or new_xyz.numel() == 0:
+            return 0
+        new_xyz = new_xyz.to(device="cuda", dtype=self._xyz.dtype).contiguous()
+        rgbs = rgbs.to(device="cuda", dtype=new_xyz.dtype).reshape(-1, 3).clamp(0.0, 1.0)
+        if rgbs.shape[0] != new_xyz.shape[0]:
+            raise ValueError("rgbs must have shape [N, 3] and match new_xyz")
+        if depth_scale_tags is None:
+            new_depth_scale_tags = torch.full((new_xyz.shape[0],), float("inf"), device="cuda", dtype=new_xyz.dtype)
+        else:
+            new_depth_scale_tags = depth_scale_tags.to(device="cuda", dtype=new_xyz.dtype).reshape(-1)
+            if new_depth_scale_tags.shape[0] != new_xyz.shape[0]:
+                raise ValueError("depth_scale_tags must have shape [N] and match new_xyz")
+        color_init = str(getattr(self, "field_bg_prior_color_init", "gt")).lower()
+        if color_init == "zero":
+            new_features_dc = torch.zeros((rgbs.shape[0], 6), device="cuda", dtype=new_xyz.dtype)
+        else:
+            new_features_dc = torch.cat((rgbs, torch.zeros_like(rgbs)), dim=1)
+
+        new_rotation = torch.zeros((new_xyz.shape[0], 4), device="cuda", dtype=new_xyz.dtype)
+        new_rotation[:, 0] = 1.0
+        new_opacity = inverse_sigmoid(float(self.field_bg_prior_opacity) * torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=new_xyz.dtype))
+        new_trbf_center = torch.full((new_xyz.shape[0], 1), float(self.field_bg_prior_trbf_center), device="cuda", dtype=new_xyz.dtype)
+        new_trbf_scale = torch.full((new_xyz.shape[0], 1), float(self.field_bg_prior_trbf_scale), device="cuda", dtype=new_xyz.dtype)
+        new_motion = torch.zeros((new_xyz.shape[0], 9), device="cuda", dtype=new_xyz.dtype)
+        new_omega = torch.zeros((new_xyz.shape[0], 4), device="cuda", dtype=new_xyz.dtype)
+        new_featuret = torch.zeros((new_xyz.shape[0], 3), device="cuda", dtype=new_xyz.dtype)
+
+        if self.use_euler_field:
+            new_static_level_logits = torch.zeros((new_xyz.shape[0], self.field_num_levels), device="cuda", dtype=new_xyz.dtype)
+            new_dynamic_level_logits = torch.zeros((new_xyz.shape[0], self.field_num_levels), device="cuda", dtype=new_xyz.dtype)
+            if self.field_level_fourier_degree > 0:
+                coeff_dim = 2 * self.field_level_fourier_degree
+                new_dynamic_level_time_coeff = torch.zeros((new_xyz.shape[0], self.field_num_levels, coeff_dim), device="cuda", dtype=new_xyz.dtype)
+            else:
+                new_dynamic_level_time_coeff = None
+        else:
+            new_static_level_logits = None
+            new_dynamic_level_logits = None
+            new_dynamic_level_time_coeff = None
+
+        new_scaling = self._init_background_gaussian_scaling(
+            new_xyz,
+            new_depth_scale_tags,
+        )
 
         new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
         new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)

@@ -1,5 +1,6 @@
 # Runtime/generated files
 output/
+dataset/
 baseline/
 OldVision/
 log/

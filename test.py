@@ -64,7 +64,7 @@ def compute_skimage_ssim(rendernumpy, gtnumpy):
         return sk_ssim(rendernumpy, gtnumpy, multichannel=True, data_range=1.0)
 
 # modified from https://github.com/graphdeco-inria/gaussian-splatting/blob/main/render.py and https://github.com/graphdeco-inria/gaussian-splatting/blob/main/metrics.py
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=0):
     render, GRsetting, GRzer = getrenderpip(rdpip) 
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -140,6 +140,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for idx, view in enumerate(tqdm(views, desc="Rendering and metric progress")):
         renderingpkg = render(view, gaussians, pipeline, background, scaling_modifier=1.0, basicfunction=rbfbasefunction,  GRsetting=GRsetting, GRzer=GRzer) # C x H x W
         rendering = renderingpkg["render"]
+        duration = renderingpkg.get("duration", None)
+        if duration is not None and idx > 10:
+            times.append(float(duration))
         gt = view.original_image[0:3, :, :].cuda().float()
         rendering = torch.clamp(rendering, 0, 1.0)
         ssims.append(ssim(rendering.unsqueeze(0),gt.unsqueeze(0))) 
@@ -162,20 +165,24 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     
 
-    for idx, view in enumerate(tqdm(views, desc="release gt images cuda memory for timing")):
-        view.original_image = None #.detach()  
-        torch.cuda.empty_cache()
+    timing_repeats = max(int(timing_repeats), 0)
+    if timing_repeats > 0:
+        times = []
+        for idx, view in enumerate(tqdm(views, desc="release gt images cuda memory for timing")):
+            view.original_image = None #.detach()
+            torch.cuda.empty_cache()
 
-    # start timing
-    for _ in range(4):
-        for idx, view in enumerate(tqdm(views, desc="timing ")):
+        # Optional dedicated timing pass. Disabled by default because metrics already render every view once.
+        for _ in range(timing_repeats):
+            for idx, view in enumerate(tqdm(views, desc="timing ")):
+                renderpack = render(view, gaussians, pipeline, background, scaling_modifier=1.0, basicfunction=rbfbasefunction,  GRsetting=GRsetting, GRzer=GRzer)#["time"] # C x H x W
+                duration = renderpack["duration"]
+                if idx > 10: #warm up
+                    times.append(float(duration))
 
-            renderpack = render(view, gaussians, pipeline, background, scaling_modifier=1.0, basicfunction=rbfbasefunction,  GRsetting=GRsetting, GRzer=GRzer)#["time"] # C x H x W
-            duration = renderpack["duration"]
-            if idx > 10: #warm up
-                times.append(duration)
-
-    print(np.mean(np.array(times)))
+    if len(times) == 0:
+        times = [0.0]
+    print(f"[STEGF] Mean render time: {float(np.mean(np.array(times))):.6f}s")
     if len(views) > 0:
         full_dict[model_path][iteration].update({"SSIM": torch.tensor(ssims).mean().item(),
                                         "PSNR": torch.tensor(psnrs).mean().item(),
@@ -231,7 +238,7 @@ def render_setnogt(model_path, name, iteration, views, gaussians, pipeline, back
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
 
 
-def run_test(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, multiview : bool, duration: int, rgbfunction="rgbv1", rdpip="v2", loader="colmap"):
+def run_test(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, multiview : bool, duration: int, rgbfunction="rgbv1", rdpip="v2", loader="colmap", timing_repeats=0):
     
     with torch.no_grad():
         print("use model {}".format(dataset.model))
@@ -253,7 +260,7 @@ def run_test(dataset : ModelParams, iteration : int, pipeline : PipelineParams, 
             gaussians.ts = torch.ones(1,1,H,W).cuda()
 
         if not skip_test and not multiview:            
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, rbfbasefunction, rdpip)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=timing_repeats)
         if multiview:
             render_setnogt(dataset.model_path, "mv", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, rbfbasefunction, rdpip)
 
@@ -261,4 +268,4 @@ if __name__ == "__main__":
     
 
     args, model_extract, pp_extract, multiview =gettestparse()
-    run_test(model_extract, args.test_iteration, pp_extract, args.skip_train, args.skip_test, multiview, args.duration,  rgbfunction=args.rgbfunction, rdpip=args.rdpip, loader=args.valloader)
+    run_test(model_extract, args.test_iteration, pp_extract, args.skip_train, args.skip_test, multiview, args.duration,  rgbfunction=args.rgbfunction, rdpip=args.rdpip, loader=args.valloader, timing_repeats=args.timing_repeats)

@@ -275,7 +275,7 @@ class ModelParams(ParamGroup):
         self.field_bg_dense_add_iter = 3000
         self.field_bg_dense_add_time_indices = "0,12,25,37,49"
         self.field_bg_dense_depth_base = "render"
-        self.field_bg_dense_depth_scales = "1,1.5,2,2.5,4"
+        self.field_bg_dense_depth_scales = "0.75,1.09,1.58,2.29,3.32,4.82,7"
         self.field_bg_dense_depth_values = ""
         self.field_bg_dense_mask_source = "instant"
         self.field_bg_dense_sample_block_size = 3
@@ -293,6 +293,7 @@ class ModelParams(ParamGroup):
         self.field_bg_dense_beit_threshold = 0.50
         self.field_bg_dense_cell_dedup = 0
         self.field_bg_dense_dedup_level = 3
+        self.field_bg_dense_dedup_priority = "center"
         self.field_bg_dense_max_per_cell = 1
         self.field_bg_dense_skip_control_at_add_iter = 0
         self.field_bg_dense_clip_to_bbox = 0
@@ -313,6 +314,7 @@ class ModelParams(ParamGroup):
         self.field_scale_reg_weight = 0.0
         self.field_scale_reg_base_limit = 0.3
         self.field_scale_reg_depth_ref = 8.0
+        self.field_scale_reg_depth_mode = "euclidean"
         self.field_scale_reg_depth_gamma = 0.75
         self.field_scale_reg_max_boost = 8.0
         self.field_bg_candidate_grad_boost = 0
