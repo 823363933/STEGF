@@ -95,6 +95,81 @@ def write_stegf_config(args, gaussians):
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def _gaussian_blur_2d(x, sigma):
+    if sigma <= 0:
+        return x
+    radius = max(int(round(3.0 * sigma)), 1)
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    kernel = torch.exp(-(coords * coords) / (2.0 * sigma * sigma))
+    kernel = kernel / kernel.sum().clamp_min(1e-12)
+    kernel_h = kernel.view(1, 1, 1, -1)
+    kernel_v = kernel.view(1, 1, -1, 1)
+    x = F.conv2d(x, kernel_h, padding=(0, radius))
+    x = F.conv2d(x, kernel_v, padding=(radius, 0))
+    return x
+
+
+def compute_highfreq_densify_gate(image, gt_image, viewpoint_camera, means3D, gaussians):
+    if not bool(getattr(gaussians, "field_highfreq_densify", 0)):
+        return None
+    if means3D is None or means3D.numel() == 0:
+        return None
+
+    eps = max(float(getattr(gaussians, "field_highfreq_densify_eps", 1e-3)), 1e-8)
+    y_min = float(getattr(gaussians, "field_highfreq_densify_y_min", 0.03))
+    y_max = float(getattr(gaussians, "field_highfreq_densify_y_max", 0.97))
+    min_pixels = max(int(getattr(gaussians, "field_highfreq_densify_min_pixels", 64)), 1)
+
+    pred = image.clamp(0.0, 1.0)
+    gt = gt_image.clamp(0.0, 1.0)
+    coeff = pred.new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
+    y_pred = (pred * coeff).sum(dim=0, keepdim=True)
+    y_gt = (gt * coeff).sum(dim=0, keepdim=True)
+    valid = ((y_gt > y_min) & (y_gt < y_max)).to(dtype=pred.dtype)
+    valid_count = valid.sum()
+    if valid_count.item() < min_pixels:
+        return None
+
+    log_residual = torch.log(y_pred + eps) - torch.log(y_gt + eps)
+    _, h, w = log_residual.shape
+    sigma_divisor = max(float(getattr(gaussians, "field_highfreq_densify_sigma_divisor", 64.0)), 1.0)
+    sigma = min(h, w) / sigma_divisor
+    numerator = _gaussian_blur_2d((valid * log_residual).unsqueeze(0), sigma)
+    denominator = _gaussian_blur_2d(valid.unsqueeze(0), sigma).clamp_min(1e-6)
+    low_residual = (numerator / denominator).squeeze(0)
+    high_residual = log_residual - low_residual
+    q = torch.abs(high_residual) / (torch.abs(high_residual) + torch.abs(low_residual) + eps)
+    q_start = float(getattr(gaussians, "field_highfreq_densify_gate_start", 0.3))
+    q_width = max(float(getattr(gaussians, "field_highfreq_densify_gate_width", 0.4)), 1e-6)
+    gate_map = ((q - q_start) / q_width).clamp(0.0, 1.0)
+    gate_map = gate_map * valid + (1.0 - valid)
+
+    height = int(viewpoint_camera.image_height)
+    width = int(viewpoint_camera.image_width)
+    projected = geom_transform_points(means3D.detach(), viewpoint_camera.full_proj_transform)
+    ndc = projected[:, :2]
+    finite = torch.isfinite(ndc[:, 0]) & torch.isfinite(ndc[:, 1])
+    inside = finite & (ndc[:, 0] >= -1.0) & (ndc[:, 0] <= 1.0) & (ndc[:, 1] >= -1.0) & (ndc[:, 1] <= 1.0)
+    if torch.count_nonzero(inside) == 0:
+        return None
+
+    x = (((ndc[:, 0] + 1.0) * float(width)) - 1.0) * 0.5
+    y = (((ndc[:, 1] + 1.0) * float(height)) - 1.0) * 0.5
+    grid_x = (2.0 * (x / max(width - 1, 1))) - 1.0
+    grid_y = (2.0 * (y / max(height - 1, 1))) - 1.0
+    grid = torch.stack((grid_x, grid_y), dim=-1).view(1, -1, 1, 2)
+    sampled = F.grid_sample(
+        gate_map.detach().unsqueeze(0),
+        grid,
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).view(-1, 1)
+    point_gate = torch.ones((means3D.shape[0], 1), device=means3D.device, dtype=means3D.dtype)
+    point_gate[inside] = sampled[inside].to(dtype=means3D.dtype)
+    return point_gate
+
+
 def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration=50, rgbfunction="rgbv1", rdpip="v2"):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
@@ -3237,6 +3312,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     selectedlength = 2
     lasterems = 0 
+    appearance_only_logged = False
+    soft_geometry_lr_logged = False
 
     for iteration in range(first_iter, opt.iterations + 1):        
         if ems_main_enabled and iteration ==  opt.emsstart:
@@ -3244,6 +3321,15 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
+        if hasattr(gaussians, "apply_soft_geometry_lr"):
+            soft_geometry_lr_active = gaussians.apply_soft_geometry_lr(iteration)
+            if soft_geometry_lr_active and not soft_geometry_lr_logged:
+                print(
+                    "\n[STEGF] Soft geometry LR active at iter "
+                    f"{iteration}: scale={getattr(gaussians, 'field_soft_geometry_lr_scale', '')}, "
+                    f"full_lr={getattr(gaussians, 'field_soft_geometry_full_lr_groups', '')}"
+                )
+                soft_geometry_lr_logged = True
         if hasattr(gaussians, "set_field_training_stage"):
             gaussians.set_field_training_stage(iteration)
             if getattr(gaussians, "field_staged_training", False) and iteration in (
@@ -3256,6 +3342,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             pipe.debug = True
         if gaussians.rgbdecoder is not None:
             gaussians.rgbdecoder.train()
+        if getattr(gaussians, "content_exposure_head", None) is not None:
+            gaussians.content_exposure_head.train()
         if getattr(gaussians, "use_euler_field", False):
             if gaussians.euler_field is not None:
                 gaussians.euler_field.train()
@@ -3286,6 +3374,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             bg_prior_contexts = []
             obs_reset_contexts = []
             bg_only_pixels = 0
+            densify_point_gate = None
+            need_highfreq_densify_stats = bool(getattr(gaussians, "field_highfreq_densify", 0)) and (
+                iteration < opt.densify_until_iter
+                or (
+                    hasattr(gaussians, "background_candidate_stats_enabled")
+                    and gaussians.background_candidate_stats_enabled(iteration)
+                )
+            )
 
             for i in range(opt.batch):
                 viewpoint_cam = camindex[i]
@@ -3316,6 +3412,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     mask = torch.sum(gt_image, dim=0) == 0
                     mask = mask.float()
                     image = image * (1- mask) +  gt_image * (mask)
+                if hasattr(gaussians, "apply_content_exposure"):
+                    image = gaussians.apply_content_exposure(image)
                 if hasattr(gaussians, "update_error_prior"):
                     gaussians.update_error_prior(visibility_filter, image, gt_image, viewpoint_cam, render_pkg["means3D"].detach())
 
@@ -3389,6 +3487,15 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 freq_prior_loss = get_frequency_prior_loss(iteration, viewpoint_cam, image, gt_image, unreliable_mask)
                 if freq_prior_loss is not None:
                     loss = loss + freq_prior_loss
+
+                if need_highfreq_densify_stats:
+                    densify_point_gate = compute_highfreq_densify_gate(
+                        loss_image,
+                        gt_image,
+                        viewpoint_cam,
+                        render_pkg.get("means3D"),
+                        gaussians,
+                    )
 
                 if ems_main_enabled and flagems == 1:
                     if viewpoint_cam.image_name not in lossdiect:
@@ -3488,7 +3595,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     stats_filter = visibility_filter & bg_candidate_mask
                 if torch.count_nonzero(stats_filter) > 0:
                     gaussians.max_radii2D[stats_filter] = torch.max(gaussians.max_radii2D[stats_filter], radii[stats_filter])
-                    gaussians.add_densification_stats(viewspace_point_tensor, stats_filter)
+                    if bool(getattr(gaussians, "field_highfreq_densify", 0)) and densify_point_gate is not None:
+                        gaussians.add_densification_stats_with_gate(viewspace_point_tensor, stats_filter, densify_point_gate)
+                    else:
+                        gaussians.add_densification_stats(viewspace_point_tensor, stats_filter)
             flag = controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filter, radii, viewspace_point_tensor, flag,  traincamerawithdistance=None, maxbounds=maxbounds,minbounds=minbounds)
             dense_added_post_control = run_dense_background_add(iteration)
             if dense_added_post_control > 0:
@@ -3630,6 +3740,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 
             # Optimizer step
             if iteration < opt.iterations:
+                if hasattr(gaussians, "apply_appearance_only_gradients"):
+                    appearance_only_active = gaussians.apply_appearance_only_gradients(iteration)
+                    if appearance_only_active and not appearance_only_logged:
+                        print(
+                            "\n[STEGF] Appearance-only optimization active at iter "
+                            f"{iteration}: allow={getattr(gaussians, 'field_appearance_only_allow', '')}"
+                        )
+                        appearance_only_logged = True
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
                 obs_reset_count = 0

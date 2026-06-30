@@ -53,6 +53,85 @@ class Sandwich(nn.Module):
         return result
 
 
+class SandwichScalarExposure(nn.Module):
+    def __init__(self, dim, outdim=3, bias=False, exposure_scale=0.05):
+        super(SandwichScalarExposure, self).__init__()
+
+        self.mlp1 = nn.Conv2d(12, 6, kernel_size=1, bias=bias)
+        self.mlp2 = nn.Conv2d(6, 3, kernel_size=1, bias=bias)
+
+        self.exposure_mlp1 = nn.Conv2d(15, 6, kernel_size=1, bias=bias)
+        self.exposure_mlp2 = nn.Conv2d(6, 1, kernel_size=1, bias=bias)
+        nn.init.zeros_(self.exposure_mlp2.weight)
+        if self.exposure_mlp2.bias is not None:
+            nn.init.zeros_(self.exposure_mlp2.bias)
+
+        self.exposure_scale = float(exposure_scale)
+        self.relu = nn.ReLU()
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, input, rays, time=None):
+        albedo, spec, timefeature = input.chunk(3, dim=1)
+        specular_input = torch.cat([spec, timefeature, rays], dim=1)
+        specular = self.mlp1(specular_input)
+        specular = self.relu(specular)
+        specular = self.mlp2(specular)
+
+        exposure_input = torch.cat([albedo, spec, timefeature, rays], dim=1)
+        exposure = self.exposure_mlp1(exposure_input)
+        exposure = self.relu(exposure)
+        exposure = self.exposure_mlp2(exposure)
+
+        result = albedo + specular + self.exposure_scale * exposure
+        result = self.sigmoid(result)
+        return result
+
+
+class SandwichWide(nn.Module):
+    def __init__(self, dim, outdim=3, bias=False, hidden_dim=12):
+        super(SandwichWide, self).__init__()
+
+        self.mlp1 = nn.Conv2d(12, hidden_dim, kernel_size=1, bias=bias)
+        self.mlp2 = nn.Conv2d(hidden_dim, 3, kernel_size=1, bias=bias)
+        self.relu = nn.ReLU()
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, input, rays, time=None):
+        albedo, spec, timefeature = input.chunk(3, dim=1)
+        specular = torch.cat([spec, timefeature, rays], dim=1)
+        specular = self.mlp1(specular)
+        specular = self.relu(specular)
+        specular = self.mlp2(specular)
+
+        result = albedo + specular
+        result = self.sigmoid(result)
+        return result
+
+
+class SandwichDeepWide(nn.Module):
+    def __init__(self, dim, outdim=3, bias=False, hidden_dim=12):
+        super(SandwichDeepWide, self).__init__()
+
+        self.mlp1 = nn.Conv2d(12, hidden_dim, kernel_size=1, bias=bias)
+        self.mlp2 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1, bias=bias)
+        self.mlp3 = nn.Conv2d(hidden_dim, 3, kernel_size=1, bias=bias)
+        self.relu = nn.ReLU()
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, input, rays, time=None):
+        albedo, spec, timefeature = input.chunk(3, dim=1)
+        specular = torch.cat([spec, timefeature, rays], dim=1)
+        specular = self.mlp1(specular)
+        specular = self.relu(specular)
+        specular = self.mlp2(specular)
+        specular = self.relu(specular)
+        specular = self.mlp3(specular)
+
+        result = albedo + specular
+        result = self.sigmoid(result)
+        return result
+
+
 class Sandwichnoact(nn.Module):
     def __init__(self, dim, outdim=3, bias=False):
         super(Sandwichnoact, self).__init__()
@@ -347,6 +426,12 @@ def padding_point(pcd, N=4):
 def getcolormodel(rgbfuntion):
     if rgbfuntion == "sandwich":
         rgbdecoder = Sandwich(9,3)
+    elif rgbfuntion in ("sandwich_scalar_exposure", "sandwich_exposure_scalar"):
+        rgbdecoder = SandwichScalarExposure(9,3)
+    elif rgbfuntion in ("sandwich_wide", "wide_sandwich"):
+        rgbdecoder = SandwichWide(9,3)
+    elif rgbfuntion in ("sandwich_deep_wide", "deep_wide_sandwich"):
+        rgbdecoder = SandwichDeepWide(9,3)
     
     elif rgbfuntion == "sandwichnoact":
         rgbdecoder = Sandwichnoact(9,3)
@@ -362,6 +447,3 @@ def pix2ndc(v, S):
 
 def ndc2pix(v, S):
     return ((v + 1.0) * S - 1.0) * 0.5
-
-
-

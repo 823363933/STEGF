@@ -147,6 +147,90 @@ def _print_args_summary(args, title):
     else:
         disabled_modules.append("scale_reg")
 
+    if _truthy(values.get("field_highfreq_densify", 0)):
+        active_modules.append(
+            "highfreq_densify("
+            + _format_labeled_items(
+                values,
+                [
+                    ("sigma_div", "field_highfreq_densify_sigma_divisor"),
+                    ("eps", "field_highfreq_densify_eps"),
+                    ("y_min", "field_highfreq_densify_y_min"),
+                    ("y_max", "field_highfreq_densify_y_max"),
+                    ("min_pixels", "field_highfreq_densify_min_pixels"),
+                    ("gate_start", "field_highfreq_densify_gate_start"),
+                    ("gate_width", "field_highfreq_densify_gate_width"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_highfreq_densify" in values:
+        disabled_modules.append("highfreq_densify")
+
+    if _truthy(values.get("field_appearance_only_train", 0)):
+        active_modules.append(
+            "appearance_only("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_appearance_only_start"),
+                    ("allow", "field_appearance_only_allow"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_appearance_only_train" in values:
+        disabled_modules.append("appearance_only")
+
+    if _truthy(values.get("field_soft_geometry_lr", 0)):
+        active_modules.append(
+            "soft_geometry_lr("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_soft_geometry_start"),
+                    ("scale", "field_soft_geometry_lr_scale"),
+                    ("full_lr", "field_soft_geometry_full_lr_groups"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_soft_geometry_lr" in values:
+        disabled_modules.append("soft_geometry_lr")
+
+    if _truthy(values.get("field_content_exposure", 0)):
+        active_modules.append(
+            "content_exposure("
+            + _format_labeled_items(
+                values,
+                [
+                    ("hidden", "field_content_exposure_hidden"),
+                    ("max_log_scale", "field_content_exposure_max_log_scale"),
+                    ("max_bias", "field_content_exposure_max_bias"),
+                    ("detach_stats", "field_content_exposure_detach_stats"),
+                    ("lr", "field_content_exposure_lr"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_content_exposure" in values:
+        disabled_modules.append("content_exposure")
+
+    if title.lower().startswith("testing") and _truthy(values.get("test_photometric_fit", 0)):
+        active_modules.append(
+            "photometric_fit("
+            + _format_labeled_items(
+                values,
+                [
+                    ("mode", "test_photometric_fit_mode"),
+                    ("reg", "test_photometric_fit_reg"),
+                    ("clamp", "test_photometric_fit_clamp"),
+                    ("save_images", "test_photometric_fit_save_images"),
+                ],
+            )
+            + ")"
+        )
+
     optional_switches = [
         ("field_depthpro_supervision", "depthpro"),
         ("field_static_radiance_branch", "static_radiance"),

@@ -45,6 +45,7 @@ import scipy
 import numpy as np 
 import warnings
 import json 
+from PIL import Image
 
 from thirdparty.gaussian_splatting.lpipsPyTorch import lpips
 from helper_train import getrenderpip, getmodel, trbfunction
@@ -63,8 +64,143 @@ def compute_skimage_ssim(rendernumpy, gtnumpy):
     except TypeError:
         return sk_ssim(rendernumpy, gtnumpy, multichannel=True, data_range=1.0)
 
+
+class PhotometricFitAccumulator:
+    def __init__(self, mode="rgb_affine", reg=1e-6):
+        self.mode = str(mode).lower()
+        self.reg = float(reg)
+        self.count = torch.zeros((3,), dtype=torch.float64)
+        self.sum_x = torch.zeros((3,), dtype=torch.float64)
+        self.sum_y = torch.zeros((3,), dtype=torch.float64)
+        self.sum_x2 = torch.zeros((3,), dtype=torch.float64)
+        self.sum_xy = torch.zeros((3,), dtype=torch.float64)
+
+    def update(self, rendering, gt):
+        x = rendering.detach().float().clamp(0.0, 1.0).reshape(3, -1).double()
+        y = gt.detach().float().clamp(0.0, 1.0).reshape(3, -1).double()
+        self.count += x.shape[1]
+        self.sum_x += x.sum(dim=1).cpu()
+        self.sum_y += y.sum(dim=1).cpu()
+        self.sum_x2 += (x * x).sum(dim=1).cpu()
+        self.sum_xy += (x * y).sum(dim=1).cpu()
+
+    def solve(self):
+        count = torch.clamp(self.count, min=1.0)
+        mode = self.mode
+        if mode == "rgb_scale":
+            scale = self.sum_xy / torch.clamp(self.sum_x2 + self.reg, min=1e-12)
+            bias = torch.zeros_like(scale)
+        elif mode == "scalar_affine":
+            n = count.sum()
+            sx = self.sum_x.sum()
+            sy = self.sum_y.sum()
+            sx2 = self.sum_x2.sum()
+            sxy = self.sum_xy.sum()
+            denom = sx2 - sx * sx / torch.clamp(n, min=1.0) + self.reg
+            scale_value = (sxy - sx * sy / torch.clamp(n, min=1.0)) / torch.clamp(denom, min=1e-12)
+            bias_value = sy / torch.clamp(n, min=1.0) - scale_value * sx / torch.clamp(n, min=1.0)
+            scale = scale_value.repeat(3)
+            bias = bias_value.repeat(3)
+        else:
+            mode = "rgb_affine"
+            denom = self.sum_x2 - self.sum_x * self.sum_x / count + self.reg
+            scale = (self.sum_xy - self.sum_x * self.sum_y / count) / torch.clamp(denom, min=1e-12)
+            bias = self.sum_y / count - scale * self.sum_x / count
+        scale = torch.nan_to_num(scale.float(), nan=1.0, posinf=1.0, neginf=1.0)
+        bias = torch.nan_to_num(bias.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        return {"mode": mode, "scale": scale, "bias": bias}
+
+
+def load_rgb_tensor(path):
+    image = Image.open(path).convert("RGB")
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1)
+
+
+def apply_photometric_fit(image, fit_params, clamp=True):
+    scale = fit_params["scale"].to(device=image.device, dtype=image.dtype).view(3, 1, 1)
+    bias = fit_params["bias"].to(device=image.device, dtype=image.dtype).view(3, 1, 1)
+    image = scale * image + bias
+    if clamp:
+        image = image.clamp(0.0, 1.0)
+    return image
+
+
+def evaluate_photometric_fit(
+    model_path,
+    name,
+    iteration,
+    image_names,
+    fit_params,
+    clamp=True,
+    save_images=True,
+):
+    base_path = os.path.join(model_path, name, "ours_{}".format(iteration))
+    render_path = os.path.join(base_path, "renders")
+    gts_path = os.path.join(base_path, "gt")
+    fit_render_path = os.path.join(base_path, "renders_photometric_fit")
+    if save_images:
+        makedirs(fit_render_path, exist_ok=True)
+
+    psnrs = []
+    lpipss = []
+    lpipssvggs = []
+    ssims = []
+    ssimsv2 = []
+    per_view_dict = {model_path: {iteration: {}}}
+    full_dict = {model_path: {iteration: {}}}
+
+    for image_name in tqdm(image_names, desc="Photometric fit metric progress"):
+        rendering = load_rgb_tensor(os.path.join(render_path, image_name)).cuda().contiguous()
+        gt = load_rgb_tensor(os.path.join(gts_path, image_name)).cuda().contiguous()
+        fitted = apply_photometric_fit(rendering, fit_params, clamp=clamp).contiguous()
+
+        ssims.append(ssim(fitted.unsqueeze(0), gt.unsqueeze(0)))
+        psnrs.append(psnr(fitted.unsqueeze(0), gt.unsqueeze(0)))
+        lpipss.append(lpips(fitted.unsqueeze(0), gt.unsqueeze(0), net_type='alex'))
+        lpipssvggs.append(lpips(fitted.unsqueeze(0), gt.unsqueeze(0), net_type='vgg'))
+
+        rendernumpy = fitted.permute(1, 2, 0).detach().cpu().numpy()
+        gtnumpy = gt.permute(1, 2, 0).detach().cpu().numpy()
+        ssimsv2.append(compute_skimage_ssim(rendernumpy, gtnumpy))
+
+        if save_images:
+            torchvision.utils.save_image(fitted, os.path.join(fit_render_path, image_name))
+
+    per_view_dict[model_path][iteration].update({
+        "SSIM": {name: value for value, name in zip(torch.tensor(ssims).tolist(), image_names)},
+        "PSNR": {name: value for value, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+        "LPIPS": {name: value for value, name in zip(torch.tensor(lpipss).tolist(), image_names)},
+        "ssimsv2": {name: value for value, name in zip(torch.tensor(ssimsv2).tolist(), image_names)},
+        "LPIPSVGG": {name: value for value, name in zip(torch.tensor(lpipssvggs).tolist(), image_names)},
+    })
+    full_dict[model_path][iteration].update({
+        "SSIM": torch.tensor(ssims).mean().item(),
+        "PSNR": torch.tensor(psnrs).mean().item(),
+        "LPIPS": torch.tensor(lpipss).mean().item(),
+        "ssimsv2": torch.tensor(ssimsv2).mean().item(),
+        "LPIPSVGG": torch.tensor(lpipssvggs).mean().item(),
+        "fit_mode": fit_params["mode"],
+        "fit_scale": fit_params["scale"].tolist(),
+        "fit_bias": fit_params["bias"].tolist(),
+        "fit_clamp": int(bool(clamp)),
+    })
+
+    with open(os.path.join(model_path, str(iteration) + "_runtimeresults_photometric_fit.json"), 'w') as fp:
+        json.dump(full_dict, fp, indent=True)
+    with open(os.path.join(model_path, str(iteration) + "_runtimeperview_photometric_fit.json"), 'w') as fp:
+        json.dump(per_view_dict, fp, indent=True)
+    with open(os.path.join(base_path, "photometric_fit.json"), 'w') as fp:
+        json.dump({
+            "mode": fit_params["mode"],
+            "scale": fit_params["scale"].tolist(),
+            "bias": fit_params["bias"].tolist(),
+            "clamp": int(bool(clamp)),
+            "save_images": int(bool(save_images)),
+        }, fp, indent=True)
+
 # modified from https://github.com/graphdeco-inria/gaussian-splatting/blob/main/render.py and https://github.com/graphdeco-inria/gaussian-splatting/blob/main/metrics.py
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=0):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=0, photometric_fit=False, photometric_fit_mode="rgb_affine", photometric_fit_reg=1e-6, photometric_fit_clamp=True, photometric_fit_save_images=True):
     render, GRsetting, GRzer = getrenderpip(rdpip) 
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -74,6 +210,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     if gaussians.rgbdecoder is not None:
         gaussians.rgbdecoder.cuda()
         gaussians.rgbdecoder.eval()
+    if getattr(gaussians, "content_exposure_head", None) is not None:
+        gaussians.content_exposure_head.cuda()
+        gaussians.content_exposure_head.eval()
     if getattr(gaussians, "use_euler_field", False):
         if gaussians.euler_field is not None:
             gaussians.euler_field.cuda()
@@ -121,6 +260,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     scene_dir = model_path
     image_names = []
     times = []
+    fit_accumulator = PhotometricFitAccumulator(
+        mode=photometric_fit_mode,
+        reg=photometric_fit_reg,
+    ) if photometric_fit else None
 
     full_dict[scene_dir] = {}
     per_view_dict[scene_dir] = {}
@@ -144,7 +287,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if duration is not None and idx > 10:
             times.append(float(duration))
         gt = view.original_image[0:3, :, :].cuda().float()
+        if hasattr(gaussians, "apply_content_exposure"):
+            rendering = gaussians.apply_content_exposure(rendering)
         rendering = torch.clamp(rendering, 0, 1.0)
+        if fit_accumulator is not None:
+            fit_accumulator.update(rendering, gt)
         ssims.append(ssim(rendering.unsqueeze(0),gt.unsqueeze(0))) 
 
         psnrs.append(psnr(rendering.unsqueeze(0), gt.unsqueeze(0)))
@@ -205,6 +352,25 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         with open(model_path + "/" + str(iteration) + "_runtimeperview.json", 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
 
+        if fit_accumulator is not None:
+            fit_params = fit_accumulator.solve()
+            print(
+                "[STEGF] Photometric fit: mode={}, scale={}, bias={}".format(
+                    fit_params["mode"],
+                    [round(float(v), 6) for v in fit_params["scale"]],
+                    [round(float(v), 6) for v in fit_params["bias"]],
+                )
+            )
+            evaluate_photometric_fit(
+                model_path,
+                name,
+                iteration,
+                image_names,
+                fit_params,
+                clamp=photometric_fit_clamp,
+                save_images=photometric_fit_save_images,
+            )
+
 
 # render free view
 def render_setnogt(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip):
@@ -215,6 +381,9 @@ def render_setnogt(model_path, name, iteration, views, gaussians, pipeline, back
     if gaussians.rgbdecoder is not None:
         gaussians.rgbdecoder.cuda()
         gaussians.rgbdecoder.eval()
+    if getattr(gaussians, "content_exposure_head", None) is not None:
+        gaussians.content_exposure_head.cuda()
+        gaussians.content_exposure_head.eval()
     if getattr(gaussians, "use_euler_field", False):
         if gaussians.euler_field is not None:
             gaussians.euler_field.cuda()
@@ -234,6 +403,9 @@ def render_setnogt(model_path, name, iteration, views, gaussians, pipeline, back
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
         rendering = render(view, gaussians, pipeline, background,scaling_modifier=1.0, basicfunction=rbfbasefunction,  GRsetting=GRsetting, GRzer=GRzer)["render"] # C x H x W
+        if hasattr(gaussians, "apply_content_exposure"):
+            rendering = gaussians.apply_content_exposure(rendering)
+        rendering = torch.clamp(rendering, 0, 1.0)
 
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
 
@@ -260,7 +432,23 @@ def run_test(dataset : ModelParams, iteration : int, pipeline : PipelineParams, 
             gaussians.ts = torch.ones(1,1,H,W).cuda()
 
         if not skip_test and not multiview:            
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=timing_repeats)
+            render_set(
+                dataset.model_path,
+                "test",
+                scene.loaded_iter,
+                scene.getTestCameras(),
+                gaussians,
+                pipeline,
+                background,
+                rbfbasefunction,
+                rdpip,
+                timing_repeats=timing_repeats,
+                photometric_fit=bool(getattr(dataset, "test_photometric_fit", 0)),
+                photometric_fit_mode=str(getattr(dataset, "test_photometric_fit_mode", "rgb_affine")),
+                photometric_fit_reg=float(getattr(dataset, "test_photometric_fit_reg", 1e-6)),
+                photometric_fit_clamp=bool(getattr(dataset, "test_photometric_fit_clamp", 1)),
+                photometric_fit_save_images=bool(getattr(dataset, "test_photometric_fit_save_images", 1)),
+            )
         if multiview:
             render_setnogt(dataset.model_path, "mv", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, rbfbasefunction, rdpip)
 

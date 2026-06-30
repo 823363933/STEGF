@@ -30,6 +30,8 @@ def build_train_command(args, scene, repo_root, model_path):
         "--save_iterations",
     ]
     cmd.extend(str(iteration) for iteration in args.save_iterations)
+    if args.iterations is not None:
+        cmd.extend(["--iterations", str(args.iterations)])
     return cmd
 
 
@@ -92,6 +94,11 @@ def main():
     parser.add_argument("--output_root", default="/root/autodl-tmp/output", help="Root for scene outputs.")
     parser.add_argument("--config_dir", default="configs/n3d_ours", help="Directory containing <scene>.json configs.")
     parser.add_argument("--colmap_subdir", default="colmap_0", help="Scene subdirectory used as --source_path.")
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        help="Total training iterations passed to train.py. Defaults to train.py/config value.",
+    )
     parser.add_argument(
         "--save_iterations",
         nargs="+",

@@ -24,6 +24,31 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation, update_
 from utils.graphics_utils import geom_transform_points
 from helper_model import getcolormodel, interpolate_point, interpolate_partuse, interpolate_pointv3
 from scene.euler_field import EulerField, EulerLevelRouter, EulerQueryFusionGate, EulerResidualDecoder
+
+
+class ContentExposureHead(nn.Module):
+    def __init__(self, hidden=8, max_log_scale=0.2, max_bias=0.05):
+        super().__init__()
+        hidden = max(int(hidden), 1)
+        self.hidden = hidden
+        self.max_log_scale = float(max_log_scale)
+        self.max_bias = float(max_bias)
+        self.net = nn.Sequential(
+            nn.Linear(6, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 2),
+        )
+        # Identity initialization keeps the first iterations equivalent to the baseline renderer.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, stats):
+        raw = self.net(stats)
+        log_scale = self.max_log_scale * torch.tanh(raw[:, 0:1])
+        bias = self.max_bias * torch.tanh(raw[:, 1:2])
+        return log_scale, bias
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -79,6 +104,7 @@ class GaussianModel:
         self.field_temporal_opacity_head = None
         self.field_static_view_mapper = None
         self.field_static_app_head = None
+        self.content_exposure_head = None
     
         self.setup_functions()
         self.delta_t = None
@@ -325,6 +351,28 @@ class GaussianModel:
         self.field_bg_dense_skip_control_at_add_iter = False
         self.field_bg_dense_clip_to_bbox = False
         self.field_bg_dense_bbox_clip_margin = 0.999
+        self.field_highfreq_densify = False
+        self.field_highfreq_densify_sigma_divisor = 64.0
+        self.field_highfreq_densify_eps = 0.001
+        self.field_highfreq_densify_y_min = 0.03
+        self.field_highfreq_densify_y_max = 0.97
+        self.field_highfreq_densify_min_pixels = 64
+        self.field_highfreq_densify_gate_start = 0.3
+        self.field_highfreq_densify_gate_width = 0.4
+        self.field_appearance_only_train = False
+        self.field_appearance_only_start = 20000
+        self.field_appearance_only_allow = "f_dc,f_t,decoder"
+        self.field_soft_geometry_lr = False
+        self.field_soft_geometry_start = 20000
+        self.field_soft_geometry_lr_scale = 0.5
+        self.field_soft_geometry_full_lr_groups = "f_dc,f_t,decoder,field_static_app,field_static_view_mapper"
+        self.field_content_exposure = False
+        self.field_content_exposure_lr = 0.001
+        self.field_content_exposure_hidden = 8
+        self.field_content_exposure_max_log_scale = 0.2
+        self.field_content_exposure_max_bias = 0.05
+        self.field_content_exposure_eps = 0.001
+        self.field_content_exposure_detach_stats = True
         self.field_depthpro_supervision = False
         self.field_depthpro_path = ""
         self.field_depthpro_start = 3000
@@ -1405,6 +1453,29 @@ class GaussianModel:
         self.field_bg_dense_skip_control_at_add_iter = bool(getattr(args, "field_bg_dense_skip_control_at_add_iter", 0))
         self.field_bg_dense_clip_to_bbox = bool(getattr(args, "field_bg_dense_clip_to_bbox", 0))
         self.field_bg_dense_bbox_clip_margin = float(getattr(args, "field_bg_dense_bbox_clip_margin", 0.999))
+        self.field_highfreq_densify = bool(getattr(args, "field_highfreq_densify", 0))
+        self.field_highfreq_densify_sigma_divisor = float(getattr(args, "field_highfreq_densify_sigma_divisor", 64.0))
+        self.field_highfreq_densify_eps = float(getattr(args, "field_highfreq_densify_eps", 0.001))
+        self.field_highfreq_densify_y_min = float(getattr(args, "field_highfreq_densify_y_min", 0.03))
+        self.field_highfreq_densify_y_max = float(getattr(args, "field_highfreq_densify_y_max", 0.97))
+        self.field_highfreq_densify_min_pixels = int(getattr(args, "field_highfreq_densify_min_pixels", 64))
+        self.field_highfreq_densify_gate_start = float(getattr(args, "field_highfreq_densify_gate_start", 0.3))
+        self.field_highfreq_densify_gate_width = float(getattr(args, "field_highfreq_densify_gate_width", 0.4))
+        self.field_appearance_only_train = bool(getattr(args, "field_appearance_only_train", 0))
+        self.field_appearance_only_start = int(getattr(args, "field_appearance_only_start", 20000))
+        self.field_appearance_only_allow = str(getattr(args, "field_appearance_only_allow", "f_dc,f_t,decoder"))
+        self.field_soft_geometry_lr = bool(getattr(args, "field_soft_geometry_lr", 0))
+        self.field_soft_geometry_start = int(getattr(args, "field_soft_geometry_start", 20000))
+        self.field_soft_geometry_lr_scale = float(getattr(args, "field_soft_geometry_lr_scale", 0.5))
+        self.field_soft_geometry_full_lr_groups = str(getattr(args, "field_soft_geometry_full_lr_groups", "f_dc,f_t,decoder,field_static_app,field_static_view_mapper"))
+        self.field_content_exposure = bool(getattr(args, "field_content_exposure", 0))
+        self.field_content_exposure_lr = float(getattr(args, "field_content_exposure_lr", 0.001))
+        self.field_content_exposure_hidden = int(getattr(args, "field_content_exposure_hidden", 8))
+        self.field_content_exposure_max_log_scale = float(getattr(args, "field_content_exposure_max_log_scale", 0.2))
+        self.field_content_exposure_max_bias = float(getattr(args, "field_content_exposure_max_bias", 0.05))
+        self.field_content_exposure_eps = float(getattr(args, "field_content_exposure_eps", 0.001))
+        self.field_content_exposure_detach_stats = bool(getattr(args, "field_content_exposure_detach_stats", 1))
+        self._ensure_content_exposure_head()
         self.field_depthpro_supervision = bool(getattr(args, "field_depthpro_supervision", 0))
         self.field_depthpro_path = str(getattr(args, "field_depthpro_path", ""))
         self.field_depthpro_start = int(getattr(args, "field_depthpro_start", 3000))
@@ -2304,6 +2375,54 @@ class GaussianModel:
         opacity_param = opacity_param + scale * opacity_scale * residual[:, 9:10]
         return motion, opacity_param
 
+    def _ensure_content_exposure_head(self):
+        if not self.field_content_exposure:
+            self.content_exposure_head = None
+            return
+        needs_rebuild = (
+            self.content_exposure_head is None
+            or getattr(self.content_exposure_head, "hidden", None) != int(self.field_content_exposure_hidden)
+            or getattr(self.content_exposure_head, "max_log_scale", None) != float(self.field_content_exposure_max_log_scale)
+            or getattr(self.content_exposure_head, "max_bias", None) != float(self.field_content_exposure_max_bias)
+        )
+        if needs_rebuild:
+            self.content_exposure_head = ContentExposureHead(
+                hidden=self.field_content_exposure_hidden,
+                max_log_scale=self.field_content_exposure_max_log_scale,
+                max_bias=self.field_content_exposure_max_bias,
+            )
+
+    def _content_exposure_stats(self, image):
+        source = image.detach() if self.field_content_exposure_detach_stats else image
+        source = source.clamp(0.0, 1.0)
+        luminance = (
+            0.299 * source[0:1, :, :]
+            + 0.587 * source[1:2, :, :]
+            + 0.114 * source[2:3, :, :]
+        )
+        flat = luminance.reshape(-1)
+        eps = max(float(self.field_content_exposure_eps), 1e-8)
+        stats = torch.stack(
+            [
+                torch.log(flat + eps).mean(),
+                flat.mean(),
+                torch.quantile(flat, 0.90),
+                torch.quantile(flat, 0.95),
+                (flat > 0.90).to(flat.dtype).mean(),
+                (flat < 0.05).to(flat.dtype).mean(),
+            ]
+        )
+        return stats.view(1, 6)
+
+    def apply_content_exposure(self, image):
+        if (not self.field_content_exposure) or self.content_exposure_head is None:
+            return image
+        stats = self._content_exposure_stats(image).to(device=image.device, dtype=image.dtype)
+        log_scale, bias = self.content_exposure_head(stats)
+        log_scale = log_scale.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        bias = bias.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        return torch.exp(log_scale) * image + bias
+
     def _init_module_grad_cache(self):
         self.rgb_grd = {}
         if self.rgbdecoder is not None:
@@ -2341,6 +2460,10 @@ class GaussianModel:
         if self.use_euler_field and self.field_static_app_head is not None:
             for name, param in self.field_static_app_head.named_parameters():
                 self.field_static_app_head_grd[name] = torch.zeros_like(param, requires_grad=False, device=param.device)
+        self.content_exposure_grd = {}
+        if self.content_exposure_head is not None:
+            for name, param in self.content_exposure_head.named_parameters():
+                self.content_exposure_grd[name] = torch.zeros_like(param, requires_grad=False, device=param.device)
 
     def compose_time_conditioned_attributes(self, timestamp, basicfunction, camera_center=None):
         pointtimes = torch.ones((self.get_xyz.shape[0], 1), dtype=self.get_xyz.dtype, requires_grad=False, device="cuda")
@@ -2826,6 +2949,10 @@ class GaussianModel:
             for name, param in self.field_static_app_head.named_parameters():
                 if param.grad is not None:
                     self.field_static_app_head_grd[name] = self.field_static_app_head_grd[name] + param.grad.clone()
+        if self.content_exposure_head is not None:
+            for name, param in self.content_exposure_head.named_parameters():
+                if param.grad is not None:
+                    self.content_exposure_grd[name] = self.content_exposure_grd[name] + param.grad.clone()
     def zero_gradient_cache(self):
 
         self._xyz_grd = torch.zeros_like(self._xyz, requires_grad=False)
@@ -2870,6 +2997,8 @@ class GaussianModel:
             self.field_static_view_mapper_grd[name].zero_()
         for name in self.field_static_app_head_grd.keys():
             self.field_static_app_head_grd[name].zero_()
+        for name in self.content_exposure_grd.keys():
+            self.content_exposure_grd[name].zero_()
 
     def set_batch_gradient(self, cnt):
         ratio = 1/cnt
@@ -2918,6 +3047,49 @@ class GaussianModel:
         if self.use_euler_field and self.field_static_app_head is not None:
             for name, param in self.field_static_app_head.named_parameters():
                 param.grad = self.field_static_app_head_grd[name] * ratio
+        if self.content_exposure_head is not None:
+            for name, param in self.content_exposure_head.named_parameters():
+                param.grad = self.content_exposure_grd[name] * ratio
+
+    def apply_appearance_only_gradients(self, iteration):
+        if not self.field_appearance_only_train or iteration < self.field_appearance_only_start:
+            return False
+        if self.optimizer is None:
+            return False
+        allowed = {
+            name.strip()
+            for name in self.field_appearance_only_allow.split(",")
+            if name.strip()
+        }
+        for group in self.optimizer.param_groups:
+            if group.get("name") in allowed:
+                continue
+            for param in group.get("params", []):
+                if param is not None:
+                    param.grad = None
+        return True
+
+    def apply_soft_geometry_lr(self, iteration):
+        if not self.field_soft_geometry_lr or self.optimizer is None:
+            return False
+        full_lr_groups = {
+            name.strip()
+            for name in self.field_soft_geometry_full_lr_groups.split(",")
+            if name.strip()
+        }
+        active = iteration >= self.field_soft_geometry_start
+        scale = max(float(self.field_soft_geometry_lr_scale), 0.0) if active else 1.0
+        for group in self.optimizer.param_groups:
+            if group.get("name") in full_lr_groups:
+                if "_stegf_base_lr" in group and group.get("name") != "xyz":
+                    group["lr"] = group["_stegf_base_lr"]
+                continue
+            if group.get("name") == "xyz":
+                group["lr"] = group["lr"] * scale
+            else:
+                base_lr = group.get("_stegf_base_lr", group["lr"])
+                group["lr"] = base_lr * scale
+        return active
 
 
     def training_setup(self, training_args):
@@ -2926,6 +3098,9 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         if self.rgbdecoder is not None:
             self.rgbdecoder.cuda()
+        self._ensure_content_exposure_head()
+        if self.content_exposure_head is not None:
+            self.content_exposure_head.cuda()
         if self.use_euler_field and self.euler_field is not None:
             self.euler_field.cuda()
             self.field_router.cuda()
@@ -2953,6 +3128,8 @@ class GaussianModel:
         ]
         if self.rgbdecoder is not None:
             l.append({'params': list(self.rgbdecoder.parameters()), 'lr': training_args.rgb_lr, "name": "decoder"})
+        if self.content_exposure_head is not None:
+            l.append({'params': list(self.content_exposure_head.parameters()), 'lr': self.field_content_exposure_lr, "name": "content_exposure"})
         if self.use_euler_field and self.euler_field is not None:
             l.append({'params': [self._static_level_logits], 'lr': training_args.grid_logits_lr, "name": "static_grid_logits"})
             if self._static_radiance_level_logits.numel() > 0:
@@ -2975,6 +3152,8 @@ class GaussianModel:
             ])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        for group in self.optimizer.param_groups:
+            group["_stegf_base_lr"] = group["lr"]
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -3246,6 +3425,28 @@ class GaussianModel:
             "field_bg_dense_skip_control_at_add_iter": int(self.field_bg_dense_skip_control_at_add_iter),
             "field_bg_dense_clip_to_bbox": int(self.field_bg_dense_clip_to_bbox),
             "field_bg_dense_bbox_clip_margin": self.field_bg_dense_bbox_clip_margin,
+            "field_highfreq_densify": int(self.field_highfreq_densify),
+            "field_highfreq_densify_sigma_divisor": self.field_highfreq_densify_sigma_divisor,
+            "field_highfreq_densify_eps": self.field_highfreq_densify_eps,
+            "field_highfreq_densify_y_min": self.field_highfreq_densify_y_min,
+            "field_highfreq_densify_y_max": self.field_highfreq_densify_y_max,
+            "field_highfreq_densify_min_pixels": self.field_highfreq_densify_min_pixels,
+            "field_highfreq_densify_gate_start": self.field_highfreq_densify_gate_start,
+            "field_highfreq_densify_gate_width": self.field_highfreq_densify_gate_width,
+            "field_appearance_only_train": int(self.field_appearance_only_train),
+            "field_appearance_only_start": self.field_appearance_only_start,
+            "field_appearance_only_allow": self.field_appearance_only_allow,
+            "field_soft_geometry_lr": int(self.field_soft_geometry_lr),
+            "field_soft_geometry_start": self.field_soft_geometry_start,
+            "field_soft_geometry_lr_scale": self.field_soft_geometry_lr_scale,
+            "field_soft_geometry_full_lr_groups": self.field_soft_geometry_full_lr_groups,
+            "field_content_exposure": int(self.field_content_exposure),
+            "field_content_exposure_lr": self.field_content_exposure_lr,
+            "field_content_exposure_hidden": self.field_content_exposure_hidden,
+            "field_content_exposure_max_log_scale": self.field_content_exposure_max_log_scale,
+            "field_content_exposure_max_bias": self.field_content_exposure_max_bias,
+            "field_content_exposure_eps": self.field_content_exposure_eps,
+            "field_content_exposure_detach_stats": int(self.field_content_exposure_detach_stats),
             "field_depthpro_supervision": int(self.field_depthpro_supervision),
             "field_depthpro_path": self.field_depthpro_path,
             "field_depthpro_start": self.field_depthpro_start,
@@ -3588,6 +3789,28 @@ class GaussianModel:
             self.field_bg_dense_skip_control_at_add_iter = bool(config.get("field_bg_dense_skip_control_at_add_iter", int(self.field_bg_dense_skip_control_at_add_iter)))
             self.field_bg_dense_clip_to_bbox = bool(config.get("field_bg_dense_clip_to_bbox", int(self.field_bg_dense_clip_to_bbox)))
             self.field_bg_dense_bbox_clip_margin = float(config.get("field_bg_dense_bbox_clip_margin", self.field_bg_dense_bbox_clip_margin))
+            self.field_highfreq_densify = bool(config.get("field_highfreq_densify", int(self.field_highfreq_densify)))
+            self.field_highfreq_densify_sigma_divisor = float(config.get("field_highfreq_densify_sigma_divisor", self.field_highfreq_densify_sigma_divisor))
+            self.field_highfreq_densify_eps = float(config.get("field_highfreq_densify_eps", self.field_highfreq_densify_eps))
+            self.field_highfreq_densify_y_min = float(config.get("field_highfreq_densify_y_min", self.field_highfreq_densify_y_min))
+            self.field_highfreq_densify_y_max = float(config.get("field_highfreq_densify_y_max", self.field_highfreq_densify_y_max))
+            self.field_highfreq_densify_min_pixels = int(config.get("field_highfreq_densify_min_pixels", self.field_highfreq_densify_min_pixels))
+            self.field_highfreq_densify_gate_start = float(config.get("field_highfreq_densify_gate_start", self.field_highfreq_densify_gate_start))
+            self.field_highfreq_densify_gate_width = float(config.get("field_highfreq_densify_gate_width", self.field_highfreq_densify_gate_width))
+            self.field_appearance_only_train = bool(config.get("field_appearance_only_train", int(self.field_appearance_only_train)))
+            self.field_appearance_only_start = int(config.get("field_appearance_only_start", self.field_appearance_only_start))
+            self.field_appearance_only_allow = str(config.get("field_appearance_only_allow", self.field_appearance_only_allow))
+            self.field_soft_geometry_lr = bool(config.get("field_soft_geometry_lr", int(self.field_soft_geometry_lr)))
+            self.field_soft_geometry_start = int(config.get("field_soft_geometry_start", self.field_soft_geometry_start))
+            self.field_soft_geometry_lr_scale = float(config.get("field_soft_geometry_lr_scale", self.field_soft_geometry_lr_scale))
+            self.field_soft_geometry_full_lr_groups = str(config.get("field_soft_geometry_full_lr_groups", self.field_soft_geometry_full_lr_groups))
+            self.field_content_exposure = bool(config.get("field_content_exposure", int(self.field_content_exposure)))
+            self.field_content_exposure_lr = float(config.get("field_content_exposure_lr", self.field_content_exposure_lr))
+            self.field_content_exposure_hidden = int(config.get("field_content_exposure_hidden", self.field_content_exposure_hidden))
+            self.field_content_exposure_max_log_scale = float(config.get("field_content_exposure_max_log_scale", self.field_content_exposure_max_log_scale))
+            self.field_content_exposure_max_bias = float(config.get("field_content_exposure_max_bias", self.field_content_exposure_max_bias))
+            self.field_content_exposure_eps = float(config.get("field_content_exposure_eps", self.field_content_exposure_eps))
+            self.field_content_exposure_detach_stats = bool(config.get("field_content_exposure_detach_stats", int(self.field_content_exposure_detach_stats)))
             self.field_depthpro_supervision = bool(config.get("field_depthpro_supervision", int(self.field_depthpro_supervision)))
             self.field_depthpro_path = str(config.get("field_depthpro_path", self.field_depthpro_path))
             self.field_depthpro_start = int(config.get("field_depthpro_start", self.field_depthpro_start))
@@ -3678,6 +3901,10 @@ class GaussianModel:
             self.field_freq_prior_debug_mode = str(config.get("field_freq_prior_debug_mode", self.field_freq_prior_debug_mode))
             self.field_bg_median_loss = bool(config.get("field_bg_median_loss", int(self.field_bg_median_loss)))
             self.field_bg_median_loss_weight = float(config.get("field_bg_median_loss_weight", self.field_bg_median_loss_weight))
+
+        self._ensure_content_exposure_head()
+        if payload.get("content_exposure_head") is not None and self.content_exposure_head is not None:
+            self._load_module_state_compatible(self.content_exposure_head, payload["content_exposure_head"])
 
         if not self.use_euler_field:
             self._static_level_logits = torch.empty(0, device="cuda")
@@ -3987,6 +4214,7 @@ class GaussianModel:
         print(f'Saving model checkpoint to: {model_fname}')
         payload = {
             "rgbdecoder": self.rgbdecoder.state_dict() if self.rgbdecoder is not None else None,
+            "content_exposure_head": self.content_exposure_head.state_dict() if self.content_exposure_head is not None else None,
             "field_config": self._checkpoint_field_config(),
             "static_level_logits": self._static_level_logits.detach().cpu() if self.use_euler_field and self._static_level_logits.numel() > 0 else None,
             "static_radiance_level_logits": self._static_radiance_level_logits.detach().cpu() if self.use_euler_field and self._static_radiance_level_logits.numel() > 0 else None,
@@ -5269,6 +5497,12 @@ class GaussianModel:
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        self.denom[update_filter] += 1
+
+    def add_densification_stats_with_gate(self, viewspace_point_tensor, update_filter, point_gate):
+        grad = torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
+        gate = point_gate[update_filter].to(device=grad.device, dtype=grad.dtype).clamp(0.0, 1.0)
+        self.xyz_gradient_accum[update_filter] += grad * gate
         self.denom[update_filter] += 1
 
 
