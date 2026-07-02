@@ -3460,6 +3460,13 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 else:
                     Ll1 = l1_loss(loss_image, gt_image)
                     loss = getloss(opt, Ll1, ssim, loss_image, gt_image, gaussians, radii)
+                content_exposure_reg_loss = (
+                    gaussians.get_content_exposure_reg_loss()
+                    if hasattr(gaussians, "get_content_exposure_reg_loss")
+                    else None
+                )
+                if content_exposure_reg_loss is not None:
+                    loss = loss + content_exposure_reg_loss
                 bg_prior_loss = get_background_prior_loss(viewpoint_cam, image, gt_image)
                 if bg_prior_loss is not None:
                     loss = loss + bg_prior_loss

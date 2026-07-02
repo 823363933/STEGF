@@ -27,16 +27,22 @@ from scene.euler_field import EulerField, EulerLevelRouter, EulerQueryFusionGate
 
 
 class ContentExposureHead(nn.Module):
-    def __init__(self, hidden=8, max_log_scale=0.2, max_bias=0.05):
+    def __init__(self, hidden=8, mode="affine", max_log_scale=0.2, max_bias=0.05, max_wb_log_gain=0.08):
         super().__init__()
         hidden = max(int(hidden), 1)
+        mode = str(mode).lower()
+        if mode not in {"affine", "luma_wb"}:
+            mode = "affine"
         self.hidden = hidden
+        self.mode = mode
         self.max_log_scale = float(max_log_scale)
         self.max_bias = float(max_bias)
+        self.max_wb_log_gain = float(max_wb_log_gain)
+        output_dim = 4 if mode == "luma_wb" else 2
         self.net = nn.Sequential(
             nn.Linear(6, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, 2),
+            nn.Linear(hidden, output_dim),
         )
         # Identity initialization keeps the first iterations equivalent to the baseline renderer.
         nn.init.zeros_(self.net[-1].weight)
@@ -46,7 +52,21 @@ class ContentExposureHead(nn.Module):
         raw = self.net(stats)
         log_scale = self.max_log_scale * torch.tanh(raw[:, 0:1])
         bias = self.max_bias * torch.tanh(raw[:, 1:2])
-        return log_scale, bias
+        if self.mode != "luma_wb":
+            return {
+                "mode": self.mode,
+                "log_scale": log_scale,
+                "bias": bias,
+            }
+        delta_r = self.max_wb_log_gain * torch.tanh(raw[:, 2:3])
+        delta_b = self.max_wb_log_gain * torch.tanh(raw[:, 3:4])
+        return {
+            "mode": self.mode,
+            "log_scale": log_scale,
+            "bias": bias,
+            "delta_r": delta_r,
+            "delta_b": delta_b,
+        }
 
 
 class GaussianModel:
@@ -369,10 +389,15 @@ class GaussianModel:
         self.field_content_exposure = False
         self.field_content_exposure_lr = 0.001
         self.field_content_exposure_hidden = 8
+        self.field_content_exposure_mode = "affine"
         self.field_content_exposure_max_log_scale = 0.2
         self.field_content_exposure_max_bias = 0.05
+        self.field_content_exposure_max_wb_log_gain = 0.08
+        self.field_content_exposure_reg_weight = 0.0
+        self.field_content_exposure_wb_reg_weight = 5.0
         self.field_content_exposure_eps = 0.001
         self.field_content_exposure_detach_stats = True
+        self._last_content_exposure_params = None
         self.field_depthpro_supervision = False
         self.field_depthpro_path = ""
         self.field_depthpro_start = 3000
@@ -1471,8 +1496,12 @@ class GaussianModel:
         self.field_content_exposure = bool(getattr(args, "field_content_exposure", 0))
         self.field_content_exposure_lr = float(getattr(args, "field_content_exposure_lr", 0.001))
         self.field_content_exposure_hidden = int(getattr(args, "field_content_exposure_hidden", 8))
+        self.field_content_exposure_mode = str(getattr(args, "field_content_exposure_mode", "affine")).lower()
         self.field_content_exposure_max_log_scale = float(getattr(args, "field_content_exposure_max_log_scale", 0.2))
         self.field_content_exposure_max_bias = float(getattr(args, "field_content_exposure_max_bias", 0.05))
+        self.field_content_exposure_max_wb_log_gain = float(getattr(args, "field_content_exposure_max_wb_log_gain", 0.08))
+        self.field_content_exposure_reg_weight = float(getattr(args, "field_content_exposure_reg_weight", 0.0))
+        self.field_content_exposure_wb_reg_weight = float(getattr(args, "field_content_exposure_wb_reg_weight", 5.0))
         self.field_content_exposure_eps = float(getattr(args, "field_content_exposure_eps", 0.001))
         self.field_content_exposure_detach_stats = bool(getattr(args, "field_content_exposure_detach_stats", 1))
         self._ensure_content_exposure_head()
@@ -2382,14 +2411,18 @@ class GaussianModel:
         needs_rebuild = (
             self.content_exposure_head is None
             or getattr(self.content_exposure_head, "hidden", None) != int(self.field_content_exposure_hidden)
+            or getattr(self.content_exposure_head, "mode", None) != str(self.field_content_exposure_mode).lower()
             or getattr(self.content_exposure_head, "max_log_scale", None) != float(self.field_content_exposure_max_log_scale)
             or getattr(self.content_exposure_head, "max_bias", None) != float(self.field_content_exposure_max_bias)
+            or getattr(self.content_exposure_head, "max_wb_log_gain", None) != float(self.field_content_exposure_max_wb_log_gain)
         )
         if needs_rebuild:
             self.content_exposure_head = ContentExposureHead(
                 hidden=self.field_content_exposure_hidden,
+                mode=self.field_content_exposure_mode,
                 max_log_scale=self.field_content_exposure_max_log_scale,
                 max_bias=self.field_content_exposure_max_bias,
+                max_wb_log_gain=self.field_content_exposure_max_wb_log_gain,
             )
 
     def _content_exposure_stats(self, image):
@@ -2416,12 +2449,41 @@ class GaussianModel:
 
     def apply_content_exposure(self, image):
         if (not self.field_content_exposure) or self.content_exposure_head is None:
+            self._last_content_exposure_params = None
             return image
         stats = self._content_exposure_stats(image).to(device=image.device, dtype=image.dtype)
-        log_scale, bias = self.content_exposure_head(stats)
-        log_scale = log_scale.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
-        bias = bias.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
-        return torch.exp(log_scale) * image + bias
+        params = self.content_exposure_head(stats)
+        self._last_content_exposure_params = params
+        log_scale = params["log_scale"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        bias = params["bias"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        if params.get("mode", "affine") != "luma_wb":
+            return torch.exp(log_scale) * image + bias
+        delta_r = params["delta_r"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        delta_b = params["delta_b"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        wb = torch.cat(
+            [
+                torch.exp(delta_r),
+                torch.ones_like(delta_r),
+                torch.exp(delta_b),
+            ],
+            dim=0,
+        )
+        return torch.exp(log_scale) * wb * image + bias
+
+    def get_content_exposure_reg_loss(self):
+        weight = float(getattr(self, "field_content_exposure_reg_weight", 0.0))
+        if weight <= 0.0:
+            return None
+        params = self._last_content_exposure_params
+        if not params:
+            return None
+        loss = params["log_scale"].square().mean() + params["bias"].square().mean()
+        if params.get("mode", "affine") == "luma_wb":
+            wb_weight = float(getattr(self, "field_content_exposure_wb_reg_weight", 5.0))
+            loss = loss + wb_weight * (
+                params["delta_r"].square().mean() + params["delta_b"].square().mean()
+            )
+        return weight * loss
 
     def _init_module_grad_cache(self):
         self.rgb_grd = {}
@@ -3443,8 +3505,12 @@ class GaussianModel:
             "field_content_exposure": int(self.field_content_exposure),
             "field_content_exposure_lr": self.field_content_exposure_lr,
             "field_content_exposure_hidden": self.field_content_exposure_hidden,
+            "field_content_exposure_mode": self.field_content_exposure_mode,
             "field_content_exposure_max_log_scale": self.field_content_exposure_max_log_scale,
             "field_content_exposure_max_bias": self.field_content_exposure_max_bias,
+            "field_content_exposure_max_wb_log_gain": self.field_content_exposure_max_wb_log_gain,
+            "field_content_exposure_reg_weight": self.field_content_exposure_reg_weight,
+            "field_content_exposure_wb_reg_weight": self.field_content_exposure_wb_reg_weight,
             "field_content_exposure_eps": self.field_content_exposure_eps,
             "field_content_exposure_detach_stats": int(self.field_content_exposure_detach_stats),
             "field_depthpro_supervision": int(self.field_depthpro_supervision),
@@ -3807,8 +3873,12 @@ class GaussianModel:
             self.field_content_exposure = bool(config.get("field_content_exposure", int(self.field_content_exposure)))
             self.field_content_exposure_lr = float(config.get("field_content_exposure_lr", self.field_content_exposure_lr))
             self.field_content_exposure_hidden = int(config.get("field_content_exposure_hidden", self.field_content_exposure_hidden))
+            self.field_content_exposure_mode = str(config.get("field_content_exposure_mode", self.field_content_exposure_mode)).lower()
             self.field_content_exposure_max_log_scale = float(config.get("field_content_exposure_max_log_scale", self.field_content_exposure_max_log_scale))
             self.field_content_exposure_max_bias = float(config.get("field_content_exposure_max_bias", self.field_content_exposure_max_bias))
+            self.field_content_exposure_max_wb_log_gain = float(config.get("field_content_exposure_max_wb_log_gain", self.field_content_exposure_max_wb_log_gain))
+            self.field_content_exposure_reg_weight = float(config.get("field_content_exposure_reg_weight", self.field_content_exposure_reg_weight))
+            self.field_content_exposure_wb_reg_weight = float(config.get("field_content_exposure_wb_reg_weight", self.field_content_exposure_wb_reg_weight))
             self.field_content_exposure_eps = float(config.get("field_content_exposure_eps", self.field_content_exposure_eps))
             self.field_content_exposure_detach_stats = bool(config.get("field_content_exposure_detach_stats", int(self.field_content_exposure_detach_stats)))
             self.field_depthpro_supervision = bool(config.get("field_depthpro_supervision", int(self.field_depthpro_supervision)))

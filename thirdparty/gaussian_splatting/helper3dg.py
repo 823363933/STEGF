@@ -205,8 +205,12 @@ def _print_args_summary(args, title):
                 values,
                 [
                     ("hidden", "field_content_exposure_hidden"),
+                    ("mode", "field_content_exposure_mode"),
                     ("max_log_scale", "field_content_exposure_max_log_scale"),
                     ("max_bias", "field_content_exposure_max_bias"),
+                    ("max_wb", "field_content_exposure_max_wb_log_gain"),
+                    ("reg", "field_content_exposure_reg_weight"),
+                    ("wb_reg", "field_content_exposure_wb_reg_weight"),
                     ("detach_stats", "field_content_exposure_detach_stats"),
                     ("lr", "field_content_exposure_lr"),
                 ],

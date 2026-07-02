@@ -321,8 +321,12 @@ class ModelParams(ParamGroup):
         self.field_content_exposure = 0
         self.field_content_exposure_lr = 0.001
         self.field_content_exposure_hidden = 8
+        self.field_content_exposure_mode = "affine"
         self.field_content_exposure_max_log_scale = 0.2
         self.field_content_exposure_max_bias = 0.05
+        self.field_content_exposure_max_wb_log_gain = 0.08
+        self.field_content_exposure_reg_weight = 0.0
+        self.field_content_exposure_wb_reg_weight = 5.0
         self.field_content_exposure_eps = 0.001
         self.field_content_exposure_detach_stats = 1
         self.field_depthpro_supervision = 0
