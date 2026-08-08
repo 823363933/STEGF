@@ -27,6 +27,21 @@ import natsort
 from simple_knn._C import distCUDA2
 import torch
 
+
+def _report_source_camera_progress(current, total, duration):
+    total = int(total)
+    current = int(current)
+    interval = max(total // 10, 1)
+    if current == 1 or current == total or current % interval == 0:
+        message = (
+            "[STEGF][Init][Dataset] Reading source cameras: "
+            f"{current}/{total} ({int(duration)} frames each)"
+        )
+        sys.stderr.write("\r" + message)
+        if current == total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -120,13 +135,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, near, far, 
     sortednamedict = {}
     for i in  range(len(sortedtotalcamelist)):
         sortednamedict[sortedtotalcamelist[i]] = i # map each cam with a number
-     
+    
 
     for idx, key in enumerate(cam_extrinsics): # first is cam20_ so we strictly sort by camera name
-        sys.stdout.write('\r')
-        # the exact output you're looking for:
-        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
-        sys.stdout.flush()
+        _report_source_camera_progress(
+            idx + 1,
+            len(cam_extrinsics),
+            duration,
+        )
 
         extr = cam_extrinsics[key]
 
@@ -169,7 +185,6 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, near, far, 
             else:
                 cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height, near=near, far=far, timestamp=(j-startime)/duration, pose=None, hpdirecitons=None, cxr=0.0, cyr=0.0)
             cam_infos.append(cam_info)
-    sys.stdout.write('\n')
     return cam_infos
 
 
@@ -1206,5 +1221,3 @@ sceneLoadTypeCallbacks = {
     "Blender" : readNerfSyntheticInfo, 
     "Technicolor": readColmapSceneInfoTechnicolor,
 }
-
-

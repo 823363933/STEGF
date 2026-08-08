@@ -287,6 +287,217 @@ class EulerField(nn.Module):
         return torch.sum(level_features * weights, dim=1)
 
 
+class EulerVelocityField(nn.Module):
+    """A shared Eulerian velocity field used to transport Gaussian particles.
+
+    The trainable state is spatial (multi-resolution feature grids). Time is
+    supplied to a shared decoder, so every Gaussian that reaches the same
+    space-time location receives the same velocity.  This is deliberately
+    separate from ``EulerField``: the latter can keep serving the radiance
+    branch while this module has an unambiguous transport-only meaning.
+    """
+
+    def __init__(
+        self,
+        bbox_min,
+        bbox_max,
+        level_resolutions,
+        feature_dim=8,
+        hidden_dim=32,
+        fourier_degree=4,
+        max_normalized_speed=0.25,
+    ):
+        super().__init__()
+        self.level_resolutions = EulerField._resolve_level_resolutions(
+            base_resolution=4,
+            num_levels=len(level_resolutions),
+            level_resolutions=level_resolutions,
+        )
+        self.feature_dim = max(int(feature_dim), 1)
+        self.fourier_degree = max(int(fourier_degree), 0)
+        self.max_normalized_speed = max(float(max_normalized_speed), 0.0)
+
+        bbox_min = torch.as_tensor(bbox_min, dtype=torch.float32).view(1, 3)
+        bbox_max = torch.as_tensor(bbox_max, dtype=torch.float32).view(1, 3)
+        bbox_span = torch.clamp(bbox_max - bbox_min, min=1e-6)
+        self.register_buffer("bbox_min", bbox_min)
+        self.register_buffer("bbox_max", bbox_max)
+        self.register_buffer("bbox_span", bbox_span)
+
+        self.feature_grids = nn.ParameterList()
+        for res_x, res_y, res_z in self.level_resolutions:
+            grid = nn.Parameter(
+                torch.empty(1, self.feature_dim, res_z, res_y, res_x)
+            )
+            nn.init.normal_(grid, mean=0.0, std=1e-3)
+            self.feature_grids.append(grid)
+
+        time_dim = 1 + 2 * self.fourier_degree
+        input_dim = (
+            len(self.level_resolutions) * self.feature_dim
+            + 3
+            + time_dim
+        )
+        hidden_dim = max(int(hidden_dim), 4)
+        self.decoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3, bias=False),
+        )
+        # The H2 experiment must begin as the identity map.  The final layer
+        # learns first; gradients then open the spatial grids and earlier MLP.
+        nn.init.zeros_(self.decoder[-1].weight)
+
+    def _normalize_points_unit(self, points):
+        return ((points - self.bbox_min) / self.bbox_span).clamp(0.0, 1.0)
+
+    def _sample_grid(self, grid, unit_points):
+        coords = (unit_points * 2.0 - 1.0).view(1, -1, 1, 1, 3)
+        sampled = F.grid_sample(
+            grid,
+            coords,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        return (
+            sampled.squeeze(0)
+            .squeeze(-1)
+            .squeeze(-1)
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    def _prepare_times(self, timestamp, count, device, dtype):
+        if not torch.is_tensor(timestamp):
+            timestamp = torch.tensor(timestamp, device=device, dtype=dtype)
+        timestamp = timestamp.to(device=device, dtype=dtype)
+        if timestamp.numel() == 1:
+            return timestamp.reshape(1, 1).expand(count, 1)
+        timestamp = timestamp.reshape(-1, 1)
+        if timestamp.shape[0] != count:
+            raise ValueError(
+                "EulerVelocityField timestamp must be scalar or have one "
+                f"value per point, got {timestamp.shape[0]} for {count}"
+            )
+        return timestamp
+
+    def _time_features(self, timestamp):
+        features = [2.0 * timestamp - 1.0]
+        if self.fourier_degree > 0:
+            harmonics = torch.arange(
+                1,
+                self.fourier_degree + 1,
+                device=timestamp.device,
+                dtype=timestamp.dtype,
+            ).view(1, -1)
+            angles = 2.0 * math.pi * timestamp * harmonics
+            features.extend((torch.cos(angles), torch.sin(angles)))
+        return torch.cat(features, dim=1)
+
+    def query_velocity(self, points, timestamp, return_normalized=False):
+        unit_points = self._normalize_points_unit(points)
+        level_features = [
+            self._sample_grid(grid, unit_points)
+            for grid in self.feature_grids
+        ]
+        time_features = self._time_features(
+            self._prepare_times(
+                timestamp,
+                points.shape[0],
+                points.device,
+                points.dtype,
+            )
+        )
+        decoder_input = torch.cat(
+            level_features + ([(unit_points * 2.0 - 1.0), time_features]),
+            dim=1,
+        )
+        normalized_velocity = self.max_normalized_speed * torch.tanh(
+            self.decoder(decoder_input)
+        )
+        if return_normalized:
+            return normalized_velocity
+        return normalized_velocity * self.bbox_span.to(
+            device=points.device,
+            dtype=points.dtype,
+        )
+
+    def transport(
+        self,
+        points,
+        source_times,
+        target_time,
+        steps=2,
+        method="midpoint",
+    ):
+        """Transport points from individual source times to one target time."""
+        steps = max(int(steps), 1)
+        method = str(method).strip().lower()
+        if method not in {"euler", "midpoint"}:
+            raise ValueError(
+                "EulerVelocityField integration method must be euler or "
+                f"midpoint, got {method!r}"
+            )
+        source_times = self._prepare_times(
+            source_times,
+            points.shape[0],
+            points.device,
+            points.dtype,
+        )
+        target_times = self._prepare_times(
+            target_time,
+            points.shape[0],
+            points.device,
+            points.dtype,
+        )
+        step_dt = (target_times - source_times) / float(steps)
+        current_points = points
+        current_times = source_times
+        normalized_velocity_energy = []
+        bbox_span = self.bbox_span.to(
+            device=points.device,
+            dtype=points.dtype,
+        )
+
+        for _ in range(steps):
+            if method == "midpoint":
+                velocity_start_norm = self.query_velocity(
+                    current_points,
+                    current_times,
+                    return_normalized=True,
+                )
+                midpoint = (
+                    current_points
+                    + 0.5 * step_dt * velocity_start_norm * bbox_span
+                )
+                midpoint_time = current_times + 0.5 * step_dt
+                velocity_norm = self.query_velocity(
+                    midpoint,
+                    midpoint_time,
+                    return_normalized=True,
+                )
+            else:
+                velocity_norm = self.query_velocity(
+                    current_points,
+                    current_times,
+                    return_normalized=True,
+                )
+            current_points = current_points + step_dt * velocity_norm * bbox_span
+            current_times = current_times + step_dt
+            normalized_velocity_energy.append(velocity_norm.square().mean())
+
+        aux = {
+            "normalized_velocity_energy": torch.stack(
+                normalized_velocity_energy
+            ).mean(),
+            "displacement": current_points - points,
+        }
+        return current_points, aux
+
+
 class EulerResidualDecoder(nn.Module):
     def __init__(self, feature_dim, hidden_dim=32, output_dim=10):
         super().__init__()

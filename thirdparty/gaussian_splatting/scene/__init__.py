@@ -12,6 +12,8 @@
 import os
 import random
 import json
+import sys
+import time
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.oursfull import GaussianModel
@@ -20,6 +22,12 @@ from PIL import Image
 from utils.camera_utils import camera_to_JSON, cameraList_from_camInfosv2, cameraList_from_camInfosv2nogt
 from helper_train import recordpointshelper, getfisheyemapper
 import torch 
+
+
+def _init_status(message):
+    print(f"[STEGF][Init][Scene] {message}", file=sys.stderr, flush=True)
+
+
 class Scene:
 
     # gaussians : GaussianModel
@@ -46,6 +54,7 @@ class Scene:
         raydict = {}
 
 
+        scene_load_started = time.perf_counter()
         if loader == "colmap" or loader == "colmapvalid": # colmapvalid only for testing
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, multiview, duration=duration)
         
@@ -61,6 +70,20 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmapmv"](args.source_path, args.images, args.eval, multiview, duration=duration)
         else:
             assert False, "Could not recognize scene type!"
+        point_count = (
+            len(scene_info.point_cloud.points)
+            if scene_info.point_cloud is not None
+            else 0
+        )
+        _init_status(
+            "Dataset ready: train={}, test={}, raw_points={}, "
+            "elapsed={:.2f}s".format(
+                len(scene_info.train_cameras),
+                len(scene_info.test_cameras),
+                point_count,
+                time.perf_counter() - scene_load_started,
+            )
+        )
 
         if not self.loaded_iter:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
@@ -86,7 +109,6 @@ class Scene:
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
-            print("Loading Training Cameras")  
             if loader in ["colmapvalid", "colmapmv", "immersivevalid","technicolorvalid", "immersivevalidss", "imv2valid"]:         
                 self.train_cameras[resolution_scale] = [] # no training data
 
@@ -96,19 +118,27 @@ class Scene:
                 self.train_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.train_cameras, resolution_scale, args, ss=True)
 
             else: # immersive and immersivevalid 
-                self.train_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.train_cameras, resolution_scale, args)
+                self.train_cameras[resolution_scale] = cameraList_from_camInfosv2(
+                    scene_info.train_cameras,
+                    resolution_scale,
+                    args,
+                    progress_label="training cameras",
+                )
             
             
             
-            print("Loading Test Cameras")
             if loader  in ["colmapvalid", "immersivevalid", "colmap", "technicolorvalid", "technicolor", "imv2","imv2valid"]: # we need gt for metrics
-                self.test_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.test_cameras, resolution_scale, args)
+                self.test_cameras[resolution_scale] = cameraList_from_camInfosv2(
+                    scene_info.test_cameras,
+                    resolution_scale,
+                    args,
+                    progress_label="test cameras",
+                )
             elif loader in ["immersivess", "immersivevalidss"]:
                 self.test_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.test_cameras, resolution_scale, args, ss=True)
             elif loader in ["colmapmv"]:                 # only for multi view
 
                 self.test_cameras[resolution_scale] = cameraList_from_camInfosv2nogt(scene_info.test_cameras, resolution_scale, args)
-
 
         for cam in self.train_cameras[resolution_scale]:
             if cam.image_name not in raydict and cam.rayo is not None:
@@ -124,6 +154,7 @@ class Scene:
 
         for cam in self.test_cameras[resolution_scale]:
             cam.rays = raydict[cam.image_name] # should be direct ?
+        _init_status(f"Camera tensors and shared rays ready: cameras={len(raydict)}")
 
         if loader in ["immersivess", "immersivevalidss"]:# construct shared fisheyd remapping
             self.fisheyemapper = {}
@@ -150,11 +181,13 @@ class Scene:
 
        
         if self.loaded_iter :
+            _init_status(f"Restoring Gaussian checkpoint at iteration {self.loaded_iter}")
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
+            _init_status(f"Initializing Gaussian topology: raw_points={point_count}")
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
 

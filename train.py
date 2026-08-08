@@ -28,6 +28,7 @@ import sys
 import uuid
 import time 
 import json
+import math
 
 import torchvision
 import numpy as np 
@@ -45,6 +46,10 @@ from argparse import Namespace
 from thirdparty.gaussian_splatting.helper3dg import getparser, getrenderparts
 from thirdparty.gaussian_splatting.renderer import observation_contribution_ours_full
 from thirdparty.gaussian_splatting.utils.graphics_utils import geom_transform_points
+
+
+def _init_status(message):
+    print(f"[STEGF][Init] {message}", file=sys.stderr, flush=True)
 
 
 def _jsonable(value):
@@ -177,7 +182,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     first_iter = 0
     render, GRsetting, GRzer = getrenderpip(rdpip)
 
-    print("use model {}".format(dataset.model))
+    init_started = time.perf_counter()
+    _init_status(f"1/5 Constructing Gaussian model: {dataset.model}")
     GaussianModel = getmodel(dataset.model) # gmodel, gmodelrgbonly
     
     gaussians = GaussianModel(dataset.sh_degree, rgbfunction)
@@ -193,7 +199,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
 
     rbfbasefunction = trbfunction
+    _init_status("2/5 Loading scene metadata, cameras, rays, and point cloud")
     scene = Scene(dataset, gaussians, duration=duration, loader=dataset.loader)
+    _init_status(
+        "3/5 Scene and Gaussian initialization complete: "
+        f"train_views={len(scene.getTrainCameras())}, "
+        f"test_views={len(scene.getTestCameras())}, "
+        f"gaussians={int(gaussians.get_xyz.shape[0])}"
+    )
     write_stegf_config(args, gaussians)
     
 
@@ -212,6 +225,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     minbounds = [minx, miny, minz]
 
 
+    _init_status("4/5 Building optimizer and gradient caches")
     gaussians.training_setup(opt)
     
     numchannel = 9 
@@ -226,6 +240,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     ema_loss_for_log = 0.0
     #if freeze != 1:
     first_iter = 0
+    _init_status(
+        "5/5 Training ready after {:.2f}s; starting {} iterations".format(
+            time.perf_counter() - init_started,
+            int(opt.iterations),
+        )
+    )
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
@@ -316,6 +336,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     obs_reset_debug_events = 0
     obs_reset_debug_dir = os.path.join(args.model_path, "obs_reset_debug")
     obs_reset_log_path = os.path.join(obs_reset_debug_dir, "events.jsonl")
+    layer_resp_debug_events = 0
+    layer_resp_debug_dir = os.path.join(args.model_path, "layer_responsibility_debug")
 
     def obs_reset_debug_enabled():
         return bool(getattr(gaussians, "field_obs_reset_debug", 0))
@@ -601,6 +623,59 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             reliability,
         )
         return reliability, unreliable_mask.detach()
+
+    def get_persistent_need_mask_from_ema(camera, target_shape, device="cuda"):
+        key = str(camera.image_name)
+        prev = observation_error_ema.get(key)
+        height, width = int(target_shape[0]), int(target_shape[1])
+        if prev is None or prev.shape != (height, width):
+            return torch.zeros((height, width), device=device, dtype=torch.bool), {
+                "enabled": True,
+                "reason": "missing_ema",
+                "pixels": 0,
+            }
+
+        ema = prev.to(device=device, dtype=torch.float32)
+        finite = torch.isfinite(ema)
+        values = ema[finite]
+        need_mask = torch.zeros_like(ema, dtype=torch.bool)
+        stats = {
+            "enabled": True,
+            "reason": "ok",
+            "finite_pixels": int(torch.count_nonzero(finite).item()),
+            "pixels": 0,
+        }
+        if values.numel() == 0:
+            stats["reason"] = "empty_finite"
+            return need_mask, stats
+
+        quantile = float(getattr(gaussians, "field_obs_reliability_error_quantile", 0.90))
+        error_threshold = float(getattr(gaussians, "field_obs_reliability_error_threshold", 0.0))
+        min_threshold = max(float(getattr(gaussians, "field_obs_reliability_min_error", 0.03)), 0.0)
+        if error_threshold > 0.0:
+            threshold = torch.tensor(
+                max(error_threshold, min_threshold),
+                device=values.device,
+                dtype=values.dtype,
+            )
+            stats["threshold_mode"] = "fixed"
+        else:
+            quantile = max(0.0, min(quantile, 1.0))
+            threshold = torch.quantile(values.float(), quantile)
+            threshold = torch.maximum(
+                threshold,
+                torch.tensor(min_threshold, device=threshold.device, dtype=threshold.dtype),
+            )
+            stats["threshold_mode"] = "quantile"
+            stats["quantile"] = float(quantile)
+        need_mask = finite & (ema >= threshold)
+        stats.update({
+            "threshold": float(threshold.detach().cpu()),
+            "min_threshold": float(min_threshold),
+            "error_threshold": float(error_threshold),
+            "pixels": int(torch.count_nonzero(need_mask).item()),
+        })
+        return need_mask.detach(), stats
 
     def apply_observation_reliability_to_loss_image(image, gt_image, reliability):
         if reliability is None:
@@ -1123,6 +1198,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         kernel = radius * 2 + 1
         return F.max_pool2d(mask.float().unsqueeze(0).unsqueeze(0), kernel, stride=1, padding=radius)[0, 0] > 0.5
 
+    def erode_mask(mask, radius):
+        radius = int(radius)
+        if radius <= 0:
+            return mask.bool()
+        return ~dilate_mask(~mask.bool(), radius)
+
     def rgb_to_luma(image):
         weights = torch.tensor([0.299, 0.587, 0.114], device=image.device, dtype=image.dtype).view(3, 1, 1)
         return torch.sum(image * weights, dim=0)
@@ -1322,11 +1403,102 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             tensor = tensor.unsqueeze(0)
         torchvision.utils.save_image(tensor, path)
 
+    def source_time_map_to_rgb(source_time_map, source_time_indices):
+        source_time_map = source_time_map.detach().long()
+        output = torch.zeros((3, source_time_map.shape[0], source_time_map.shape[1]), device=source_time_map.device, dtype=torch.float32)
+        palette = [
+            (0.10, 0.10, 0.10),
+            (0.10, 0.45, 1.00),
+            (0.10, 0.80, 0.25),
+            (1.00, 0.65, 0.05),
+            (1.00, 0.10, 0.10),
+            (0.65, 0.20, 1.00),
+            (0.00, 0.80, 0.80),
+            (0.90, 0.90, 0.20),
+        ]
+        for idx, time_idx in enumerate(source_time_indices):
+            mask = source_time_map == int(time_idx)
+            if torch.count_nonzero(mask) == 0:
+                continue
+            color = torch.tensor(palette[idx % len(palette)], device=output.device, dtype=output.dtype).view(3, 1)
+            output[:, mask] = color
+        return output
+
     def overlay_debug_mask(base, mask, color, alpha=0.65):
         base = base.detach().float().clamp(0.0, 1.0)
         mask = mask.detach().bool().unsqueeze(0)
         color_tensor = torch.tensor(color, device=base.device, dtype=base.dtype).view(3, 1, 1)
         return torch.where(mask, base * (1.0 - alpha) + color_tensor * alpha, base)
+
+    def overlay_opacity_map(base, opacity, color=(0.0, 0.75, 1.0), alpha_scale=0.65):
+        base = base.detach().float().clamp(0.0, 1.0)
+        opacity = opacity.detach().float().clamp(0.0, 1.0).unsqueeze(0)
+        alpha = alpha_scale * opacity
+        color_tensor = torch.tensor(color, device=base.device, dtype=base.dtype).view(3, 1, 1)
+        return base * (1.0 - alpha) + color_tensor * alpha
+
+    def save_layer_responsibility_debug(
+        iteration,
+        time_idx,
+        camera,
+        gt_image,
+        normal_image,
+        bg_mask,
+        bg_stats,
+        far_image,
+        far_image_exposed,
+        near_opacity,
+        far_points,
+        near_points,
+        far_loss_value,
+        front_loss_value,
+    ):
+        nonlocal layer_resp_debug_events
+        if not bool(getattr(gaussians, "field_layer_debug", 0)):
+            return
+        max_events = int(getattr(gaussians, "field_layer_debug_max_events", 4))
+        if max_events > 0 and layer_resp_debug_events >= max_events:
+            return
+        layer_resp_debug_events += 1
+
+        safe_name = str(getattr(camera, "image_name", "camera")).replace("/", "_").replace("\\", "_")
+        event_dir = os.path.join(
+            layer_resp_debug_dir,
+            f"{int(iteration):06d}_{safe_name}_t{int(time_idx):02d}_px{int(torch.count_nonzero(bg_mask).item())}",
+        )
+        os.makedirs(event_dir, exist_ok=True)
+        save_debug_image(os.path.join(event_dir, "gt.png"), gt_image.detach().float().clamp(0.0, 1.0))
+        save_debug_image(os.path.join(event_dir, "normal_render.png"), normal_image.detach().float().clamp(0.0, 1.0))
+        save_debug_image(os.path.join(event_dir, "M_bg.png"), bg_mask.detach().float())
+        save_debug_image(os.path.join(event_dir, "M_bg_overlay.png"), overlay_debug_mask(gt_image, bg_mask, (1.0, 0.0, 0.0), alpha=0.60))
+        if far_image is not None:
+            save_debug_image(os.path.join(event_dir, "far_only_raw.png"), far_image.detach().float().clamp(0.0, 1.0))
+        if far_image_exposed is not None:
+            save_debug_image(os.path.join(event_dir, "far_only_exposed.png"), far_image_exposed.detach().float().clamp(0.0, 1.0))
+        if near_opacity is not None:
+            budget = float(getattr(gaussians, "field_layer_front_opacity_budget", 0.15))
+            over_budget = near_opacity.detach().float() > budget
+            save_debug_image(os.path.join(event_dir, "near_opacity.png"), near_opacity.detach().float().clamp(0.0, 1.0))
+            save_debug_image(os.path.join(event_dir, "near_opacity_overlay.png"), overlay_opacity_map(gt_image, near_opacity))
+            save_debug_image(os.path.join(event_dir, "near_opacity_over_budget_overlay.png"), overlay_debug_mask(gt_image, bg_mask & over_budget, (0.0, 0.75, 1.0), alpha=0.65))
+        for name, mask in bg_stats.get("_debug_masks", {}).items():
+            save_debug_image(os.path.join(event_dir, f"{name}.png"), mask.detach().float())
+        for name, value in bg_stats.get("_debug_maps", {}).items():
+            save_debug_image(os.path.join(event_dir, f"{name}.png"), normalize_debug_map(value.detach()))
+        meta = strip_debug_tensors(bg_stats)
+        meta.update({
+            "iteration": int(iteration),
+            "time_idx": int(time_idx),
+            "camera": str(getattr(camera, "image_name", "")),
+            "timestamp": float(getattr(camera, "timestamp", 0.0)),
+            "far_points": int(far_points),
+            "near_points": int(near_points),
+            "far_loss": float(far_loss_value),
+            "front_loss": float(front_loss_value),
+            "exposure_domain": "main_render_params_detached",
+        })
+        with open(os.path.join(event_dir, "meta.json"), "w") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
 
     def save_background_prior_debug(iteration, camera, gt_image, image, median, stable, visible, occlusion, occlusion_dilated,
                                     candidate, selected, render_to_bg, depth, anchor_depth, bg_depth, threshold,
@@ -1692,6 +1864,18 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 return sorted(set(indices))
         return parse_bg_scan_time_indices()
 
+    def parse_dense_source_time_indices():
+        raw = str(getattr(gaussians, "field_bg_dense_source_time_indices", "")).strip()
+        if raw:
+            indices = []
+            for item in raw.split(","):
+                item = item.strip()
+                if item:
+                    indices.append(max(0, min(int(item), duration - 1)))
+            if indices:
+                return sorted(set(indices))
+        return parse_dense_add_time_indices()
+
     def resolve_dense_da3_npz_path():
         raw = str(getattr(gaussians, "field_bg_dense_da3_path", "")).strip()
         candidates = []
@@ -1718,6 +1902,23 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     def camera_basename(camera):
         return os.path.splitext(os.path.basename(str(camera.image_name)))[0]
+
+    def camera_time_index(camera):
+        timestamp = getattr(camera, "timestamp", 0.0)
+        if torch.is_tensor(timestamp):
+            timestamp = float(timestamp.detach().reshape(-1)[0].cpu())
+        else:
+            timestamp = float(timestamp)
+
+        source_root = os.path.abspath(getattr(args, "source_path", ""))
+        source_name = os.path.basename(source_root)
+        source_start = 0
+        if source_name.startswith("colmap_"):
+            maybe_index = source_name.split("_", 1)[1].split("_", 1)[0]
+            if maybe_index.isdigit():
+                source_start = int(maybe_index)
+
+        return int(round(timestamp * float(duration) + float(source_start)))
 
     def resolve_scene_aux_dir(config_value, default_dirname):
         raw = str(config_value).strip()
@@ -1891,30 +2092,63 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             return bg_dense_beit_cache
 
         depth_like = {}
-        for entry in sorted(os.listdir(root)):
-            cam_dir = os.path.join(root, entry)
-            if not os.path.isdir(cam_dir):
-                continue
-            raw_path = os.path.join(cam_dir, "raw_depth_like.npy")
+        legacy_views = 0
+        nested_views = 0
+
+        def load_raw(time_index, cam_name, raw_path):
             if not os.path.exists(raw_path):
+                return
+            depth_like[(int(time_index), str(cam_name))] = np.load(raw_path).astype(np.float32)
+
+        for entry in sorted(os.listdir(root)):
+            entry_dir = os.path.join(root, entry)
+            if not os.path.isdir(entry_dir):
                 continue
-            depth_like[entry] = np.load(raw_path).astype(np.float32)
+            if entry.startswith("colmap_"):
+                maybe_index = entry.split("_", 1)[1].split("_", 1)[0]
+                if not maybe_index.isdigit():
+                    continue
+                time_index = int(maybe_index)
+                for cam_entry in sorted(os.listdir(entry_dir)):
+                    cam_dir = os.path.join(entry_dir, cam_entry)
+                    if not os.path.isdir(cam_dir):
+                        continue
+                    before = len(depth_like)
+                    load_raw(time_index, cam_entry, os.path.join(cam_dir, "raw_depth_like.npy"))
+                    nested_views += int(len(depth_like) > before)
+                continue
+
+            before = len(depth_like)
+            load_raw(0, entry, os.path.join(entry_dir, "raw_depth_like.npy"))
+            legacy_views += int(len(depth_like) > before)
 
         bg_dense_beit_cache.update({
             "path": root,
             "depth_like": depth_like,
         })
-        print(f"[STEGF] Loaded BEiT depth-like foreground masks: {root}, views={len(depth_like)}.")
+        times = sorted({int(key[0]) for key in depth_like.keys()})
+        cameras = sorted({str(key[1]) for key in depth_like.keys()})
+        print(
+            f"[STEGF] Loaded BEiT depth-like foreground masks: {root}, "
+            f"entries={len(depth_like)}, times={times}, cameras={len(cameras)}, "
+            f"legacy_views={legacy_views}, nested_views={nested_views}."
+        )
         return bg_dense_beit_cache
 
-    def get_dense_beit_foreground_mask(camera, target_shape):
+    def get_dense_beit_foreground_mask(camera, target_shape, time_index_override=None, allow_fallback=True):
         if not bool(getattr(gaussians, "field_bg_dense_beit_filter", 0)):
             return None, None, {"enabled": False}
         cache = load_dense_beit_depth_like()
-        depth_np = cache.get("depth_like", {}).get(camera_basename(camera))
+        cam_name = camera_basename(camera)
+        time_index = camera_time_index(camera) if time_index_override is None else int(time_index_override)
+        depth_np = cache.get("depth_like", {}).get((time_index, cam_name))
+        used_time_index = time_index
+        if depth_np is None and allow_fallback and time_index != 0:
+            depth_np = cache.get("depth_like", {}).get((0, cam_name))
+            used_time_index = 0
         if depth_np is None:
             if not bg_dense_beit_cache["warned"]:
-                print(f"[STEGF] Dense BEiT warning: no raw_depth_like.npy for camera {camera_basename(camera)}.")
+                print(f"[STEGF] Dense BEiT warning: no raw_depth_like.npy for time={time_index}, camera={cam_name}.")
                 bg_dense_beit_cache["warned"] = True
             return None, None, {"enabled": True, "reason": "missing_camera"}
 
@@ -1948,11 +2182,369 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         return band.detach(), foreground.detach(), {
             "enabled": True,
             "path": cache.get("path"),
-            "camera": camera_basename(camera),
+            "camera": cam_name,
+            "time_index": int(time_index),
+            "used_time_index": int(used_time_index),
             "band_low": float(low_q),
             "band_high": float(high_q),
             "threshold": float(threshold),
             "foreground_pixels": int(torch.count_nonzero(foreground).item()),
+        }
+
+    def layer_responsibility_due(iteration):
+        if not bool(getattr(gaussians, "field_layer_responsibility", 0)):
+            return False
+        start = int(getattr(gaussians, "field_layer_responsibility_start", 3000))
+        until = int(getattr(gaussians, "field_layer_responsibility_until", 18000))
+        if iteration < start or iteration > until:
+            return False
+        interval = max(int(getattr(gaussians, "field_layer_responsibility_interval", 5)), 1)
+        return (iteration - start) % interval == 0
+
+    def nearest_layer_beit_time_index(time_idx):
+        candidates = parse_int_list(
+            getattr(gaussians, "field_layer_beit_time_indices", "0,12,25,37,49"),
+            default=[0, 12, 25, 37, 49],
+        )
+        candidates = [max(0, min(int(value), duration - 1)) for value in candidates]
+        if not candidates:
+            return int(time_idx)
+        return min(candidates, key=lambda value: (abs(int(value) - int(time_idx)), int(value)))
+
+    def detach_content_exposure_params(params):
+        if not isinstance(params, dict):
+            return None
+        detached = {"mode": params.get("mode", "affine")}
+        for key in ("log_scale", "bias", "delta_r", "delta_b"):
+            value = params.get(key)
+            if torch.is_tensor(value):
+                detached[key] = value.detach()
+        if "log_scale" not in detached or "bias" not in detached:
+            return None
+        return detached
+
+    def apply_content_exposure_params(image, params):
+        if not isinstance(params, dict):
+            return image
+        log_scale = params["log_scale"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        bias = params["bias"].to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        if params.get("mode", "affine") != "luma_wb":
+            return torch.exp(log_scale) * image + bias
+        delta_r = params.get("delta_r")
+        delta_b = params.get("delta_b")
+        if delta_r is None or delta_b is None:
+            return torch.exp(log_scale) * image + bias
+        delta_r = delta_r.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        delta_b = delta_b.to(device=image.device, dtype=image.dtype).view(1, 1, 1)
+        wb = torch.cat(
+            [
+                torch.exp(delta_r),
+                torch.ones_like(delta_r),
+                torch.exp(delta_b),
+            ],
+            dim=0,
+        )
+        return torch.exp(log_scale) * wb * image + bias
+
+    def build_layer_responsibility_mask(time_idx, camera, gt_image, temporal_motion_map):
+        height, width = int(gt_image.shape[1]), int(gt_image.shape[2])
+        median, _, stable = get_observation_prior(camera)
+        if median is None or stable is None:
+            return None, {"reason": "missing_temporal_prior", "pixels": 0}
+
+        rep_time_idx = nearest_layer_beit_time_index(time_idx)
+        beit_band, beit_foreground, beit_stats = get_dense_beit_foreground_mask(
+            camera,
+            (height, width),
+            time_index_override=rep_time_idx,
+            allow_fallback=False,
+        )
+        if beit_band is None or beit_foreground is None:
+            return None, {
+                "reason": str((beit_stats or {}).get("reason", "missing_beit")),
+                "pixels": 0,
+                "beit_time": int(rep_time_idx),
+            }
+
+        median = median.to(device=gt_image.device, dtype=gt_image.dtype)
+        stable = stable.to(device=gt_image.device, dtype=torch.bool)
+        beit_band = beit_band.to(device=gt_image.device, dtype=torch.float32)
+        beit_foreground = beit_foreground.to(device=gt_image.device, dtype=torch.bool)
+        temporal_motion_map = temporal_motion_map.to(device=gt_image.device, dtype=torch.float32)
+
+        erode_radius = max(int(getattr(gaussians, "field_layer_mask_erode", 3)), 0)
+        beit_bg_threshold = float(getattr(gaussians, "field_layer_beit_background_threshold", 0.35))
+        motion_threshold = max(float(getattr(gaussians, "field_layer_motion_threshold", 0.12)), 1e-6)
+        median_threshold = max(float(getattr(gaussians, "field_layer_median_threshold", 0.12)), 1e-6)
+
+        current_to_median = torch.abs(gt_image - median).mean(dim=0)
+        strict_background = (beit_band < beit_bg_threshold) & (~dilate_mask(beit_foreground, erode_radius))
+        stable_current = stable & (current_to_median <= median_threshold) & (temporal_motion_map <= motion_threshold)
+        mask = strict_background & stable_current
+        if erode_radius > 0:
+            mask = erode_mask(mask, erode_radius)
+
+        pixel_count = int(torch.count_nonzero(mask).item())
+        min_pixels = int(getattr(gaussians, "field_layer_min_pixels", 256))
+        stats = {
+            "reason": "ok" if pixel_count >= min_pixels else "too_few_pixels",
+            "pixels": pixel_count,
+            "beit_time": int(rep_time_idx),
+            "strict_bg_pixels": int(torch.count_nonzero(strict_background).item()),
+            "stable_pixels": int(torch.count_nonzero(stable_current).item()),
+            "_debug_masks": {
+                "M_bg": mask.detach(),
+                "strict_background": strict_background.detach(),
+                "stable_current": stable_current.detach(),
+                "beit_foreground": beit_foreground.detach(),
+            },
+            "_debug_maps": {
+                "beit_band": beit_band.detach(),
+                "temporal_motion": temporal_motion_map.detach(),
+                "current_to_median": current_to_median.detach(),
+            },
+        }
+        if pixel_count < min_pixels:
+            return None, stats
+        return mask.detach(), stats
+
+    def layer_depth_masks(camera):
+        with torch.no_grad():
+            means3D, _, _, _ = gaussians.compose_time_conditioned_attributes(
+                camera.timestamp,
+                rbfbasefunction,
+                camera_center=camera.camera_center,
+            )
+            view_depth = geom_transform_points(
+                means3D.detach().float(),
+                camera.world_view_transform,
+            )[:, 2]
+            valid_depth = torch.isfinite(view_depth) & (view_depth > 0.0)
+            near_depth = float(getattr(gaussians, "field_layer_near_depth", 30.0))
+            far_depth = float(getattr(gaussians, "field_layer_far_depth", 80.0))
+            near_mask = valid_depth & (view_depth < near_depth)
+            far_mask = valid_depth & (view_depth >= far_depth)
+        return near_mask.detach(), far_mask.detach()
+
+    def rasterize_layer_opacity(camera, point_mask):
+        point_mask = point_mask.to(device=gaussians.get_xyz.device, dtype=torch.bool).reshape(-1)
+        if point_mask.shape[0] != gaussians.get_xyz.shape[0] or torch.count_nonzero(point_mask) == 0:
+            return None
+        means3D, opacity, rotations, _ = gaussians.compose_time_conditioned_attributes(
+            camera.timestamp,
+            rbfbasefunction,
+            camera_center=camera.camera_center,
+        )
+        scales = gaussians.get_scaling
+        means3D = means3D[point_mask]
+        opacity = opacity[point_mask]
+        rotations = rotations[point_mask]
+        scales = scales[point_mask]
+        values = torch.ones(
+            (means3D.shape[0], int(background.shape[0])),
+            device=means3D.device,
+            dtype=means3D.dtype,
+        )
+        means2D = torch.zeros_like(means3D, dtype=means3D.dtype, device=means3D.device)
+        zero_background = torch.zeros_like(background)
+        tanfovx = math.tan(camera.FoVx * 0.5)
+        tanfovy = math.tan(camera.FoVy * 0.5)
+        raster_settings = GRsetting(
+            image_height=int(camera.image_height),
+            image_width=int(camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=zero_background,
+            scale_modifier=1.0,
+            viewmatrix=camera.world_view_transform,
+            projmatrix=camera.full_proj_transform,
+            sh_degree=gaussians.active_sh_degree,
+            campos=camera.camera_center,
+            prefiltered=False,
+        )
+        rasterizer = GRzer(raster_settings=raster_settings)
+        rendered, _, _ = rasterizer(
+            means3D=means3D,
+            means2D=means2D,
+            shs=None,
+            colors_precomp=values,
+            opacities=opacity,
+            scales=scales,
+            rotations=rotations,
+            cov3D_precomp=None,
+        )
+        return rendered[0].float().clamp(0.0, 1.0)
+
+    def ensure_core_grads_for_cache():
+        for param in (
+            gaussians._xyz,
+            gaussians._features_dc,
+            gaussians._features_t,
+            gaussians._scaling,
+            gaussians._rotation,
+            gaussians._opacity,
+            gaussians._trbf_center,
+            gaussians._trbf_scale,
+            gaussians._motion,
+            gaussians._omega,
+        ):
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+
+    def filter_layer_responsibility_gradients(allowed_point_masks):
+        core_groups = {
+            "xyz",
+            "f_dc",
+            "f_t",
+            "opacity",
+            "scaling",
+            "rotation",
+            "omega",
+            "trbf_center",
+            "trbf_scale",
+            "motion",
+        }
+        num_points = gaussians.get_xyz.shape[0]
+        for group in gaussians.optimizer.param_groups:
+            name = group.get("name", "")
+            for param in group.get("params", []):
+                if param is None:
+                    continue
+                if name in core_groups:
+                    if param.grad is None:
+                        param.grad = torch.zeros_like(param)
+                    if name not in allowed_point_masks:
+                        param.grad.zero_()
+                        continue
+                    mask = allowed_point_masks[name].to(device=param.grad.device, dtype=torch.bool).reshape(-1)
+                    if mask.shape[0] != num_points or param.grad.shape[0] != num_points:
+                        param.grad.zero_()
+                        continue
+                    while mask.dim() < param.grad.dim():
+                        mask = mask.unsqueeze(-1)
+                    param.grad.mul_(mask.to(dtype=param.grad.dtype))
+                else:
+                    param.grad = None
+        ensure_core_grads_for_cache()
+
+    def cache_layer_auxiliary_loss(aux_loss, allowed_point_masks, batch_scale):
+        if aux_loss is None:
+            return False
+        (aux_loss * float(batch_scale)).backward()
+        filter_layer_responsibility_gradients(allowed_point_masks)
+        gaussians.cache_gradient()
+        gaussians.optimizer.zero_grad(set_to_none=True)
+        return True
+
+    def apply_layer_responsibility_losses(
+        iteration,
+        time_idx,
+        camera,
+        gt_image,
+        temporal_motion_map,
+        batch_scale,
+        normal_image=None,
+        content_exposure_params=None,
+    ):
+        if not layer_responsibility_due(iteration):
+            return None
+        bg_mask, bg_stats = build_layer_responsibility_mask(time_idx, camera, gt_image, temporal_motion_map)
+        if bg_mask is None:
+            return {
+                "pixels": 0,
+                "reason": bg_stats.get("reason", "missing_mask"),
+                "far_loss": 0.0,
+                "front_loss": 0.0,
+            }
+
+        near_mask, far_mask = layer_depth_masks(camera)
+        far_points = int(torch.count_nonzero(far_mask).item())
+        near_points = int(torch.count_nonzero(near_mask).item())
+        far_image_debug = None
+        far_image_exposed_debug = None
+        near_opacity_debug = None
+        if far_points > 0:
+            far_pkg = render(
+                camera,
+                gaussians,
+                pipe,
+                background,
+                override_color=None,
+                basicfunction=rbfbasefunction,
+                GRsetting=GRsetting,
+                GRzer=GRzer,
+                time_conditioned=None,
+                static_radiance_mask=None,
+                iteration=iteration,
+                render_point_mask=far_mask,
+            )
+            far_image = far_pkg["render"]
+            far_image_exposed = apply_content_exposure_params(far_image, content_exposure_params)
+            far_l1 = torch.abs(far_image_exposed - gt_image)[:, bg_mask].mean()
+            far_weight = float(getattr(gaussians, "field_layer_far_loss_weight", 0.10))
+            far_image_debug = far_image.detach()
+            far_image_exposed_debug = far_image_exposed.detach()
+            cache_layer_auxiliary_loss(
+                far_weight * far_l1,
+                {
+                    "xyz": far_mask,
+                    "f_dc": far_mask,
+                    "opacity": far_mask,
+                    "scaling": far_mask,
+                    "rotation": far_mask,
+                },
+                batch_scale,
+            )
+            far_loss_value = float(far_l1.detach().cpu())
+            del far_pkg, far_image, far_image_exposed, far_l1
+        else:
+            far_loss_value = 0.0
+
+        if near_points > 0:
+            near_opacity = rasterize_layer_opacity(camera, near_mask)
+            if near_opacity is not None:
+                budget = float(getattr(gaussians, "field_layer_front_opacity_budget", 0.15))
+                front_loss = torch.relu(near_opacity - budget)[bg_mask].pow(2).mean()
+                front_weight = float(getattr(gaussians, "field_layer_front_opacity_weight", 0.01))
+                near_opacity_debug = near_opacity.detach()
+                cache_layer_auxiliary_loss(
+                    front_weight * front_loss,
+                    {"opacity": near_mask},
+                    batch_scale,
+                )
+                front_loss_value = float(front_loss.detach().cpu())
+                del near_opacity, front_loss
+            else:
+                front_loss_value = 0.0
+        else:
+            front_loss_value = 0.0
+
+        if normal_image is not None:
+            save_layer_responsibility_debug(
+                iteration,
+                time_idx,
+                camera,
+                gt_image,
+                normal_image,
+                bg_mask,
+                bg_stats,
+                far_image_debug,
+                far_image_exposed_debug,
+                near_opacity_debug,
+                far_points,
+                near_points,
+                far_loss_value,
+                front_loss_value,
+            )
+
+        return {
+            "pixels": int(bg_stats.get("pixels", 0)),
+            "reason": bg_stats.get("reason", "ok"),
+            "beit_time": int(bg_stats.get("beit_time", -1)),
+            "far_points": far_points,
+            "near_points": near_points,
+            "far_loss": far_loss_value,
+            "front_loss": front_loss_value,
         }
 
     def load_depthpro_depths():
@@ -2064,6 +2656,203 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             capped_mask[capped_coords[:, 0], capped_coords[:, 1]] = True
             selected_mask = capped_mask
         return selected_mask
+
+    def select_dense_source_times(iteration, image_name, need_mask, reference_camera, reference_gt, fallback_depth, source_time_indices, collect_debug=False):
+        need_mask = need_mask.bool()
+        device = need_mask.device
+        height, width = need_mask.shape
+        if fallback_depth is None:
+            fallback_depth = torch.full((height, width), max(float(getattr(gaussians, "field_bg_prior_depth_max", 15.0)), 1e-4), device=device, dtype=torch.float32)
+        fallback_depth = fallback_depth.to(device=device, dtype=torch.float32)
+        fallback_depth = torch.where(
+            torch.isfinite(fallback_depth) & (fallback_depth > 1e-4),
+            fallback_depth,
+            torch.full_like(fallback_depth, max(float(getattr(gaussians, "field_bg_prior_depth_max", 15.0)), 1e-4)),
+        )
+
+        source_time_indices = [int(t) for t in source_time_indices]
+        min_support = max(int(getattr(gaussians, "field_bg_dense_source_min_support", 2)), 1)
+        beit_bg_threshold = float(getattr(gaussians, "field_bg_dense_source_beit_background_threshold", 0.35))
+        dilate_radius = max(int(getattr(gaussians, "field_bg_dense_source_dilate", 5)), 0)
+        motion_threshold = max(float(getattr(gaussians, "field_bg_dense_source_motion_threshold", 0.12)), 1e-6)
+        median_threshold = max(float(getattr(gaussians, "field_bg_dense_source_median_threshold", 0.12)), 1e-6)
+        beit_weight = float(getattr(gaussians, "field_bg_dense_source_score_beit_weight", 0.60))
+        motion_weight = float(getattr(gaussians, "field_bg_dense_source_score_motion_weight", 0.25))
+        median_weight = float(getattr(gaussians, "field_bg_dense_source_score_median_weight", 0.15))
+
+        support_count = torch.zeros_like(need_mask, dtype=torch.int32)
+        best_score = torch.full_like(fallback_depth, float("inf"))
+        source_time_map = torch.full_like(support_count, -1)
+        source_timestamp_map = torch.full_like(
+            fallback_depth,
+            -1.0,
+            dtype=torch.float32,
+        )
+        selected_depth = fallback_depth.clone()
+        selected_color = reference_gt.detach().float().to(device=device).clone()
+
+        per_time_stats = []
+        debug_per_time = []
+        fallback_not_counted = 0
+
+        for time_idx in source_time_indices:
+            source_camera = traincamlookup.get(int(time_idx), {}).get(image_name)
+            if source_camera is None:
+                per_time_stats.append({
+                    "time_idx": int(time_idx),
+                    "reason": "missing_camera",
+                    "valid_pixels": 0,
+                })
+                continue
+
+            source_render_pkg = render(
+                source_camera,
+                gaussians,
+                pipe,
+                background,
+                override_color=None,
+                basicfunction=rbfbasefunction,
+                GRsetting=GRsetting,
+                GRzer=GRzer,
+                time_conditioned=None,
+            )
+            source_depth = source_render_pkg["depth"].detach().squeeze(0).float()
+            source_gt = get_gt_image(source_camera).detach().float()
+            temporal_motion = get_temporal_motion_map(int(time_idx), source_camera).detach().float()
+            median, _, _ = get_observation_prior(source_camera)
+            if median is None:
+                current_to_median = torch.full_like(temporal_motion, float("inf"))
+            else:
+                current_to_median = torch.abs(source_gt - median.to(device=source_gt.device, dtype=source_gt.dtype)).mean(dim=0)
+
+            beit_band, beit_foreground, beit_stats = get_dense_beit_foreground_mask(source_camera, need_mask.shape)
+            if beit_band is None or beit_foreground is None:
+                per_time_stats.append({
+                    "time_idx": int(time_idx),
+                    "reason": str((beit_stats or {}).get("reason", "missing_beit")),
+                    "valid_pixels": 0,
+                })
+                del source_render_pkg, source_depth, source_gt, temporal_motion, current_to_median
+                torch.cuda.empty_cache()
+                continue
+
+            beit_band = beit_band.to(device=device, dtype=torch.float32)
+            beit_foreground = beit_foreground.to(device=device, dtype=torch.bool)
+            beit_used_time_index = int((beit_stats or {}).get("used_time_index", time_idx))
+            if beit_used_time_index != int(time_idx):
+                fallback_not_counted += 1
+                per_time_stats.append({
+                    "time_idx": int(time_idx),
+                    "reason": "fallback_not_counted",
+                    "valid_pixels": 0,
+                    "beit_used_time_index": int(beit_used_time_index),
+                })
+                if collect_debug:
+                    debug_per_time.append({
+                        "time_idx": int(time_idx),
+                        "beit_band": beit_band.detach().cpu(),
+                        "strict_background": torch.zeros_like(need_mask, dtype=torch.bool).detach().cpu(),
+                        "dynamic_mask": torch.zeros_like(need_mask, dtype=torch.bool).detach().cpu(),
+                        "valid_source": torch.zeros_like(need_mask, dtype=torch.bool).detach().cpu(),
+                    })
+                del source_render_pkg, source_depth, source_gt, temporal_motion, current_to_median, beit_band, beit_foreground
+                torch.cuda.empty_cache()
+                continue
+
+            strict_background = (beit_band < beit_bg_threshold) & (~dilate_mask(beit_foreground, dilate_radius))
+            dynamic_mask = (temporal_motion > motion_threshold) | (current_to_median > median_threshold)
+            dynamic_mask = dilate_mask(dynamic_mask, dilate_radius)
+            valid_source = need_mask & strict_background & (~dynamic_mask)
+            support_count = support_count + valid_source.to(dtype=torch.int32)
+
+            motion_score = torch.clamp(temporal_motion / motion_threshold, 0.0, 1.0)
+            median_score = torch.clamp(current_to_median / median_threshold, 0.0, 1.0)
+            source_score = beit_weight * beit_band + motion_weight * motion_score + median_weight * median_score
+            better = valid_source & (source_score < best_score)
+            if torch.count_nonzero(better) > 0:
+                source_time_map = torch.where(better, torch.full_like(source_time_map, int(time_idx)), source_time_map)
+                source_timestamp_map = torch.where(
+                    better,
+                    torch.full_like(
+                        source_timestamp_map,
+                        float(source_camera.timestamp),
+                    ),
+                    source_timestamp_map,
+                )
+                best_score = torch.where(better, source_score, best_score)
+                valid_depth = torch.isfinite(source_depth) & (source_depth > 1e-4)
+                depth_for_source = torch.where(valid_depth, source_depth, fallback_depth)
+                selected_depth = torch.where(better, depth_for_source, selected_depth)
+                selected_color = torch.where(better.unsqueeze(0), source_gt.to(device=device), selected_color)
+
+            valid_pixels = int(torch.count_nonzero(valid_source).item())
+            per_time_stats.append({
+                "time_idx": int(time_idx),
+                "reason": "ok",
+                "valid_pixels": valid_pixels,
+                "strict_background_pixels": int(torch.count_nonzero(strict_background & need_mask).item()),
+                "dynamic_pixels": int(torch.count_nonzero(dynamic_mask & need_mask).item()),
+                "foreground_pixels": int(torch.count_nonzero(beit_foreground & need_mask).item()),
+                "beit_used_time_index": int(beit_used_time_index),
+            })
+            if collect_debug:
+                debug_per_time.append({
+                    "time_idx": int(time_idx),
+                    "beit_band": beit_band.detach().cpu(),
+                    "strict_background": strict_background.detach().cpu(),
+                    "dynamic_mask": dynamic_mask.detach().cpu(),
+                    "valid_source": valid_source.detach().cpu(),
+                })
+            del source_render_pkg, source_depth, source_gt, temporal_motion, current_to_median, beit_band, beit_foreground
+            torch.cuda.empty_cache()
+
+        supported = need_mask & (support_count >= min_support) & (source_time_map >= 0)
+        source_time_map = torch.where(supported, source_time_map, torch.full_like(source_time_map, -1))
+        source_timestamp_map = torch.where(
+            supported,
+            source_timestamp_map,
+            torch.full_like(source_timestamp_map, -1.0),
+        )
+        selected_depth = torch.where(
+            torch.isfinite(selected_depth) & (selected_depth > 1e-4),
+            selected_depth,
+            fallback_depth,
+        ).clamp_min(1e-4)
+
+        source_counts = {
+            str(int(time_idx)): int(torch.count_nonzero(source_time_map == int(time_idx)).item())
+            for time_idx in source_time_indices
+        }
+        stats = {
+            "enabled": 1,
+            "source_time_indices": source_time_indices,
+            "min_support": int(min_support),
+            "beit_background_threshold": float(beit_bg_threshold),
+            "dilate": int(dilate_radius),
+            "motion_threshold": float(motion_threshold),
+            "median_threshold": float(median_threshold),
+            "need_pixels": int(torch.count_nonzero(need_mask).item()),
+            "supported_pixels": int(torch.count_nonzero(supported).item()),
+            "fallback_not_counted": int(fallback_not_counted),
+            "source_counts": source_counts,
+            "per_time": per_time_stats,
+        }
+        debug = None
+        if collect_debug:
+            debug = {
+                "source_time_indices": source_time_indices,
+                "support_count": support_count.detach().cpu(),
+                "source_time_map": source_time_map.detach().cpu(),
+                "per_time": debug_per_time,
+            }
+        return (
+            supported.detach(),
+            selected_color.detach(),
+            selected_depth.detach(),
+            source_timestamp_map.detach(),
+            stats,
+            debug,
+        )
 
     def dense_candidate_worldpoints(pixel_indices, viewpoint_cam, depth_base, depth_value=None, depth_scale=None):
         if pixel_indices is None or pixel_indices.numel() == 0:
@@ -2380,7 +3169,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                                         union_mask, sample_mask, depth_base, depth_scales, added_points, frame_stats,
                                         filtered_mask=None, da3_depth=None, da3_foreground_mask=None, da3_stats=None,
                                         beit_band=None, beit_foreground_mask=None, beit_stats=None,
-                                        pre_dedup_sample_mask=None, dedup_stats=None):
+                                        pre_dedup_sample_mask=None, dedup_stats=None,
+                                        source_selection_stats=None, source_selection_debug=None,
+                                        persistent_need_mask=None, time0_unreliable_mask=None):
         if not bool(getattr(gaussians, "field_bg_dense_debug", 0)):
             return
         safe_name = str(camera.image_name).replace("/", "_").replace("\\", "_")
@@ -2453,6 +3244,38 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         if beit_foreground_mask is not None:
             save_debug_image(os.path.join(event_dir, "beit_foreground_mask.png"), beit_foreground_mask.float())
             save_debug_image(os.path.join(event_dir, "beit_foreground_overlay.png"), overlay_debug_mask(gt_vis, beit_foreground_mask, (0.0, 0.4, 1.0), alpha=0.55))
+        if source_selection_debug is not None:
+            if persistent_need_mask is not None:
+                save_debug_image(os.path.join(event_dir, "persistent_need_mask.png"), persistent_need_mask.float())
+                save_debug_image(
+                    os.path.join(event_dir, "persistent_need_overlay.png"),
+                    overlay_debug_mask(gt_vis, persistent_need_mask, (1.0, 0.0, 0.0), alpha=0.65),
+                )
+            if time0_unreliable_mask is not None:
+                save_debug_image(os.path.join(event_dir, "time0_unreliable_mask.png"), time0_unreliable_mask.float())
+                save_debug_image(
+                    os.path.join(event_dir, "time0_unreliable_overlay.png"),
+                    overlay_debug_mask(gt_vis, time0_unreliable_mask, (0.0, 0.4, 1.0), alpha=0.65),
+                )
+            source_times = source_selection_debug.get("source_time_indices", [])
+            support_count = source_selection_debug.get("support_count")
+            source_time_map = source_selection_debug.get("source_time_map")
+            if support_count is not None:
+                denom = max(float(len(source_times)), 1.0)
+                save_debug_image(os.path.join(event_dir, "source_support_count.png"), support_count.float() / denom)
+            if source_time_map is not None:
+                save_debug_image(os.path.join(event_dir, "source_time_map.png"), source_time_map_to_rgb(source_time_map.to(device=gt_vis.device), source_times))
+            for item in source_selection_debug.get("per_time", []):
+                time_idx = int(item.get("time_idx", -1))
+                prefix = f"source_t{time_idx:02d}"
+                if item.get("beit_band") is not None:
+                    save_debug_image(os.path.join(event_dir, f"{prefix}_beit_band.png"), item["beit_band"].float().clamp(0.0, 1.0))
+                if item.get("strict_background") is not None:
+                    save_debug_image(os.path.join(event_dir, f"{prefix}_strict_background.png"), item["strict_background"].float())
+                if item.get("dynamic_mask") is not None:
+                    save_debug_image(os.path.join(event_dir, f"{prefix}_dynamic_mask.png"), item["dynamic_mask"].float())
+                if item.get("valid_source") is not None:
+                    save_debug_image(os.path.join(event_dir, f"{prefix}_valid_source.png"), item["valid_source"].float())
         save_debug_image(os.path.join(event_dir, "selected_pixels.png"), sample_mask.float())
         save_debug_image(os.path.join(event_dir, "selected_overlay.png"), overlay_debug_mask(gt_vis, sample_mask, (1.0, 0.0, 0.0), alpha=0.65))
         save_debug_image(os.path.join(event_dir, "selected_pixels_before_cell_dedup.png"), pre_dedup_sample_mask.float())
@@ -2481,6 +3304,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "added_points": int(added_points),
             "da3": da3_stats or {},
             "beit": beit_stats or {},
+            "source_selection": source_selection_stats or {},
             "cell_dedup": dedup_stats or {},
             "frame_stats": frame_stats,
         }
@@ -2517,16 +3341,21 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             reference_time_indices = [time_indices[len(time_indices) // 2]]
         else:
             reference_time_indices = time_indices
+        source_time_select = bool(getattr(gaussians, "field_bg_dense_source_time_select", 0))
+        source_time_indices = parse_dense_source_time_indices() if source_time_select else []
         image_names = sorted({cam.image_name for cam in traincameralist})
         total_added = 0
         total_sampled = 0
         camera_events = 0
         bg_dense_add_done = True
         dense_debug_enabled = bool(getattr(gaussians, "field_bg_dense_debug", 0))
+        source_debug_collected = 0
+        source_debug_max_events = int(getattr(gaussians, "field_bg_dense_debug_max_events", 0))
 
         print(
             f"[STEGF] Dense background add at iter {int(iteration)}: "
             f"{len(image_names)} cameras, times={reference_time_indices}, "
+            f"source_time_select={int(source_time_select)}, source_times={source_time_indices}, "
             f"depth_values={depth_values}, depth_scales={depth_scales}, "
             f"sample_block={int(getattr(gaussians, 'field_bg_dense_sample_block_size', 3))}x"
             f"{int(getattr(gaussians, 'field_bg_dense_sample_block_size', 3))}, "
@@ -2554,6 +3383,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             color_count = None
             depth_base = None
             fallback_depth = None
+            persistent_need_union = None
+            time0_unreliable_union = None
             frame_stats = []
 
             for time_idx in reference_time_indices:
@@ -2588,6 +3419,19 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     use_accumulated=use_accumulated_mask,
                 )
                 depth = target_render_pkg["depth"].detach().squeeze(0).float()
+                time0_unreliable_mask = unreliable_mask
+                persistent_need_stats = {}
+                if source_time_select and use_accumulated_mask:
+                    persistent_need_mask, persistent_need_stats = get_persistent_need_mask_from_ema(
+                        target_camera,
+                        target_image.shape[-2:],
+                        device=depth.device,
+                    )
+                    if time0_unreliable_mask is None:
+                        time0_unreliable_mask = torch.zeros_like(persistent_need_mask, dtype=torch.bool)
+                    else:
+                        time0_unreliable_mask = time0_unreliable_mask.to(device=depth.device, dtype=torch.bool)
+                    unreliable_mask = persistent_need_mask
                 if unreliable_mask is None:
                     frame_stats.append({
                         "time_idx": int(time_idx),
@@ -2609,16 +3453,32 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     color_count = torch.zeros_like(unreliable_mask, dtype=torch.float32)
                     depth_base = torch.full_like(depth, float("inf"))
                     fallback_depth = depth.clone()
+                    if source_time_select and use_accumulated_mask:
+                        persistent_need_union = torch.zeros_like(unreliable_mask, dtype=torch.bool)
+                        time0_unreliable_union = torch.zeros_like(unreliable_mask, dtype=torch.bool)
 
                 unreliable_count = int(torch.count_nonzero(unreliable_mask).item())
-                frame_stats.append({
+                frame_stat = {
                     "time_idx": int(time_idx),
                     "unreliable_pixels": unreliable_count,
                     "mask_source": mask_source,
                     "ema_available": bool(ema_available),
-                })
+                }
+                if source_time_select and use_accumulated_mask:
+                    frame_stat.update({
+                        "need_mask_mode": "persistent_ema",
+                        "persistent_need_pixels": unreliable_count,
+                        "time0_unreliable_pixels": int(torch.count_nonzero(time0_unreliable_mask).item()),
+                        "persistent_need": persistent_need_stats,
+                    })
+                frame_stats.append(frame_stat)
+                if source_time_select and use_accumulated_mask:
+                    persistent_need_union = persistent_need_union | unreliable_mask
+                    time0_unreliable_union = time0_unreliable_union | time0_unreliable_mask
                 if unreliable_count == 0:
                     del target_render_pkg, target_image, target_gt, temporal_motion_map, unreliable_mask, depth
+                    if source_time_select and use_accumulated_mask:
+                        del time0_unreliable_mask, persistent_need_mask
                     torch.cuda.empty_cache()
                     continue
 
@@ -2631,6 +3491,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 current_depth = torch.where(valid_depth & unreliable_mask, depth, torch.full_like(depth, float("inf")))
                 depth_base = torch.minimum(depth_base, current_depth)
                 del target_render_pkg, target_image, target_gt, temporal_motion_map, unreliable_mask, depth
+                if source_time_select and use_accumulated_mask:
+                    del time0_unreliable_mask, persistent_need_mask
                 torch.cuda.empty_cache()
 
             if reference_camera is None or union_mask is None:
@@ -2638,37 +3500,77 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
             if fallback_depth is None:
                 fallback_depth = torch.full_like(depth_base, max(float(getattr(gaussians, "field_bg_prior_depth_max", 15.0)), 1e-4))
-            finite_depth = torch.isfinite(depth_base) & (depth_base > 1e-4)
             fallback_depth = torch.where(
                 torch.isfinite(fallback_depth) & (fallback_depth > 1e-4),
                 fallback_depth,
                 torch.full_like(fallback_depth, max(float(getattr(gaussians, "field_bg_prior_depth_max", 15.0)), 1e-4)),
             )
-            depth_base = torch.where(finite_depth, depth_base, fallback_depth).clamp_min(1e-4)
 
-            color_count_safe = torch.clamp(color_count, min=1.0)
-            color_image = color_accum / color_count_safe.unsqueeze(0)
-            color_image = torch.where((color_count > 0.0).unsqueeze(0), color_image, reference_gt.float())
-            filtered_mask = union_mask
-            da3_depth, da3_foreground_mask, da3_stats = get_dense_da3_foreground_mask(reference_camera, union_mask.shape)
-            if da3_foreground_mask is not None:
-                da3_foreground_mask = da3_foreground_mask.to(device=union_mask.device, dtype=torch.bool)
-                filtered_mask = union_mask & (~da3_foreground_mask)
-            beit_band, beit_foreground_mask, beit_stats = get_dense_beit_foreground_mask(reference_camera, union_mask.shape)
-            if beit_foreground_mask is not None:
-                beit_foreground_mask = beit_foreground_mask.to(device=union_mask.device, dtype=torch.bool)
-                filtered_mask = filtered_mask & (~beit_foreground_mask)
-            depth_base_mode = str(getattr(gaussians, "field_bg_dense_depth_base", "render")).lower()
-            if depth_base_mode == "da3" and da3_depth is not None:
-                da3_depth_for_base = da3_depth.to(device=depth_base.device, dtype=depth_base.dtype)
-                valid_da3_depth = torch.isfinite(da3_depth_for_base) & (da3_depth_for_base > 1e-4)
-                depth_base = torch.where(valid_da3_depth, da3_depth_for_base, depth_base)
-                da3_stats = dict(da3_stats or {})
-                da3_stats["depth_base"] = "da3"
-                da3_stats["depth_base_valid_pixels"] = int(torch.count_nonzero(valid_da3_depth).item())
+            source_selection_stats = {}
+            source_selection_debug = None
+            if source_time_select:
+                collect_source_debug = dense_debug_enabled and (
+                    source_debug_max_events <= 0 or source_debug_collected < source_debug_max_events
+                )
+                (
+                    filtered_mask,
+                    color_image,
+                    depth_base,
+                    source_timestamp_map,
+                    source_selection_stats,
+                    source_selection_debug,
+                ) = select_dense_source_times(
+                    iteration,
+                    image_name,
+                    union_mask,
+                    reference_camera,
+                    reference_gt,
+                    fallback_depth,
+                    source_time_indices,
+                    collect_debug=collect_source_debug,
+                )
+                source_debug_collected += int(source_selection_debug is not None)
+                da3_stats = {"enabled": False, "reason": "source_time_select"}
+                beit_stats = {
+                    "enabled": True,
+                    "source_time_select": source_selection_stats,
+                }
+                da3_depth = None
+                da3_foreground_mask = None
+                beit_band = None
+                beit_foreground_mask = None
             else:
-                da3_stats = dict(da3_stats or {})
-                da3_stats["depth_base"] = "render"
+                source_timestamp_map = torch.full_like(
+                    depth_base,
+                    float(reference_camera.timestamp),
+                    dtype=torch.float32,
+                )
+                finite_depth = torch.isfinite(depth_base) & (depth_base > 1e-4)
+                depth_base = torch.where(finite_depth, depth_base, fallback_depth).clamp_min(1e-4)
+
+                color_count_safe = torch.clamp(color_count, min=1.0)
+                color_image = color_accum / color_count_safe.unsqueeze(0)
+                color_image = torch.where((color_count > 0.0).unsqueeze(0), color_image, reference_gt.float())
+                filtered_mask = union_mask
+                da3_depth, da3_foreground_mask, da3_stats = get_dense_da3_foreground_mask(reference_camera, union_mask.shape)
+                if da3_foreground_mask is not None:
+                    da3_foreground_mask = da3_foreground_mask.to(device=union_mask.device, dtype=torch.bool)
+                    filtered_mask = union_mask & (~da3_foreground_mask)
+                beit_band, beit_foreground_mask, beit_stats = get_dense_beit_foreground_mask(reference_camera, union_mask.shape)
+                if beit_foreground_mask is not None:
+                    beit_foreground_mask = beit_foreground_mask.to(device=union_mask.device, dtype=torch.bool)
+                    filtered_mask = filtered_mask & (~beit_foreground_mask)
+                depth_base_mode = str(getattr(gaussians, "field_bg_dense_depth_base", "render")).lower()
+                if depth_base_mode == "da3" and da3_depth is not None:
+                    da3_depth_for_base = da3_depth.to(device=depth_base.device, dtype=depth_base.dtype)
+                    valid_da3_depth = torch.isfinite(da3_depth_for_base) & (da3_depth_for_base > 1e-4)
+                    depth_base = torch.where(valid_da3_depth, da3_depth_for_base, depth_base)
+                    da3_stats = dict(da3_stats or {})
+                    da3_stats["depth_base"] = "da3"
+                    da3_stats["depth_base_valid_pixels"] = int(torch.count_nonzero(valid_da3_depth).item())
+                else:
+                    da3_stats = dict(da3_stats or {})
+                    da3_stats["depth_base"] = "render"
             sample_mask = sample_dense_union_mask(filtered_mask)
             pixel_indices = torch.nonzero(sample_mask, as_tuple=False)
             payload = {
@@ -2677,10 +3579,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 "color_image": color_image.detach().cpu(),
                 "sample_mask": sample_mask.detach().cpu(),
                 "depth_base": depth_base.detach().cpu(),
+                "source_timestamp_map": source_timestamp_map.detach().cpu(),
                 "pixel_indices": pixel_indices.detach().cpu(),
                 "union_pixels": int(torch.count_nonzero(union_mask).item()),
                 "candidate_pixels": int(torch.count_nonzero(filtered_mask).item()),
                 "pre_dedup_pixels": int(torch.count_nonzero(sample_mask).item()),
+                "source_selection_stats": source_selection_stats,
             }
             if dense_debug_enabled:
                 payload.update({
@@ -2694,10 +3598,17 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "beit_band": beit_band.detach().cpu() if beit_band is not None else None,
                     "beit_foreground_mask": beit_foreground_mask.detach().cpu() if beit_foreground_mask is not None else None,
                     "beit_stats": beit_stats,
+                    "source_selection_debug": source_selection_debug,
+                    "persistent_need_mask": persistent_need_union.detach().cpu() if persistent_need_union is not None else None,
+                    "time0_unreliable_mask": time0_unreliable_union.detach().cpu() if time0_unreliable_union is not None else None,
                     "frame_stats": frame_stats,
                 })
             dense_payloads.append(payload)
             del reference_gt, reference_image, union_mask, filtered_mask, sample_mask, color_accum, color_count, depth_base, fallback_depth, color_image, pixel_indices
+            if persistent_need_union is not None:
+                del persistent_need_union
+            if time0_unreliable_union is not None:
+                del time0_unreliable_union
             if da3_depth is not None:
                 del da3_depth
             if da3_foreground_mask is not None:
@@ -2713,6 +3624,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         all_dense_xyz = []
         all_dense_rgb = []
         all_dense_depth_scale_tags = []
+        all_dense_source_times = []
+        dense_source_time_range = None
 
         for payload in dense_payloads:
             image_name = payload["image_name"]
@@ -2724,6 +3637,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
             depth_base_cuda = payload["depth_base"].cuda(non_blocking=True)
             color_image_cuda = payload["color_image"].cuda(non_blocking=True)
+            source_timestamp_map_cuda = payload[
+                "source_timestamp_map"
+            ].cuda(non_blocking=True)
             added = 0
 
             def append_dense_candidates(selected_pixels, depth_value=None, depth_scale=None):
@@ -2740,6 +3656,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 u = selected_pixels_cuda[:, 0].long()
                 v = selected_pixels_cuda[:, 1].long()
                 rgb = color_image_cuda[:, u, v].permute(1, 0).clamp(0.0, 1.0)
+                source_times = source_timestamp_map_cuda[u, v].reshape(-1, 1)
                 if depth_value is not None:
                     scale_tag_value = float("inf")
                 else:
@@ -2747,8 +3664,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 all_dense_xyz.append(xyz.detach())
                 all_dense_rgb.append(rgb.detach())
                 all_dense_depth_scale_tags.append(torch.full((xyz.shape[0],), scale_tag_value, device=xyz.device, dtype=xyz.dtype))
+                all_dense_source_times.append(source_times.detach())
                 count = int(xyz.shape[0])
-                del selected_pixels_cuda, xyz, rgb
+                del (
+                    selected_pixels_cuda,
+                    xyz,
+                    rgb,
+                    source_times,
+                )
                 return count
 
             selected_depth_values = payload.get("selected_depth_values", {})
@@ -2768,7 +3691,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             payload["pending_added_count"] = int(added)
             if added > 0:
                 camera_events += 1
-            del depth_base_cuda, color_image_cuda
+            del depth_base_cuda, color_image_cuda, source_timestamp_map_cuda
             torch.cuda.empty_cache()
 
         if len(all_dense_xyz) > 0:
@@ -2777,14 +3700,40 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             dense_xyz = torch.cat(all_dense_xyz, dim=0)
             dense_rgb = torch.cat(all_dense_rgb, dim=0)
             dense_depth_scale_tags = torch.cat(all_dense_depth_scale_tags, dim=0)
+            dense_source_times = torch.cat(all_dense_source_times, dim=0)
+            dense_source_time_range = (
+                float(dense_source_times.min().item()),
+                float(dense_source_times.max().item()),
+            )
             total_added = int(gaussians.add_static_background_gaussians_xyz(
                 dense_xyz,
                 dense_rgb,
                 iteration,
                 depth_scale_tags=dense_depth_scale_tags,
+                source_times=dense_source_times,
             ))
-            del dense_xyz, dense_rgb, dense_depth_scale_tags
+            del dense_xyz, dense_rgb, dense_depth_scale_tags, dense_source_times
             torch.cuda.empty_cache()
+
+        if total_added > 0 and dense_source_time_range is not None:
+            single_expert = str(
+                getattr(
+                    gaussians,
+                    "field_existence_single_expert",
+                    "none",
+                )
+            ).strip().lower()
+            time_init_mode = (
+                "source"
+                if single_expert in {"persistent", "interval", "transient"}
+                else "legacy_fixed"
+            )
+            print(
+                "[STEGF] Dense add temporal init: "
+                f"mode={time_init_mode}, single_expert={single_expert}, "
+                f"source_time_min={dense_source_time_range[0]:.6f}, "
+                f"source_time_max={dense_source_time_range[1]:.6f}"
+            )
 
         for payload in dense_payloads:
             image_name = payload["image_name"]
@@ -2812,16 +3761,26 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     beit_stats=payload["beit_stats"],
                     pre_dedup_sample_mask=payload.get("pre_dedup_sample_mask"),
                     dedup_stats=payload.get("dedup_stats"),
+                    source_selection_stats=payload.get("source_selection_stats"),
+                    source_selection_debug=payload.get("source_selection_debug"),
+                    persistent_need_mask=payload.get("persistent_need_mask"),
+                    time0_unreliable_mask=payload.get("time0_unreliable_mask"),
                 )
+            source_counts = (payload.get("source_selection_stats") or {}).get("source_counts", {})
             print(
                 f"[STEGF] Dense add {image_name}: "
                 f"union_pixels={int(payload.get('union_pixels', 0))}, "
                 f"candidate_pixels={int(payload.get('candidate_pixels', 0))}, "
                 f"sample_pixels={int(pixel_indices.shape[0])}, "
                 f"pre_dedup_pixels={int(payload.get('pre_dedup_pixels', int(pixel_indices.shape[0])))}, "
-                f"new_points={int(added)}"
+                f"new_points={int(added)}, source_counts={source_counts}"
             )
-        del all_dense_xyz, all_dense_rgb, all_dense_depth_scale_tags
+        del (
+            all_dense_xyz,
+            all_dense_rgb,
+            all_dense_depth_scale_tags,
+            all_dense_source_times,
+        )
 
         if dense_debug_enabled:
             dense_log_dir = os.path.join(args.model_path, "bg_dense_add_debug")
@@ -2833,6 +3792,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "camera_events": int(camera_events),
                     "time_indices": reference_time_indices,
                     "configured_time_indices": time_indices,
+                    "source_time_select": int(source_time_select),
+                    "source_time_indices": source_time_indices,
                     "depth_base": str(getattr(gaussians, "field_bg_dense_depth_base", "render")),
                     "depth_values": depth_values,
                     "depth_scales": depth_scales,
@@ -3314,13 +4275,133 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     lasterems = 0 
     appearance_only_logged = False
     soft_geometry_lr_logged = False
+    hard_time_loss_ema = {}
+    hard_time_event_count = 0
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    def hard_time_camera_key(time_idx, camera):
+        return (int(time_idx), str(getattr(camera, "image_name", "")))
+
+    def update_hard_time_loss_ema(time_idx, camera, loss_value):
+        if not bool(getattr(gaussians, "field_mvstruct_hard_time", 0)):
+            return
+        if torch.is_tensor(loss_value):
+            value = float(loss_value.detach().float().mean().cpu())
+        else:
+            value = float(loss_value)
+        if not np.isfinite(value):
+            return
+        decay = float(getattr(gaussians, "field_mvstruct_hard_time_ema_decay", 0.05))
+        decay = max(0.0, min(decay, 1.0))
+        key = hard_time_camera_key(time_idx, camera)
+        previous = hard_time_loss_ema.get(key)
+        if previous is None:
+            hard_time_loss_ema[key] = value
+        else:
+            hard_time_loss_ema[key] = (1.0 - decay) * previous + decay * value
+
+    def hard_time_scores_by_time():
+        if len(hard_time_loss_ema) > 0:
+            fallback = float(np.mean(list(hard_time_loss_ema.values())))
+        else:
+            fallback = 1.0
+        scores = []
+        for time_idx in range(duration):
+            values = []
+            for camera in traincamdict.get(time_idx, []):
+                value = hard_time_loss_ema.get(hard_time_camera_key(time_idx, camera))
+                if value is not None and np.isfinite(value):
+                    values.append(float(value))
+            if values:
+                scores.append(max(float(np.mean(values)), 1e-8))
+            else:
+                scores.append(max(fallback, 1e-8))
+        return scores
+
+    def select_hard_time_index():
+        nonlocal hard_time_event_count
+        sampling = str(getattr(gaussians, "field_mvstruct_hard_time_sampling", "alternate")).lower()
+        use_error_sampling = sampling in {"error", "proportional", "loss", "hard"}
+        if sampling == "alternate":
+            use_error_sampling = (hard_time_event_count % 2) == 1
+        hard_time_event_count += 1
+        if not use_error_sampling:
+            return randint(0, duration - 1), "uniform", 0.0
+        scores = hard_time_scores_by_time()
+        weights = np.asarray(scores, dtype=np.float64)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        weights = np.maximum(weights, 1e-8)
+        if float(weights.sum()) <= 0.0:
+            return randint(0, duration - 1), "uniform_fallback", 0.0
+        selected = int(random.choices(range(duration), weights=weights.tolist(), k=1)[0])
+        return selected, "error", float(scores[selected])
+
+    def camera_center_cpu(camera):
+        center = getattr(camera, "camera_center", None)
+        if center is None:
+            return torch.zeros(3, dtype=torch.float32)
+        if torch.is_tensor(center):
+            tensor = center.detach().float().cpu().view(-1)
+        else:
+            tensor = torch.tensor(center, dtype=torch.float32).view(-1)
+        if tensor.numel() < 3:
+            return torch.zeros(3, dtype=torch.float32)
+        return tensor[:3]
+
+    def select_diverse_hard_time_cameras(time_idx, cameras, count):
+        cameras = list(cameras)
+        if count >= len(cameras):
+            return random.sample(cameras, len(cameras))
+        if not bool(getattr(gaussians, "field_mvstruct_hard_time_diverse_views", 1)):
+            return random.sample(cameras, count)
+        seen_cameras = [
+            camera
+            for camera in cameras
+            if hard_time_camera_key(time_idx, camera) in hard_time_loss_ema
+        ]
+        if seen_cameras:
+            seed_camera = max(
+                seen_cameras,
+                key=lambda camera: hard_time_loss_ema.get(hard_time_camera_key(time_idx, camera), 0.0),
+            )
+        else:
+            seed_camera = random.choice(cameras)
+        centers = {id(camera): camera_center_cpu(camera) for camera in cameras}
+        selected = [seed_camera]
+        remaining = [camera for camera in cameras if camera is not seed_camera]
+        while len(selected) < count and remaining:
+            selected_centers = [centers[id(camera)] for camera in selected]
+            best_camera = None
+            best_distance = -1.0
+            for camera in remaining:
+                center = centers[id(camera)]
+                min_distance = min(float(torch.norm(center - selected_center)) for selected_center in selected_centers)
+                if min_distance > best_distance:
+                    best_distance = min_distance
+                    best_camera = camera
+            selected.append(best_camera)
+            remaining = [camera for camera in remaining if camera is not best_camera]
+        return selected
+
+    existence_stats_path = os.path.join(scene.model_path, "existence_moe_stats.jsonl")
+    if first_iter <= 1:
+        with open(existence_stats_path, "w", encoding="utf-8"):
+            pass
+
+    for iteration in range(first_iter, opt.iterations + 1):
         if ems_main_enabled and iteration ==  opt.emsstart:
             flagems = 1 # start ems
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
+        existence_activated = False
+        if hasattr(gaussians, "set_existence_iteration"):
+            existence_activated = gaussians.set_existence_iteration(iteration)
+            if existence_activated:
+                print(
+                    "\n[STEGF] Existence MoE activated at iter "
+                    f"{iteration}: material opacity x "
+                    "(persistent + interval + transient), motion clock frozen."
+                )
         if hasattr(gaussians, "apply_soft_geometry_lr"):
             soft_geometry_lr_active = gaussians.apply_soft_geometry_lr(iteration)
             if soft_geometry_lr_active and not soft_geometry_lr_logged:
@@ -3347,6 +4428,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         if getattr(gaussians, "use_euler_field", False):
             if gaussians.euler_field is not None:
                 gaussians.euler_field.train()
+            if getattr(gaussians, "h2_velocity_field", None) is not None:
+                gaussians.h2_velocity_field.train()
             if getattr(gaussians, "field_router", None) is not None:
                 gaussians.field_router.train()
             if getattr(gaussians, "field_query_gate", None) is not None:
@@ -3354,18 +4437,56 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             if gaussians.field_decoder is not None:
                 gaussians.field_decoder.train()
 
+        hard_mvstruct_stepped = False
         if opt.batch > 1:
             gaussians.zero_gradient_cache()
-            timeindex = randint(0, duration-1) # 0 to 49
+            mvstruct_enabled = bool(getattr(gaussians, "field_mvstruct", 0))
+            mvstruct_start = int(getattr(gaussians, "field_mvstruct_start", 10000))
+            mvstruct_interval = max(int(getattr(gaussians, "field_mvstruct_interval", 50)), 1)
+            if mvstruct_enabled and iteration == mvstruct_start and hasattr(gaussians, "initialize_mvstruct_stats"):
+                gaussians.initialize_mvstruct_stats()
+            mvstruct_event = (
+                mvstruct_enabled
+                and iteration > mvstruct_start
+                and iteration <= int(getattr(gaussians, "field_mvstruct_until", 20000))
+                and (iteration - mvstruct_start) % mvstruct_interval == 0
+            )
+            hard_mvstruct_event = mvstruct_event and bool(getattr(gaussians, "field_mvstruct_hard_time", 0))
+            if hard_mvstruct_event:
+                timeindex, hard_time_mode, hard_time_score = select_hard_time_index()
+            else:
+                timeindex = randint(0, duration-1) # 0 to 49
+                hard_time_mode, hard_time_score = "", 0.0
             viewpointset = traincamdict[timeindex]
-            camindex = random.sample(viewpointset, opt.batch)
+            current_batch = opt.batch
+            if mvstruct_event:
+                current_batch = min(max(int(getattr(gaussians, "field_mvstruct_views", 5)), opt.batch), len(viewpointset))
+                if current_batch < max(int(getattr(gaussians, "field_mvstruct_min_event_views", 3)), 1):
+                    mvstruct_event = False
+                    hard_mvstruct_event = False
+                    current_batch = opt.batch
+            if hard_mvstruct_event:
+                camindex = select_diverse_hard_time_cameras(timeindex, viewpointset, current_batch)
+                if iteration % 500 == 0:
+                    scene.recordpoints(
+                        iteration,
+                        "mvstruct_hard_time_t{}_{}_score{:.4f}".format(
+                            int(timeindex),
+                            hard_time_mode,
+                            float(hard_time_score),
+                        ),
+                    )
+            else:
+                camindex = random.sample(viewpointset, current_batch)
+            if mvstruct_event and hasattr(gaussians, "mvstruct_begin_event"):
+                gaussians.mvstruct_begin_event(expected_views=current_batch)
             static_app_active = (
                 getattr(gaussians, "use_euler_field", False)
                 and (not getattr(gaussians, "field_v23_compat", False))
                 and getattr(gaussians, "field_static_app_scale", 0.0) > 0.0
             )
             shared_time_conditioned = None
-            if not static_app_active:
+            if (not static_app_active) and (not hard_mvstruct_event) and (not mvstruct_event):
                 shared_time_conditioned = gaussians.compose_time_conditioned_attributes(
                     camindex[0].timestamp,
                     rbfbasefunction,
@@ -3374,6 +4495,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             bg_prior_contexts = []
             obs_reset_contexts = []
             bg_only_pixels = 0
+            layer_resp_events = 0
+            layer_resp_pixels = 0
+            layer_resp_far_loss_sum = 0.0
+            layer_resp_front_loss_sum = 0.0
             densify_point_gate = None
             need_highfreq_densify_stats = bool(getattr(gaussians, "field_highfreq_densify", 0)) and (
                 iteration < opt.densify_until_iter
@@ -3383,7 +4508,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 )
             )
 
-            for i in range(opt.batch):
+            for i in range(current_batch):
                 viewpoint_cam = camindex[i]
                 gt_image = get_gt_image(viewpoint_cam)
                 temporal_motion_map = get_temporal_motion_map(timeindex, viewpoint_cam)
@@ -3407,13 +4532,20 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     iteration=iteration,
                 )
                 image, viewspace_point_tensor, visibility_filter, radii = getrenderparts(render_pkg) 
+                means3D_for_mvstruct = render_pkg.get("means3D")
+                if mvstruct_event and torch.is_tensor(means3D_for_mvstruct) and means3D_for_mvstruct.requires_grad:
+                    means3D_for_mvstruct.retain_grad()
                 
                 if opt.gtmask: # for training with undistorted immerisve image, masking black pixels in undistorted image. 
                     mask = torch.sum(gt_image, dim=0) == 0
                     mask = mask.float()
                     image = image * (1- mask) +  gt_image * (mask)
+                content_exposure_params = None
                 if hasattr(gaussians, "apply_content_exposure"):
                     image = gaussians.apply_content_exposure(image)
+                    content_exposure_params = detach_content_exposure_params(
+                        getattr(gaussians, "_last_content_exposure_params", None)
+                    )
                 if hasattr(gaussians, "update_error_prior"):
                     gaussians.update_error_prior(visibility_filter, image, gt_image, viewpoint_cam, render_pkg["means3D"].detach())
 
@@ -3460,6 +4592,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 else:
                     Ll1 = l1_loss(loss_image, gt_image)
                     loss = getloss(opt, Ll1, ssim, loss_image, gt_image, gaussians, radii)
+                update_hard_time_loss_ema(timeindex, viewpoint_cam, Ll1)
                 content_exposure_reg_loss = (
                     gaussians.get_content_exposure_reg_loss()
                     if hasattr(gaussians, "get_content_exposure_reg_loss")
@@ -3467,6 +4600,23 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 )
                 if content_exposure_reg_loss is not None:
                     loss = loss + content_exposure_reg_loss
+                existence_reg_loss = (
+                    gaussians.get_existence_regularization_loss(iteration, rbfbasefunction)
+                    if hasattr(gaussians, "get_existence_regularization_loss")
+                    else None
+                )
+                if existence_reg_loss is not None:
+                    loss = loss + existence_reg_loss
+                h2_motion_reg_loss = (
+                    gaussians.get_h2_motion_regularization_loss()
+                    if hasattr(
+                        gaussians,
+                        "get_h2_motion_regularization_loss",
+                    )
+                    else None
+                )
+                if h2_motion_reg_loss is not None:
+                    loss = loss + h2_motion_reg_loss
                 bg_prior_loss = get_background_prior_loss(viewpoint_cam, image, gt_image)
                 if bg_prior_loss is not None:
                     loss = loss + bg_prior_loss
@@ -3494,6 +4644,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 freq_prior_loss = get_frequency_prior_loss(iteration, viewpoint_cam, image, gt_image, unreliable_mask)
                 if freq_prior_loss is not None:
                     loss = loss + freq_prior_loss
+                if mvstruct_event:
+                    mvstruct_dssim_weight = float(getattr(gaussians, "field_mvstruct_dssim_weight", 0.0))
+                    if mvstruct_dssim_weight > 0.0:
+                        loss = loss + mvstruct_dssim_weight * 0.5 * (1.0 - ssim(loss_image, gt_image))
 
                 if need_highfreq_densify_stats:
                     densify_point_gate = compute_highfreq_densify_gate(
@@ -3509,8 +4663,22 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         lossdiect[viewpoint_cam.image_name] = loss.item()
                         ssimdict[viewpoint_cam.image_name] = ssim(image.clone().detach(), gt_image.clone().detach()).item()
                 
-                retain_graph = i < (opt.batch - 1)
+                retain_graph = (not hard_mvstruct_event) and i < (current_batch - 1)
                 loss.backward(retain_graph=retain_graph)
+                if mvstruct_event and hasattr(gaussians, "mvstruct_capture_view"):
+                    feature_dc_grad = getattr(gaussians, "_features_dc", None)
+                    feature_dc_grad = feature_dc_grad.grad.detach().clone() if feature_dc_grad is not None and feature_dc_grad.grad is not None else None
+                    position_grad = None
+                    means3D_for_mvstruct = render_pkg.get("means3D")
+                    if torch.is_tensor(means3D_for_mvstruct) and means3D_for_mvstruct.grad is not None:
+                        position_grad = means3D_for_mvstruct.grad.detach().clone()
+                    gaussians.mvstruct_capture_view(
+                        viewspace_point_tensor.grad.detach() if viewspace_point_tensor.grad is not None else None,
+                        visibility_filter.detach(),
+                        radii.detach(),
+                        feature_dc_grad=feature_dc_grad,
+                        position_grad=position_grad,
+                    )
                 if hasattr(gaussians, "update_dynamic_scores"):
                     gaussians.update_dynamic_scores(
                         visibility_filter,
@@ -3541,6 +4709,42 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     gaussians.cache_gradient()
                     gaussians.optimizer.zero_grad(set_to_none=True)
                     bg_only_pixels += int(bg_only_pixel_count)
+                if i == 0 and not hard_mvstruct_event:
+                    layer_resp_stats = apply_layer_responsibility_losses(
+                        iteration,
+                        timeindex,
+                        viewpoint_cam,
+                        gt_image,
+                        temporal_motion_map,
+                        batch_scale=current_batch,
+                        normal_image=image.detach(),
+                        content_exposure_params=content_exposure_params,
+                    )
+                    if layer_resp_stats is not None:
+                        if int(layer_resp_stats.get("pixels", 0)) > 0:
+                            layer_resp_events += 1
+                            layer_resp_pixels += int(layer_resp_stats.get("pixels", 0))
+                            layer_resp_far_loss_sum += float(layer_resp_stats.get("far_loss", 0.0))
+                            layer_resp_front_loss_sum += float(layer_resp_stats.get("front_loss", 0.0))
+                        elif iteration % 500 == 0:
+                            scene.recordpoints(
+                                iteration,
+                                "layer_resp_skip_" + str(layer_resp_stats.get("reason", "unknown")),
+                            )
+                if hard_mvstruct_event:
+                    gaussians.set_batch_gradient(1)
+                    if hasattr(gaussians, "apply_appearance_only_gradients"):
+                        appearance_only_active = gaussians.apply_appearance_only_gradients(iteration)
+                        if appearance_only_active and not appearance_only_logged:
+                            print(
+                                "\n[STEGF] Appearance-only optimization active at iter "
+                                f"{iteration}: allow={getattr(gaussians, 'field_appearance_only_allow', '')}"
+                            )
+                            appearance_only_logged = True
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none=True)
+                    gaussians.zero_gradient_cache()
+                    hard_mvstruct_stepped = True
 
             if ems_main_enabled and flagems == 1 and len(lossdiect.keys()) == len(viewpointset):
                 # sort dict by value
@@ -3563,9 +4767,44 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 selectedlength = len(selectviews)
 
             iter_end.record()
-            gaussians.set_batch_gradient(opt.batch)
+            if mvstruct_event and hasattr(gaussians, "mvstruct_commit_event"):
+                gaussians.mvstruct_commit_event(
+                    min_event_views=int(getattr(gaussians, "field_mvstruct_min_event_views", 3))
+                )
+            if not hard_mvstruct_event:
+                gaussians.set_batch_gradient(current_batch)
             if bg_only_pixels > 0 and iteration % 100 == 0:
                 scene.recordpoints(iteration, "bg_only_pixels_" + str(bg_only_pixels))
+            if layer_resp_events > 0 and iteration % 100 == 0:
+                scene.recordpoints(
+                    iteration,
+                    "layer_resp_px{}_far{:.5f}_front{:.5f}".format(
+                        int(layer_resp_pixels),
+                        layer_resp_far_loss_sum / max(layer_resp_events, 1),
+                        layer_resp_front_loss_sum / max(layer_resp_events, 1),
+                    ),
+                )
+            if iteration % 500 == 0 and hasattr(gaussians, "get_h2_motion_stats"):
+                h2_stats = gaussians.get_h2_motion_stats()
+                if h2_stats:
+                    scene.recordpoints(
+                        iteration,
+                        "h2_venergy{:.6g}_disp_mean{:.6g}_disp_max{:.6g}".format(
+                            h2_stats.get("normalized_velocity_energy", 0.0),
+                            h2_stats.get("displacement_mean", 0.0),
+                            h2_stats.get("displacement_max", 0.0),
+                        ),
+                    )
+            if iteration % 500 == 0 and hasattr(gaussians, "get_carrier_motion_stats"):
+                carrier_stats = gaussians.get_carrier_motion_stats()
+                if carrier_stats:
+                    scene.recordpoints(
+                        iteration,
+                        "carrier_fb{fallback_points:.0f}_c{carrier_points:.0f}_"
+                        "h0{h0_points:.0f}_h1{h1_points:.0f}_h2{h2_points:.0f}_"
+                        "clamp{clamped_points:.0f}_disp_mean{displacement_mean:.6g}_"
+                        "disp_max{displacement_max:.6g}".format(**carrier_stats),
+                    )
              # note we retrieve the correct gradient except the mask
         else:
             raise NotImplementedError("Batch size 1 is not supported")
@@ -3573,11 +4812,18 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
+            if iteration % 10 == 0 or iteration == opt.iterations:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
+                progress_bar.update(max(iteration - progress_bar.n, 0))
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            if iteration == opt.iterations and hasattr(gaussians, "get_existence_stats"):
+                final_existence_stats = gaussians.get_existence_stats(iteration)
+                if final_existence_stats:
+                    final_existence_stats["iteration"] = int(iteration)
+                    with open(existence_stats_path, "a", encoding="utf-8") as stats_file:
+                        stats_file.write(json.dumps(final_existence_stats, sort_keys=True) + "\n")
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -3747,16 +4993,45 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 
             # Optimizer step
             if iteration < opt.iterations:
-                if hasattr(gaussians, "apply_appearance_only_gradients"):
-                    appearance_only_active = gaussians.apply_appearance_only_gradients(iteration)
-                    if appearance_only_active and not appearance_only_logged:
-                        print(
-                            "\n[STEGF] Appearance-only optimization active at iter "
-                            f"{iteration}: allow={getattr(gaussians, 'field_appearance_only_allow', '')}"
-                        )
-                        appearance_only_logged = True
-                gaussians.optimizer.step()
+                if not hard_mvstruct_stepped:
+                    if hasattr(gaussians, "apply_appearance_only_gradients"):
+                        appearance_only_active = gaussians.apply_appearance_only_gradients(iteration)
+                        if appearance_only_active and not appearance_only_logged:
+                            print(
+                                "\n[STEGF] Appearance-only optimization active at iter "
+                                f"{iteration}: allow={getattr(gaussians, 'field_appearance_only_allow', '')}"
+                            )
+                            appearance_only_logged = True
+                    gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
+                existence_log_interval = max(
+                    int(getattr(gaussians, "field_existence_log_interval", 500)),
+                    1,
+                )
+                if (
+                    hasattr(gaussians, "get_existence_stats")
+                    and (
+                        existence_activated
+                        or iteration % existence_log_interval == 0
+                        or iteration == opt.iterations
+                    )
+                ):
+                    existence_stats = gaussians.get_existence_stats(iteration)
+                    if existence_stats:
+                        existence_stats["iteration"] = int(iteration)
+                        with open(existence_stats_path, "a", encoding="utf-8") as stats_file:
+                            stats_file.write(json.dumps(existence_stats, sort_keys=True) + "\n")
+                        scene.recordpoints(
+                            iteration,
+                            "existence_p{:.3f}_i{:.3f}_t{:.3f}_hard{:.3f}_{:.3f}_{:.3f}".format(
+                                existence_stats["persistent_weighted"],
+                                existence_stats["interval_weighted"],
+                                existence_stats["transient_weighted"],
+                                existence_stats["persistent_hard"],
+                                existence_stats["interval_hard"],
+                                existence_stats["transient_hard"],
+                            ),
+                        )
                 obs_reset_count = 0
                 bg_added = 0
                 if bool(getattr(gaussians, "field_obs_reset", 0)):
@@ -3854,6 +5129,80 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     bg_pruned = gaussians.prune_mature_background_candidates(iteration)
                     if bg_pruned > 0:
                         scene.recordpoints(iteration, "bg_prior_prune_" + str(bg_pruned))
+                if hasattr(gaussians, "densify_mvstruct_budgeted"):
+                    mvstruct_stats = gaussians.densify_mvstruct_budgeted(
+                        iteration,
+                        scene.cameras_extent,
+                    )
+                    if isinstance(mvstruct_stats, dict) and int(mvstruct_stats.get("due", 0)) > 0:
+                        scene.recordpoints(
+                            iteration,
+                            (
+                                "mvstruct_densify_elig{}_base{}_recentrej{}_recentwould{}_sel{}"
+                                "_ovelig{}_ovsel{}_ovr50{:.1f}_ovr90{:.1f}_ovrmax{:.1f}_normsel{}"
+                                "_confelig{}_confsel{}_confb{}_confs50{:.3e}_confs90{:.3e}_confsmax{:.3e}"
+                                "_confe50{:.1f}_confe90{:.1f}_confr50{:.1f}_confr90{:.1f}"
+                                "_specelig{}_specsel{}_specfb{}_axis50{:.3f}_axis90{:.3f}"
+                                "_axev50{:.1f}_axev90{:.1f}_spr50{:.1f}_spr90{:.1f}"
+                                "_direlig{}_dirsel{}_dirfb{}_dirsig50{:.3e}_dirsig90{:.3e}"
+                                "_scr50{:.1f}_scr90{:.1f}_fdn{:.3f}_off{:.2f}_sscale{:.2f}"
+                                "_candc{}_cands{}_c{}_s{}_net{}_total{}_eb{}_rb{}"
+                                "_p50{:.3e}_p90{:.3e}_p99{:.3e}_pmax{:.3e}"
+                            ).format(
+                                int(mvstruct_stats.get("eligible", 0)),
+                                int(mvstruct_stats.get("base_eligible", 0)),
+                                int(mvstruct_stats.get("recent_child_rejected", 0)),
+                                int(mvstruct_stats.get("recent_would_select", 0)),
+                                int(mvstruct_stats.get("selected", 0)),
+                                int(mvstruct_stats.get("oversize_eligible", 0)),
+                                int(mvstruct_stats.get("oversize_selected", 0)),
+                                float(mvstruct_stats.get("oversize_radius_p50", 0.0)),
+                                float(mvstruct_stats.get("oversize_radius_p90", 0.0)),
+                                float(mvstruct_stats.get("oversize_radius_max", 0.0)),
+                                int(mvstruct_stats.get("normal_selected", 0)),
+                                int(mvstruct_stats.get("conflict_eligible", 0)),
+                                int(mvstruct_stats.get("conflict_selected", 0)),
+                                int(mvstruct_stats.get("conflict_budget", 0)),
+                                float(mvstruct_stats.get("conflict_score_p50", 0.0)),
+                                float(mvstruct_stats.get("conflict_score_p90", 0.0)),
+                                float(mvstruct_stats.get("conflict_score_max", 0.0)),
+                                float(mvstruct_stats.get("conflict_event_count_p50", 0.0)),
+                                float(mvstruct_stats.get("conflict_event_count_p90", 0.0)),
+                                float(mvstruct_stats.get("conflict_selected_radius_p50", 0.0)),
+                                float(mvstruct_stats.get("conflict_selected_radius_p90", 0.0)),
+                                int(mvstruct_stats.get("specialize_eligible", 0)),
+                                int(mvstruct_stats.get("specialize_selected", 0)),
+                                int(mvstruct_stats.get("specialize_fallback", 0)),
+                                float(mvstruct_stats.get("axis_ratio_p50", 0.0)),
+                                float(mvstruct_stats.get("axis_ratio_p90", 0.0)),
+                                float(mvstruct_stats.get("axis_event_count_p50", 0.0)),
+                                float(mvstruct_stats.get("axis_event_count_p90", 0.0)),
+                                float(mvstruct_stats.get("parent_radius_p50", 0.0)),
+                                float(mvstruct_stats.get("parent_radius_p90", 0.0)),
+                                int(mvstruct_stats.get("directional_eligible", 0)),
+                                int(mvstruct_stats.get("directional_selected", 0)),
+                                int(mvstruct_stats.get("directional_fallback", 0)),
+                                float(mvstruct_stats.get("directional_sigma_p50", 0.0)),
+                                float(mvstruct_stats.get("directional_sigma_p90", 0.0)),
+                                float(mvstruct_stats.get("estimated_child_radius_p50", 0.0)),
+                                float(mvstruct_stats.get("estimated_child_radius_p90", 0.0)),
+                                float(mvstruct_stats.get("feature_delta_norm", 0.0)),
+                                float(mvstruct_stats.get("child_offset_ratio", 0.0)),
+                                float(mvstruct_stats.get("specialize_scale_ratio", 0.0)),
+                                int(mvstruct_stats.get("clone_candidates", 0)),
+                                int(mvstruct_stats.get("split_candidates", 0)),
+                                int(mvstruct_stats.get("cloned", 0)),
+                                int(mvstruct_stats.get("split_parents", 0)),
+                                int(mvstruct_stats.get("net_points", 0)),
+                                int(mvstruct_stats.get("total_added", 0)),
+                                int(mvstruct_stats.get("event_budget", 0)),
+                                int(mvstruct_stats.get("remaining_budget", 0)),
+                                float(mvstruct_stats.get("score_p50", 0.0)),
+                                float(mvstruct_stats.get("score_p90", 0.0)),
+                                float(mvstruct_stats.get("score_p99", 0.0)),
+                                float(mvstruct_stats.get("score_max", 0.0)),
+                            ),
+                        )
                 
                 gaussians.optimizer.zero_grad(set_to_none = True)
 

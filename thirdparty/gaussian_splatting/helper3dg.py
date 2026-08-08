@@ -35,6 +35,119 @@ def _truthy(value):
     return bool(value)
 
 
+def _normalize_existence_mode(args):
+    mode = str(
+        getattr(args, "field_existence_single_expert", "none")
+    ).strip().lower()
+    aliases = {
+        "": "none",
+        "off": "none",
+        "legacy": "none",
+        "p": "persistent",
+        "i": "interval",
+        "t": "transient",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"none", "persistent", "interval", "transient"}:
+        raise ValueError(
+            "field_existence_single_expert must be one of "
+            "none/persistent/interval/transient, got {!r}".format(mode)
+        )
+    args.field_existence_single_expert = mode
+    if mode != "none":
+        carrier_motion = str(
+            getattr(args, "field_motion_model", "polynomial")
+        ).strip().lower()
+        if (
+            carrier_motion == "carrier_hybrid"
+            and _truthy(getattr(args, "field_carrier_initialization", 0))
+            and _truthy(getattr(args, "field_existence_moe", 0))
+        ):
+            raise ValueError(
+                "carrier_hybrid motion requires field_existence_moe=0; "
+                "it cannot be combined with existence MoE routing"
+            )
+        args.field_existence_moe = 0
+    return args
+
+
+def _normalize_motion_model(args):
+    mode = str(getattr(args, "field_motion_model", "polynomial")).strip().lower()
+    aliases = {
+        "": "polynomial",
+        "none": "polynomial",
+        "off": "polynomial",
+        "poly": "polynomial",
+        "legacy": "polynomial",
+        "h1": "polynomial",
+        "shared": "h2",
+        "shared_field": "h2",
+        "h2_only": "h2",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"polynomial", "h2", "carrier_hybrid"}:
+        raise ValueError(
+            "field_motion_model must be polynomial, h2, or carrier_hybrid, got {!r}".format(
+                mode
+            )
+        )
+    args.field_motion_model = mode
+    carrier_initialization = _truthy(
+        getattr(args, "field_carrier_initialization", 0)
+    )
+    if carrier_initialization and mode != "carrier_hybrid":
+        raise ValueError(
+            "field_carrier_initialization=1 requires "
+            "field_motion_model=carrier_hybrid"
+        )
+    if mode == "h2":
+        if not _truthy(getattr(args, "use_euler_field", 0)):
+            raise ValueError("H2 motion requires use_euler_field=1")
+        if getattr(args, "field_existence_single_expert", "none") != "transient":
+            raise ValueError(
+                "S1.10.24-A H2-only motion requires "
+                "field_existence_single_expert=transient"
+            )
+    elif mode == "carrier_hybrid":
+        if not carrier_initialization:
+            raise ValueError(
+                "carrier_hybrid motion requires field_carrier_initialization=1"
+            )
+        if getattr(args, "field_existence_single_expert", "none") != "persistent":
+            raise ValueError(
+                "carrier_hybrid motion requires "
+                "field_existence_single_expert=persistent"
+            )
+        if _truthy(getattr(args, "field_existence_moe", 0)):
+            raise ValueError("carrier_hybrid motion requires field_existence_moe=0")
+        if int(getattr(args, "preprocesspoints", -1)) != 0:
+            raise ValueError("carrier_hybrid motion requires preprocesspoints=0")
+        supported_schemas = {
+            "stegf_colmap_carrier_initialization_map_v2",
+            "stegf_colmap_high_confidence_carrier_initialization_map_v1",
+        }
+        schema = str(
+            getattr(args, "field_carrier_initialization_schema", "")
+        ).strip()
+        if schema not in supported_schemas:
+            raise ValueError(
+                "carrier_hybrid motion requires a supported Carrier "
+                f"initialization schema, got {schema!r}"
+            )
+        if schema == "stegf_colmap_high_confidence_carrier_initialization_map_v1":
+            if _truthy(getattr(args, "field_bg_dense_add", 0)):
+                raise ValueError(
+                    "S2.0.1-noadd requires field_bg_dense_add=0"
+                )
+            if _truthy(getattr(args, "field_bg_prior", 0)):
+                raise ValueError("S2.0.1-noadd requires field_bg_prior=0")
+            if not _truthy(getattr(args, "field_disable_ems_main", 0)):
+                raise ValueError(
+                    "S2.0.1-noadd requires field_disable_ems_main=1"
+                )
+    return args
+
+
 def _format_summary_value(value):
     if isinstance(value, (list, tuple)):
         return "[" + ",".join(str(item) for item in value) + "]"
@@ -55,6 +168,43 @@ def _format_labeled_items(values, items):
         if key in values:
             parts.append(f"{label}={_format_summary_value(values[key])}")
     return ", ".join(parts)
+
+
+def _print_compact_args_summary(args, title):
+    values = vars(args)
+    source_path = os.path.normpath(str(values.get("source_path", "")))
+    scene_name = os.path.basename(os.path.dirname(source_path)) or "unknown"
+    version = str(values.get("stegf_version", "unversioned"))
+    run_items = [
+        f"version={version}",
+        f"scene={scene_name}",
+        f"model={values.get('model', 'unknown')}",
+    ]
+    for label, key in (
+        ("iterations", "iterations"),
+        ("duration", "duration"),
+        ("resolution", "resolution"),
+        ("batch", "batch"),
+    ):
+        if key in values:
+            run_items.append(f"{label}={values[key]}")
+    print(f"[STEGF] {title}: " + ", ".join(run_items))
+
+    carrier_enabled = _truthy(values.get("field_carrier_initialization", 0))
+    carrier_schema = str(values.get("field_carrier_initialization_schema", ""))
+    if carrier_schema == "stegf_colmap_high_confidence_carrier_initialization_map_v1":
+        init_mode = "carrier_noadd_v1"
+    else:
+        init_mode = "carrier_v2" if carrier_enabled else "colmap_points"
+    temporal_items = [
+        f"init={init_mode}",
+        f"existence={values.get('field_existence_single_expert', 'none')}",
+        f"motion={values.get('field_motion_model', 'polynomial')}",
+    ]
+    if carrier_enabled:
+        temporal_items.append("extrapolation=endpoint_clamped")
+    print("[STEGF] Spatiotemporal model: " + ", ".join(temporal_items))
+    print(f"[STEGF] Output: {values.get('model_path', '')}")
 
 
 def _print_args_summary(args, title):
@@ -81,6 +231,43 @@ def _print_args_summary(args, title):
 
     active_modules = []
     disabled_modules = []
+    if _truthy(values.get("field_carrier_initialization", 0)):
+        active_modules.append(
+            "carrier_init("
+            + _format_labeled_items(
+                values,
+                [
+                    ("mode", "field_motion_model"),
+                    ("path", "field_carrier_initialization_path"),
+                    ("schema", "field_carrier_initialization_schema"),
+                    ("existence", "field_existence_single_expert"),
+                ],
+            )
+            + ", extrapolation=endpoint_clamped)"
+        )
+    else:
+        disabled_modules.append("carrier_init")
+    if str(values.get("field_motion_model", "polynomial")).lower() == "h2":
+        active_modules.append(
+            "motion_h2("
+            + _format_labeled_items(
+                values,
+                [
+                    ("grids", "field_h2_level_resolutions"),
+                    ("feature", "field_h2_feature_dim"),
+                    ("hidden", "field_h2_hidden_dim"),
+                    ("fourier", "field_h2_fourier_degree"),
+                    ("max_speed", "field_h2_max_normalized_speed"),
+                    ("steps", "field_h2_integration_steps"),
+                    ("method", "field_h2_integration_method"),
+                    ("reg", "field_h2_velocity_reg_weight"),
+                    ("lr", "field_h2_lr"),
+                ],
+            )
+            + ")"
+        )
+    else:
+        disabled_modules.append("motion_h2")
     if _truthy(values.get("field_bg_dense_add", 0)):
         scale_init = str(values.get("field_bg_prior_scale_init", "")).lower()
         bg_dense_items = [
@@ -96,6 +283,12 @@ def _print_args_summary(args, title):
             ("clip_bbox", "field_bg_dense_clip_to_bbox"),
             ("scale_init", "field_bg_prior_scale_init"),
         ]
+        if _truthy(values.get("field_bg_dense_source_time_select", 0)):
+            bg_dense_items.extend([
+                ("source_times", "field_bg_dense_source_time_select"),
+                ("src_support", "field_bg_dense_source_min_support"),
+                ("src_bg", "field_bg_dense_source_beit_background_threshold"),
+            ])
         if scale_init in ("hybrid_far_knn", "hybrid_knn", "fixed_near_knn_far"):
             bg_dense_items.extend([
                 ("hybrid_threshold", "field_bg_prior_hybrid_knn_scale_threshold"),
@@ -167,6 +360,119 @@ def _print_args_summary(args, title):
     elif "field_highfreq_densify" in values:
         disabled_modules.append("highfreq_densify")
 
+    single_expert = str(
+        values.get("field_existence_single_expert", "none")
+    ).strip().lower()
+    if single_expert in {"persistent", "interval", "transient"}:
+        items = [("mode", "field_existence_single_expert")]
+        if single_expert == "interval":
+            items.extend(
+                [
+                    ("interval_half", "field_existence_interval_init_half_width"),
+                    ("interval_max", "field_existence_interval_max_half_width"),
+                    ("interval_tau", "field_existence_interval_transition"),
+                    ("center_lr", "field_interval_center_lr"),
+                    ("width_lr", "field_interval_width_lr"),
+                ]
+            )
+        elif single_expert == "transient":
+            items.extend(
+                [
+                    ("center_lr", "trbfc_lr"),
+                    ("scale_lr", "trbfs_lr"),
+                ]
+            )
+        active_modules.append(
+            "existence_single("
+            + _format_labeled_items(values, items)
+            + (
+                ", motion_anchor=decoupled"
+                if single_expert == "transient"
+                else ""
+            )
+            + ")"
+        )
+    elif _truthy(values.get("field_existence_moe", 0)):
+        active_modules.append(
+            "existence_moe("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_existence_start"),
+                    ("temp", "field_existence_temperature_start"),
+                    ("temp_end", "field_existence_temperature_end"),
+                    ("temp_until", "field_existence_temperature_until"),
+                    ("router_init", "field_existence_router_init"),
+                    ("interval_half", "field_existence_interval_init_half_width"),
+                    ("interval_max", "field_existence_interval_max_half_width"),
+                    ("interval_tau", "field_existence_interval_transition"),
+                    ("transient_budget", "field_existence_transient_budget"),
+                    ("budget_w", "field_existence_budget_weight"),
+                    ("transient_width", "field_existence_transient_width_limit"),
+                    ("width_route_w", "field_existence_width_route_weight"),
+                    ("entropy_w", "field_existence_entropy_weight"),
+                    ("coverage_w", "field_existence_coverage_weight"),
+                    ("router_lr", "field_existence_lr"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_existence_moe" in values:
+        disabled_modules.append("existence_moe")
+
+    if _truthy(values.get("field_mvstruct", 0)):
+        active_modules.append(
+            "mvstruct("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_mvstruct_start"),
+                    ("until", "field_mvstruct_until"),
+                    ("interval", "field_mvstruct_interval"),
+                    ("views", "field_mvstruct_views"),
+                    ("min_event_views", "field_mvstruct_min_event_views"),
+                    ("dssim_w", "field_mvstruct_dssim_weight"),
+                    ("densify", "field_mvstruct_densify"),
+                    ("densify_start", "field_mvstruct_densify_start"),
+                    ("densify_interval", "field_mvstruct_densify_interval"),
+                    ("grad_thr", "field_mvstruct_grad_threshold"),
+                    ("min_obs", "field_mvstruct_min_observations"),
+                    ("vis_ratio", "field_mvstruct_min_visibility_ratio"),
+                    ("event_max", "field_mvstruct_event_max_ratio"),
+                    ("total_max", "field_mvstruct_total_max_ratio"),
+                    ("cooldown", "field_mvstruct_cooldown"),
+                    ("oversize", "field_mvstruct_oversize_split"),
+                    ("oversize_radius", "field_mvstruct_oversize_radius"),
+                    ("oversize_budget", "field_mvstruct_oversize_budget_ratio"),
+                    ("hard_time", "field_mvstruct_hard_time"),
+                    ("hard_ema", "field_mvstruct_hard_time_ema_decay"),
+                    ("hard_sampling", "field_mvstruct_hard_time_sampling"),
+                    ("hard_diverse", "field_mvstruct_hard_time_diverse_views"),
+                    ("conflict", "field_mvstruct_conflict_split"),
+                    ("conf_src", "field_mvstruct_conflict_source"),
+                    ("conf_thr", "field_mvstruct_conflict_threshold"),
+                    ("conf_events", "field_mvstruct_conflict_min_events"),
+                    ("conf_budget", "field_mvstruct_conflict_budget_ratio"),
+                    ("conf_radius", "field_mvstruct_conflict_min_radius"),
+                    ("conf_children", "field_mvstruct_conflict_children"),
+                    ("conf_specialize", "field_mvstruct_conflict_specialize"),
+                    ("conf_dirsplit", "field_mvstruct_conflict_directional_split"),
+                    ("dir_events", "field_mvstruct_directional_min_events"),
+                    ("dir_axis", "field_mvstruct_directional_min_axis_ratio"),
+                    ("dir_offset", "field_mvstruct_directional_offset_ratio"),
+                    ("spec_events", "field_mvstruct_specialize_min_events"),
+                    ("spec_axis", "field_mvstruct_specialize_axis_ratio"),
+                    ("spec_radius", "field_mvstruct_specialize_min_radius"),
+                    ("spec_delta", "field_mvstruct_specialize_feature_delta"),
+                    ("spec_offset", "field_mvstruct_specialize_offset_ratio"),
+                    ("spec_scale", "field_mvstruct_specialize_scale_ratio"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_mvstruct" in values:
+        disabled_modules.append("mvstruct")
+
     if _truthy(values.get("field_appearance_only_train", 0)):
         active_modules.append(
             "appearance_only("
@@ -197,6 +503,30 @@ def _print_args_summary(args, title):
         )
     elif "field_soft_geometry_lr" in values:
         disabled_modules.append("soft_geometry_lr")
+
+    if _truthy(values.get("field_layer_responsibility", 0)):
+        active_modules.append(
+            "layer_resp("
+            + _format_labeled_items(
+                values,
+                [
+                    ("start", "field_layer_responsibility_start"),
+                    ("until", "field_layer_responsibility_until"),
+                    ("interval", "field_layer_responsibility_interval"),
+                    ("near_z", "field_layer_near_depth"),
+                    ("far_z", "field_layer_far_depth"),
+                    ("far_w", "field_layer_far_loss_weight"),
+                    ("front_w", "field_layer_front_opacity_weight"),
+                    ("front_tau", "field_layer_front_opacity_budget"),
+                    ("erode", "field_layer_mask_erode"),
+                    ("min_px", "field_layer_min_pixels"),
+                    ("debug", "field_layer_debug"),
+                ],
+            )
+            + ")"
+        )
+    elif "field_layer_responsibility" in values:
+        disabled_modules.append("layer_resp")
 
     if _truthy(values.get("field_content_exposure", 0)):
         active_modules.append(
@@ -296,7 +626,10 @@ def getparser():
 
     # 3. Load config if provided
     if os.path.exists(args.configpath) and args.configpath != "None":
-        print("Overriding from config:", args.configpath)
+        if args.quiet:
+            print("[STEGF] Config:", args.configpath)
+        else:
+            print("Overriding from config:", args.configpath)
         with open(args.configpath) as f:
             config = json.load(f)
 
@@ -313,10 +646,16 @@ def getparser():
             else:
                 print(f"Unknown config key '{k}', skipping.")
 
-        print("Finished loading config.")
+        if not args.quiet:
+            print("Finished loading config.")
 
-    _print_args_summary(args, "Training")
-    print("Optimizing", args.model_path)
+    args = _normalize_existence_mode(args)
+    args = _normalize_motion_model(args)
+    if args.quiet:
+        _print_compact_args_summary(args, "Training")
+    else:
+        _print_args_summary(args, "Training")
+        print("Optimizing", args.model_path)
 
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
@@ -372,7 +711,15 @@ def gettestparse():
                 print(f"Keeping command line value for '{k}'")
 
         print("finish load config from " + args.configpath)
-        _print_args_summary(args, "Testing")
+        args = _normalize_existence_mode(args)
+        args = _normalize_motion_model(args)
+        if args.quiet:
+            _print_compact_args_summary(args, "Testing")
+        else:
+            _print_args_summary(args, "Testing")
+    else:
+        args = _normalize_existence_mode(args)
+        args = _normalize_motion_model(args)
 
     return args, model.extract(args), pipeline.extract(args), multiview
     

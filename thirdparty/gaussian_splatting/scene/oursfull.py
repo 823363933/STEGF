@@ -9,6 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import math
+import json
+import sys
 
 import torch
 import numpy as np
@@ -23,7 +25,17 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, update_quaternion
 from utils.graphics_utils import geom_transform_points
 from helper_model import getcolormodel, interpolate_point, interpolate_partuse, interpolate_pointv3
-from scene.euler_field import EulerField, EulerLevelRouter, EulerQueryFusionGate, EulerResidualDecoder
+from scene.euler_field import (
+    EulerField,
+    EulerLevelRouter,
+    EulerQueryFusionGate,
+    EulerResidualDecoder,
+    EulerVelocityField,
+)
+
+
+def _init_status(message):
+    print(f"[STEGF][Init][Gaussians] {message}", file=sys.stderr, flush=True)
 
 
 class ContentExposureHead(nn.Module):
@@ -67,6 +79,269 @@ class ContentExposureHead(nn.Module):
             "delta_r": delta_r,
             "delta_b": delta_b,
         }
+
+
+class CarrierMotionBank(nn.Module):
+    """Fixed Carrier identities with trainable, support-bounded motion."""
+
+    def __init__(
+        self,
+        carrier_role,
+        carrier_cohort_id,
+        carrier_anchor_time,
+        carrier_support_start,
+        carrier_support_end,
+        h1_motion,
+        h2_residual_motion,
+        cohort_anchor_time,
+        cohort_support_start,
+        cohort_support_end,
+        h2_shared_motion,
+    ):
+        super().__init__()
+        self.register_buffer("carrier_role", carrier_role.to(dtype=torch.int8))
+        self.register_buffer(
+            "carrier_cohort_id", carrier_cohort_id.to(dtype=torch.long)
+        )
+        self.register_buffer(
+            "carrier_anchor_time", carrier_anchor_time.reshape(-1, 1)
+        )
+        self.register_buffer(
+            "carrier_support_start", carrier_support_start.reshape(-1, 1)
+        )
+        self.register_buffer(
+            "carrier_support_end", carrier_support_end.reshape(-1, 1)
+        )
+        self.register_buffer(
+            "cohort_anchor_time", cohort_anchor_time.reshape(-1, 1)
+        )
+        self.register_buffer(
+            "cohort_support_start", cohort_support_start.reshape(-1, 1)
+        )
+        self.register_buffer(
+            "cohort_support_end", cohort_support_end.reshape(-1, 1)
+        )
+        self.h1_motion = nn.Parameter(h1_motion.reshape(-1, 3, 3))
+        self.h2_residual_motion = nn.Parameter(
+            h2_residual_motion.reshape(-1, 3, 3)
+        )
+        self.h2_shared_motion = nn.Parameter(
+            h2_shared_motion.reshape(-1, 3, 3)
+        )
+        self._validate_layout()
+        # Roles are immutable. Cache these branch decisions once so the hot
+        # render path does not synchronize CUDA merely to ask whether an H1 or
+        # H2 row exists.
+        role_cpu = self.carrier_role.detach().cpu()
+        self.has_h1 = bool(torch.any(role_cpu == 3))
+        self.has_h2 = bool(torch.any(role_cpu == 4))
+
+    @property
+    def carrier_count(self):
+        return int(self.carrier_role.shape[0])
+
+    @property
+    def cohort_count(self):
+        return int(self.cohort_anchor_time.shape[0])
+
+    def _validate_layout(self):
+        count = self.carrier_count
+        for name in (
+            "carrier_cohort_id",
+            "carrier_anchor_time",
+            "carrier_support_start",
+            "carrier_support_end",
+            "h1_motion",
+            "h2_residual_motion",
+        ):
+            value = getattr(self, name)
+            if value.shape[0] != count:
+                raise ValueError(
+                    f"CarrierMotionBank {name} has {value.shape[0]} rows, "
+                    f"expected {count}"
+                )
+        cohort_count = self.cohort_count
+        for name in (
+            "cohort_support_start",
+            "cohort_support_end",
+            "h2_shared_motion",
+        ):
+            value = getattr(self, name)
+            if value.shape[0] != cohort_count:
+                raise ValueError(
+                    f"CarrierMotionBank {name} has {value.shape[0]} rows, "
+                    f"expected {cohort_count}"
+                )
+        if torch.any(self.carrier_support_start > self.carrier_support_end):
+            raise ValueError("Carrier support start exceeds support end")
+        if torch.any(self.cohort_support_start > self.cohort_support_end):
+            raise ValueError("Cohort support start exceeds support end")
+        valid_roles = (
+            (self.carrier_role == 2)
+            | (self.carrier_role == 3)
+            | (self.carrier_role == 4)
+        )
+        if not bool(torch.all(valid_roles)):
+            raise ValueError("CarrierMotionBank roles must be H0/H1/H2 (2/3/4)")
+        h2 = self.carrier_role == 4
+        if bool(torch.any(h2)):
+            cohort_ids = self.carrier_cohort_id[h2]
+            if torch.any(cohort_ids < 0) or torch.any(cohort_ids >= cohort_count):
+                raise ValueError("H2 Carrier contains an invalid Cohort id")
+
+    @staticmethod
+    def _evaluate(coefficients, query_time, anchor_time):
+        dt = query_time - anchor_time
+        powers = torch.cat((dt, dt * dt, dt * dt * dt), dim=1)
+        return torch.sum(coefficients * powers.unsqueeze(-1), dim=1)
+
+    def displacement(self, carrier_ids, timestamp, dtype=None):
+        carrier_ids = carrier_ids.reshape(-1).to(dtype=torch.long)
+        device = carrier_ids.device
+        if dtype is None:
+            dtype = self.h1_motion.dtype
+        output = torch.zeros(
+            (carrier_ids.shape[0], 3), device=device, dtype=dtype
+        )
+        valid = carrier_ids >= 0
+        valid_ids = carrier_ids[valid]
+        roles = self.carrier_role[valid_ids]
+        query = torch.as_tensor(timestamp, device=device, dtype=dtype).reshape(1, 1)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        clamped = torch.zeros(valid_ids.shape[0], device=device, dtype=torch.bool)
+
+        h1 = roles == 3
+        if self.has_h1:
+            ids = valid_ids[h1]
+            start = self.carrier_support_start[ids].to(dtype=dtype)
+            end = self.carrier_support_end[ids].to(dtype=dtype)
+            time = torch.maximum(torch.minimum(query.expand_as(start), end), start)
+            clamped[h1] = (query < start).reshape(-1) | (query > end).reshape(-1)
+            value = self._evaluate(
+                self.h1_motion[ids].to(dtype=dtype),
+                time,
+                self.carrier_anchor_time[ids].to(dtype=dtype),
+            )
+            output[valid_indices[h1]] = value
+
+        h2 = roles == 4
+        if self.has_h2:
+            ids = valid_ids[h2]
+            carrier_start = self.carrier_support_start[ids].to(dtype=dtype)
+            carrier_end = self.carrier_support_end[ids].to(dtype=dtype)
+            carrier_time = torch.maximum(
+                torch.minimum(query.expand_as(carrier_start), carrier_end),
+                carrier_start,
+            )
+            cohort_ids = self.carrier_cohort_id[ids]
+            cohort_start = self.cohort_support_start[cohort_ids].to(dtype=dtype)
+            cohort_end = self.cohort_support_end[cohort_ids].to(dtype=dtype)
+            cohort_time = torch.maximum(
+                torch.minimum(query.expand_as(cohort_start), cohort_end),
+                cohort_start,
+            )
+            clamped[h2] = (
+                (query < carrier_start).reshape(-1)
+                | (query > carrier_end).reshape(-1)
+                | (query < cohort_start).reshape(-1)
+                | (query > cohort_end).reshape(-1)
+            )
+            residual = self._evaluate(
+                self.h2_residual_motion[ids].to(dtype=dtype),
+                carrier_time,
+                self.carrier_anchor_time[ids].to(dtype=dtype),
+            )
+            shared = self._evaluate(
+                self.h2_shared_motion[cohort_ids].to(dtype=dtype),
+                cohort_time,
+                self.cohort_anchor_time[cohort_ids].to(dtype=dtype),
+            )
+            output[valid_indices[h2]] = residual + shared
+
+        return output, {
+            "carrier_points": valid.sum(),
+            "clamped_points": clamped.sum(),
+            "h0_points": (roles == 2).sum(),
+            "h1_points": h1.sum(),
+            "h2_points": h2.sum(),
+        }
+
+    def acceleration(self, carrier_ids, timestamp, dtype=None):
+        """Return d2x/dt2 for the support-clamped Carrier trajectories."""
+        carrier_ids = carrier_ids.reshape(-1).to(dtype=torch.long)
+        device = carrier_ids.device
+        if dtype is None:
+            dtype = self.h1_motion.dtype
+        output = torch.zeros(
+            (carrier_ids.shape[0], 3), device=device, dtype=dtype
+        )
+        valid = carrier_ids >= 0
+        valid_ids = carrier_ids[valid]
+        roles = self.carrier_role[valid_ids]
+        query = torch.as_tensor(timestamp, device=device, dtype=dtype).reshape(1, 1)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+
+        h1 = roles == 3
+        if self.has_h1:
+            ids = valid_ids[h1]
+            start = self.carrier_support_start[ids].to(dtype=dtype)
+            end = self.carrier_support_end[ids].to(dtype=dtype)
+            inside = (query >= start) & (query <= end)
+            time = torch.maximum(torch.minimum(query.expand_as(start), end), start)
+            dt = time - self.carrier_anchor_time[ids].to(dtype=dtype)
+            coeff = self.h1_motion[ids].to(dtype=dtype)
+            value = 2.0 * coeff[:, 1, :] + 6.0 * coeff[:, 2, :] * dt
+            output[valid_indices[h1]] = torch.where(
+                inside.expand(-1, 3), value, torch.zeros_like(value)
+            )
+
+        h2 = roles == 4
+        if self.has_h2:
+            ids = valid_ids[h2]
+            carrier_start = self.carrier_support_start[ids].to(dtype=dtype)
+            carrier_end = self.carrier_support_end[ids].to(dtype=dtype)
+            carrier_inside = (query >= carrier_start) & (query <= carrier_end)
+            carrier_time = torch.maximum(
+                torch.minimum(query.expand_as(carrier_start), carrier_end),
+                carrier_start,
+            )
+            carrier_dt = (
+                carrier_time - self.carrier_anchor_time[ids].to(dtype=dtype)
+            )
+            residual_coeff = self.h2_residual_motion[ids].to(dtype=dtype)
+            residual = (
+                2.0 * residual_coeff[:, 1, :]
+                + 6.0 * residual_coeff[:, 2, :] * carrier_dt
+            )
+            residual = torch.where(
+                carrier_inside.expand(-1, 3),
+                residual,
+                torch.zeros_like(residual),
+            )
+
+            cohort_ids = self.carrier_cohort_id[ids]
+            cohort_start = self.cohort_support_start[cohort_ids].to(dtype=dtype)
+            cohort_end = self.cohort_support_end[cohort_ids].to(dtype=dtype)
+            cohort_inside = (query >= cohort_start) & (query <= cohort_end)
+            cohort_time = torch.maximum(
+                torch.minimum(query.expand_as(cohort_start), cohort_end),
+                cohort_start,
+            )
+            cohort_dt = (
+                cohort_time - self.cohort_anchor_time[cohort_ids].to(dtype=dtype)
+            )
+            shared_coeff = self.h2_shared_motion[cohort_ids].to(dtype=dtype)
+            shared = (
+                2.0 * shared_coeff[:, 1, :]
+                + 6.0 * shared_coeff[:, 2, :] * cohort_dt
+            )
+            shared = torch.where(
+                cohort_inside.expand(-1, 3),
+                shared,
+                torch.zeros_like(shared),
+            )
+            output[valid_indices[h2]] = residual + shared
+        return output
 
 
 class GaussianModel:
@@ -115,9 +390,17 @@ class GaussianModel:
         self._dynamic_level_time_coeff = torch.empty(0)
         self._static_route_logits = torch.empty(0)
         self._field_residual_gate = torch.empty(0)
+        self._existence_logits = torch.empty(0)
+        self._interval_center_raw = torch.empty(0)
+        self._interval_log_half_width = torch.empty(0)
+        self._motion_time_anchor = torch.empty(0)
+        self._carrier_id = torch.empty(0, dtype=torch.long)
+        self._initialization_role = torch.empty(0, dtype=torch.int8)
         
         self.rgbdecoder = getcolormodel(rgbfuntion)
         self.euler_field = None
+        self.h2_velocity_field = None
+        self.carrier_motion_bank = None
         self.field_router = None
         self.field_query_gate = None
         self.field_decoder = None
@@ -145,6 +428,10 @@ class GaussianModel:
         self.computedtrbfscale = None 
         self.computedopacity = None 
         self.computedscales = None 
+        self._existence_active = False
+        self._existence_iteration = 0
+        self._last_existence_timestamp = None
+        self._last_existence_aux = {}
         self.use_euler_field = False
         self.field_base_resolution = 4
         self.field_num_levels = 5
@@ -364,6 +651,16 @@ class GaussianModel:
         self.field_bg_dense_beit_band_low = 0.10
         self.field_bg_dense_beit_band_high = 0.30
         self.field_bg_dense_beit_threshold = 0.50
+        self.field_bg_dense_source_time_select = False
+        self.field_bg_dense_source_time_indices = ""
+        self.field_bg_dense_source_min_support = 2
+        self.field_bg_dense_source_beit_background_threshold = 0.35
+        self.field_bg_dense_source_dilate = 5
+        self.field_bg_dense_source_motion_threshold = 0.12
+        self.field_bg_dense_source_median_threshold = 0.12
+        self.field_bg_dense_source_score_beit_weight = 0.60
+        self.field_bg_dense_source_score_motion_weight = 0.25
+        self.field_bg_dense_source_score_median_weight = 0.15
         self.field_bg_dense_cell_dedup = False
         self.field_bg_dense_dedup_level = 3
         self.field_bg_dense_dedup_priority = "center"
@@ -379,6 +676,114 @@ class GaussianModel:
         self.field_highfreq_densify_min_pixels = 64
         self.field_highfreq_densify_gate_start = 0.3
         self.field_highfreq_densify_gate_width = 0.4
+        self.field_existence_moe = False
+        self.field_existence_single_expert = "none"
+        self.field_motion_model = "polynomial"
+        self.field_carrier_initialization = False
+        self.field_carrier_initialization_path = ""
+        self.field_carrier_initialization_schema = ""
+        self._carrier_initialization_stats = {}
+        self._last_carrier_aux = {}
+        self.field_h2_level_resolutions = "8x4x4;16x8x8;32x16x16;64x32x32"
+        self.field_h2_feature_dim = 8
+        self.field_h2_hidden_dim = 32
+        self.field_h2_fourier_degree = 4
+        self.field_h2_max_normalized_speed = 0.25
+        self.field_h2_integration_steps = 2
+        self.field_h2_integration_method = "midpoint"
+        self.field_h2_velocity_reg_weight = 1e-4
+        self._last_h2_aux = {}
+        self.field_existence_start = 9000
+        self.field_existence_temperature_start = 1.0
+        self.field_existence_temperature_end = 0.35
+        self.field_existence_temperature_until = 30000
+        self.field_existence_router_init = "-4,-2,2"
+        self.field_existence_interval_init_half_width = 0.25
+        self.field_existence_interval_transition = 0.02
+        self.field_existence_interval_max_half_width = 0.45
+        self.field_existence_transient_budget = 0.35
+        self.field_existence_budget_weight = 0.001
+        self.field_existence_transient_width_limit = 0.35
+        self.field_existence_width_route_weight = 0.0005
+        self.field_existence_entropy_weight = 0.0001
+        self.field_existence_harden_start = 18000
+        self.field_existence_coverage_delta = 0.04
+        self.field_existence_coverage_margin = 0.05
+        self.field_existence_coverage_weight = 0.001
+        self.field_existence_log_interval = 500
+        self.field_mvstruct = False
+        self.field_mvstruct_start = 10000
+        self.field_mvstruct_until = 20000
+        self.field_mvstruct_interval = 50
+        self.field_mvstruct_views = 5
+        self.field_mvstruct_min_event_views = 3
+        self.field_mvstruct_dssim_weight = 0.0
+        self.field_mvstruct_densify = False
+        self.field_mvstruct_densify_start = 10500
+        self.field_mvstruct_densify_until = 20000
+        self.field_mvstruct_densify_interval = 500
+        self.field_mvstruct_grad_threshold = 0.0002
+        self.field_mvstruct_min_observations = 5
+        self.field_mvstruct_min_visibility_ratio = 0.1
+        self.field_mvstruct_min_opacity = 0.01
+        self.field_mvstruct_event_max_ratio = 0.003
+        self.field_mvstruct_total_max_ratio = 0.1
+        self.field_mvstruct_cooldown = 0
+        self.field_mvstruct_oversize_split = False
+        self.field_mvstruct_oversize_radius = 64.0
+        self.field_mvstruct_oversize_budget_ratio = 0.25
+        self.field_mvstruct_hard_time = False
+        self.field_mvstruct_hard_time_ema_decay = 0.05
+        self.field_mvstruct_hard_time_sampling = "alternate"
+        self.field_mvstruct_hard_time_diverse_views = True
+        self.field_mvstruct_conflict_split = False
+        self.field_mvstruct_conflict_source = "feature"
+        self.field_mvstruct_conflict_threshold = 0.35
+        self.field_mvstruct_conflict_min_events = 3
+        self.field_mvstruct_conflict_budget_ratio = 0.25
+        self.field_mvstruct_conflict_min_radius = 4.0
+        self.field_mvstruct_conflict_children = 2
+        self.field_mvstruct_conflict_specialize = False
+        self.field_mvstruct_conflict_directional_split = False
+        self.field_mvstruct_directional_min_events = 3
+        self.field_mvstruct_directional_min_axis_ratio = 0.5
+        self.field_mvstruct_directional_min_trace = 1e-6
+        self.field_mvstruct_directional_offset_ratio = 0.5
+        self.field_mvstruct_specialize_min_events = 3
+        self.field_mvstruct_specialize_axis_ratio = 0.5
+        self.field_mvstruct_specialize_min_radius = 32.0
+        self.field_mvstruct_specialize_feature_delta = 0.05
+        self.field_mvstruct_specialize_offset_ratio = 0.5
+        self.field_mvstruct_specialize_scale_ratio = 0.5
+        self.field_layer_responsibility = False
+        self.field_layer_responsibility_start = 3000
+        self.field_layer_responsibility_until = 18000
+        self.field_layer_responsibility_interval = 5
+        self.field_layer_far_depth = 80.0
+        self.field_layer_near_depth = 30.0
+        self.field_layer_far_loss_weight = 0.10
+        self.field_layer_front_opacity_weight = 0.01
+        self.field_layer_front_opacity_budget = 0.15
+        self.field_layer_mask_erode = 3
+        self.field_layer_min_pixels = 256
+        self.field_layer_beit_time_indices = "0,12,25,37,49"
+        self.field_layer_beit_background_threshold = 0.35
+        self.field_layer_motion_threshold = 0.12
+        self.field_layer_median_threshold = 0.12
+        self.field_layer_debug = False
+        self.field_layer_debug_max_events = 4
+        self._mvstruct_gradient_accum = None
+        self._mvstruct_visibility_count = None
+        self._mvstruct_max_radii2D = None
+        self._mvstruct_last_topology_iter = None
+        self._mvstruct_conflict_accum = None
+        self._mvstruct_conflict_event_count = None
+        self._mvstruct_conflict_cov_accum = None
+        self._mvstruct_conflict_cov_event_count = None
+        self._mvstruct_total_views = 0
+        self._mvstruct_event_records = []
+        self._mvstruct_budget_reference_points = 0
+        self._mvstruct_total_added = 0
         self.field_appearance_only_train = False
         self.field_appearance_only_start = 20000
         self.field_appearance_only_allow = "f_dc,f_t,decoder"
@@ -1138,6 +1543,10 @@ class GaussianModel:
         new_dynamic_level_logits = parent_dynamic_logits.repeat(repeat_count, 1) if parent_dynamic_logits is not None else None
         new_dynamic_level_time_coeff = parent_dynamic_time.repeat(repeat_count, 1, 1) if parent_dynamic_time is not None else None
         new_ems_mask = parent_ems_mask.repeat(repeat_count, 1) if parent_ems_mask is not None else None
+        existence_parent_indices = torch.nonzero(
+            selected_mask,
+            as_tuple=False,
+        ).squeeze(1).repeat(repeat_count)
 
         old_count = self.get_xyz.shape[0]
         self.densification_postfix(
@@ -1155,6 +1564,7 @@ class GaussianModel:
             new_dynamic_level_logits,
             new_dynamic_level_time_coeff,
             new_ems_mask,
+            new_existence_parent_indices=existence_parent_indices,
         )
 
         new_count = new_xyz.shape[0]
@@ -1184,6 +1594,11 @@ class GaussianModel:
 
         
     def capture(self):
+        if self.field_motion_model == "carrier_hybrid":
+            raise RuntimeError(
+                "Legacy capture() does not encode Carrier identity state; "
+                "use save_ply(), which writes the self-contained auxiliary PT"
+            )
         return (
             self.active_sh_degree,
             self._xyz,
@@ -1199,6 +1614,11 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
+        if self.field_motion_model == "carrier_hybrid":
+            raise RuntimeError(
+                "Legacy restore() cannot restore Carrier identity state; "
+                "load a save_ply() checkpoint instead"
+            )
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -1471,6 +1891,16 @@ class GaussianModel:
         self.field_bg_dense_beit_band_low = float(getattr(args, "field_bg_dense_beit_band_low", 0.10))
         self.field_bg_dense_beit_band_high = float(getattr(args, "field_bg_dense_beit_band_high", 0.30))
         self.field_bg_dense_beit_threshold = float(getattr(args, "field_bg_dense_beit_threshold", 0.50))
+        self.field_bg_dense_source_time_select = bool(getattr(args, "field_bg_dense_source_time_select", 0))
+        self.field_bg_dense_source_time_indices = str(getattr(args, "field_bg_dense_source_time_indices", ""))
+        self.field_bg_dense_source_min_support = int(getattr(args, "field_bg_dense_source_min_support", 2))
+        self.field_bg_dense_source_beit_background_threshold = float(getattr(args, "field_bg_dense_source_beit_background_threshold", 0.35))
+        self.field_bg_dense_source_dilate = int(getattr(args, "field_bg_dense_source_dilate", 5))
+        self.field_bg_dense_source_motion_threshold = float(getattr(args, "field_bg_dense_source_motion_threshold", 0.12))
+        self.field_bg_dense_source_median_threshold = float(getattr(args, "field_bg_dense_source_median_threshold", 0.12))
+        self.field_bg_dense_source_score_beit_weight = float(getattr(args, "field_bg_dense_source_score_beit_weight", 0.60))
+        self.field_bg_dense_source_score_motion_weight = float(getattr(args, "field_bg_dense_source_score_motion_weight", 0.25))
+        self.field_bg_dense_source_score_median_weight = float(getattr(args, "field_bg_dense_source_score_median_weight", 0.15))
         self.field_bg_dense_cell_dedup = bool(getattr(args, "field_bg_dense_cell_dedup", 0))
         self.field_bg_dense_dedup_level = int(getattr(args, "field_bg_dense_dedup_level", 3))
         self.field_bg_dense_dedup_priority = str(getattr(args, "field_bg_dense_dedup_priority", "center"))
@@ -1486,6 +1916,216 @@ class GaussianModel:
         self.field_highfreq_densify_min_pixels = int(getattr(args, "field_highfreq_densify_min_pixels", 64))
         self.field_highfreq_densify_gate_start = float(getattr(args, "field_highfreq_densify_gate_start", 0.3))
         self.field_highfreq_densify_gate_width = float(getattr(args, "field_highfreq_densify_gate_width", 0.4))
+        self.field_existence_moe = bool(getattr(args, "field_existence_moe", 0))
+        self.field_existence_single_expert = str(
+            getattr(args, "field_existence_single_expert", "none")
+        ).strip().lower()
+        self.field_carrier_initialization = bool(
+            getattr(args, "field_carrier_initialization", 0)
+        )
+        self.field_carrier_initialization_path = str(
+            getattr(args, "field_carrier_initialization_path", "")
+        ).strip()
+        self.field_carrier_initialization_schema = str(
+            getattr(
+                args,
+                "field_carrier_initialization_schema",
+                "stegf_colmap_carrier_initialization_map_v2",
+            )
+        ).strip()
+        self._carrier_source_path = str(getattr(args, "source_path", ""))
+        self.field_motion_model = str(
+            getattr(args, "field_motion_model", "polynomial")
+        ).strip().lower()
+        if self.field_motion_model in {
+            "",
+            "none",
+            "off",
+            "poly",
+            "legacy",
+            "h1",
+        }:
+            self.field_motion_model = "polynomial"
+        elif self.field_motion_model in {"shared", "shared_field", "h2_only"}:
+            self.field_motion_model = "h2"
+        elif self.field_motion_model in {"carrier", "carrier_bank", "carrier_moe"}:
+            self.field_motion_model = "carrier_hybrid"
+        if self.field_motion_model not in {
+            "polynomial",
+            "h2",
+            "carrier_hybrid",
+        }:
+            raise ValueError(
+                "field_motion_model must be polynomial, h2, or "
+                "carrier_hybrid, got "
+                f"{self.field_motion_model!r}"
+            )
+        self.field_h2_level_resolutions = str(
+            getattr(
+                args,
+                "field_h2_level_resolutions",
+                "8x4x4;16x8x8;32x16x16;64x32x32",
+            )
+        )
+        self.field_h2_feature_dim = int(
+            getattr(args, "field_h2_feature_dim", 8)
+        )
+        self.field_h2_hidden_dim = int(
+            getattr(args, "field_h2_hidden_dim", 32)
+        )
+        self.field_h2_fourier_degree = int(
+            getattr(args, "field_h2_fourier_degree", 4)
+        )
+        self.field_h2_max_normalized_speed = float(
+            getattr(args, "field_h2_max_normalized_speed", 0.25)
+        )
+        self.field_h2_integration_steps = max(
+            int(getattr(args, "field_h2_integration_steps", 2)),
+            1,
+        )
+        self.field_h2_integration_method = str(
+            getattr(args, "field_h2_integration_method", "midpoint")
+        ).strip().lower()
+        if self.field_h2_integration_method not in {"euler", "midpoint"}:
+            raise ValueError(
+                "field_h2_integration_method must be euler or midpoint"
+            )
+        self.field_h2_velocity_reg_weight = max(
+            float(getattr(args, "field_h2_velocity_reg_weight", 1e-4)),
+            0.0,
+        )
+        if self.field_existence_single_expert in {"", "off", "legacy"}:
+            self.field_existence_single_expert = "none"
+        if self.field_existence_single_expert not in {
+            "none",
+            "persistent",
+            "interval",
+            "transient",
+        }:
+            raise ValueError(
+                "field_existence_single_expert must be one of "
+                "none/persistent/interval/transient"
+            )
+        if self.field_existence_single_expert != "none":
+            self.field_existence_moe = False
+        if self.field_motion_model == "h2":
+            if not self.use_euler_field:
+                raise ValueError("H2 motion requires use_euler_field=1")
+            if self.field_existence_single_expert != "transient":
+                raise ValueError(
+                    "S1.10.24-A H2-only motion requires "
+                    "field_existence_single_expert=transient"
+                )
+            if self.field_existence_moe:
+                raise ValueError(
+                    "S1.10.24-A H2-only motion cannot be combined with "
+                    "existence MoE"
+                )
+        if self.field_carrier_initialization:
+            if self.field_motion_model != "carrier_hybrid":
+                raise ValueError(
+                    "Carrier initialization requires "
+                    "field_motion_model=carrier_hybrid"
+                )
+            if self.field_existence_single_expert != "persistent":
+                raise ValueError(
+                    "S1.10.25-A Carrier initialization requires "
+                    "field_existence_single_expert=persistent from iter 0"
+                )
+            if self.field_existence_moe:
+                raise ValueError(
+                    "Carrier initialization cannot be combined with "
+                    "existence MoE"
+                )
+            if self.use_euler_field and not self.field_disable_dynamic_grid:
+                raise ValueError(
+                    "S1.10.25-A requires field_disable_dynamic_grid=1 so "
+                    "Carrier motion is the only dynamic geometry branch"
+                )
+        elif self.field_motion_model == "carrier_hybrid":
+            raise ValueError(
+                "field_motion_model=carrier_hybrid requires "
+                "field_carrier_initialization=1"
+            )
+        self.field_existence_start = int(getattr(args, "field_existence_start", 9000))
+        self.field_existence_temperature_start = float(getattr(args, "field_existence_temperature_start", 1.0))
+        self.field_existence_temperature_end = float(getattr(args, "field_existence_temperature_end", 0.35))
+        self.field_existence_temperature_until = int(getattr(args, "field_existence_temperature_until", 30000))
+        self.field_existence_router_init = str(getattr(args, "field_existence_router_init", "-4,-2,2"))
+        self.field_existence_interval_init_half_width = float(getattr(args, "field_existence_interval_init_half_width", 0.25))
+        self.field_existence_interval_transition = float(getattr(args, "field_existence_interval_transition", 0.02))
+        self.field_existence_interval_max_half_width = float(getattr(args, "field_existence_interval_max_half_width", 0.45))
+        self.field_existence_transient_budget = float(getattr(args, "field_existence_transient_budget", 0.35))
+        self.field_existence_budget_weight = float(getattr(args, "field_existence_budget_weight", 0.001))
+        self.field_existence_transient_width_limit = float(getattr(args, "field_existence_transient_width_limit", 0.35))
+        self.field_existence_width_route_weight = float(getattr(args, "field_existence_width_route_weight", 0.0005))
+        self.field_existence_entropy_weight = float(getattr(args, "field_existence_entropy_weight", 0.0001))
+        self.field_existence_harden_start = int(getattr(args, "field_existence_harden_start", 18000))
+        self.field_existence_coverage_delta = float(getattr(args, "field_existence_coverage_delta", 0.04))
+        self.field_existence_coverage_margin = float(getattr(args, "field_existence_coverage_margin", 0.05))
+        self.field_existence_coverage_weight = float(getattr(args, "field_existence_coverage_weight", 0.001))
+        self.field_existence_log_interval = int(getattr(args, "field_existence_log_interval", 500))
+        self.field_mvstruct = bool(getattr(args, "field_mvstruct", 0))
+        self.field_mvstruct_start = int(getattr(args, "field_mvstruct_start", 10000))
+        self.field_mvstruct_until = int(getattr(args, "field_mvstruct_until", 20000))
+        self.field_mvstruct_interval = int(getattr(args, "field_mvstruct_interval", 50))
+        self.field_mvstruct_views = int(getattr(args, "field_mvstruct_views", 5))
+        self.field_mvstruct_min_event_views = int(getattr(args, "field_mvstruct_min_event_views", 3))
+        self.field_mvstruct_dssim_weight = float(getattr(args, "field_mvstruct_dssim_weight", 0.0))
+        self.field_mvstruct_densify = bool(getattr(args, "field_mvstruct_densify", 0))
+        self.field_mvstruct_densify_start = int(getattr(args, "field_mvstruct_densify_start", 10500))
+        self.field_mvstruct_densify_until = int(getattr(args, "field_mvstruct_densify_until", 20000))
+        self.field_mvstruct_densify_interval = int(getattr(args, "field_mvstruct_densify_interval", 500))
+        self.field_mvstruct_grad_threshold = float(getattr(args, "field_mvstruct_grad_threshold", 0.0002))
+        self.field_mvstruct_min_observations = int(getattr(args, "field_mvstruct_min_observations", 5))
+        self.field_mvstruct_min_visibility_ratio = float(getattr(args, "field_mvstruct_min_visibility_ratio", 0.1))
+        self.field_mvstruct_min_opacity = float(getattr(args, "field_mvstruct_min_opacity", 0.01))
+        self.field_mvstruct_event_max_ratio = float(getattr(args, "field_mvstruct_event_max_ratio", 0.003))
+        self.field_mvstruct_total_max_ratio = float(getattr(args, "field_mvstruct_total_max_ratio", 0.1))
+        self.field_mvstruct_cooldown = int(getattr(args, "field_mvstruct_cooldown", 0))
+        self.field_mvstruct_oversize_split = bool(getattr(args, "field_mvstruct_oversize_split", 0))
+        self.field_mvstruct_oversize_radius = float(getattr(args, "field_mvstruct_oversize_radius", 64.0))
+        self.field_mvstruct_oversize_budget_ratio = float(getattr(args, "field_mvstruct_oversize_budget_ratio", 0.25))
+        self.field_mvstruct_hard_time = bool(getattr(args, "field_mvstruct_hard_time", 0))
+        self.field_mvstruct_hard_time_ema_decay = float(getattr(args, "field_mvstruct_hard_time_ema_decay", 0.05))
+        self.field_mvstruct_hard_time_sampling = str(getattr(args, "field_mvstruct_hard_time_sampling", "alternate"))
+        self.field_mvstruct_hard_time_diverse_views = bool(getattr(args, "field_mvstruct_hard_time_diverse_views", 1))
+        self.field_mvstruct_conflict_split = bool(getattr(args, "field_mvstruct_conflict_split", 0))
+        self.field_mvstruct_conflict_source = str(getattr(args, "field_mvstruct_conflict_source", "feature"))
+        self.field_mvstruct_conflict_threshold = float(getattr(args, "field_mvstruct_conflict_threshold", 0.35))
+        self.field_mvstruct_conflict_min_events = int(getattr(args, "field_mvstruct_conflict_min_events", 3))
+        self.field_mvstruct_conflict_budget_ratio = float(getattr(args, "field_mvstruct_conflict_budget_ratio", 0.25))
+        self.field_mvstruct_conflict_min_radius = float(getattr(args, "field_mvstruct_conflict_min_radius", 4.0))
+        self.field_mvstruct_conflict_children = int(getattr(args, "field_mvstruct_conflict_children", 2))
+        self.field_mvstruct_conflict_specialize = bool(getattr(args, "field_mvstruct_conflict_specialize", 0))
+        self.field_mvstruct_conflict_directional_split = bool(getattr(args, "field_mvstruct_conflict_directional_split", 0))
+        self.field_mvstruct_directional_min_events = int(getattr(args, "field_mvstruct_directional_min_events", 3))
+        self.field_mvstruct_directional_min_axis_ratio = float(getattr(args, "field_mvstruct_directional_min_axis_ratio", 0.5))
+        self.field_mvstruct_directional_min_trace = float(getattr(args, "field_mvstruct_directional_min_trace", 1e-6))
+        self.field_mvstruct_directional_offset_ratio = float(getattr(args, "field_mvstruct_directional_offset_ratio", 0.5))
+        self.field_mvstruct_specialize_min_events = int(getattr(args, "field_mvstruct_specialize_min_events", 3))
+        self.field_mvstruct_specialize_axis_ratio = float(getattr(args, "field_mvstruct_specialize_axis_ratio", 0.5))
+        self.field_mvstruct_specialize_min_radius = float(getattr(args, "field_mvstruct_specialize_min_radius", 32.0))
+        self.field_mvstruct_specialize_feature_delta = float(getattr(args, "field_mvstruct_specialize_feature_delta", 0.05))
+        self.field_mvstruct_specialize_offset_ratio = float(getattr(args, "field_mvstruct_specialize_offset_ratio", 0.5))
+        self.field_mvstruct_specialize_scale_ratio = float(getattr(args, "field_mvstruct_specialize_scale_ratio", 0.5))
+        self.field_layer_responsibility = bool(getattr(args, "field_layer_responsibility", 0))
+        self.field_layer_responsibility_start = int(getattr(args, "field_layer_responsibility_start", 3000))
+        self.field_layer_responsibility_until = int(getattr(args, "field_layer_responsibility_until", 18000))
+        self.field_layer_responsibility_interval = int(getattr(args, "field_layer_responsibility_interval", 5))
+        self.field_layer_far_depth = float(getattr(args, "field_layer_far_depth", 80.0))
+        self.field_layer_near_depth = float(getattr(args, "field_layer_near_depth", 30.0))
+        self.field_layer_far_loss_weight = float(getattr(args, "field_layer_far_loss_weight", 0.10))
+        self.field_layer_front_opacity_weight = float(getattr(args, "field_layer_front_opacity_weight", 0.01))
+        self.field_layer_front_opacity_budget = float(getattr(args, "field_layer_front_opacity_budget", 0.15))
+        self.field_layer_mask_erode = int(getattr(args, "field_layer_mask_erode", 3))
+        self.field_layer_min_pixels = int(getattr(args, "field_layer_min_pixels", 256))
+        self.field_layer_beit_time_indices = str(getattr(args, "field_layer_beit_time_indices", "0,12,25,37,49"))
+        self.field_layer_beit_background_threshold = float(getattr(args, "field_layer_beit_background_threshold", 0.35))
+        self.field_layer_motion_threshold = float(getattr(args, "field_layer_motion_threshold", 0.12))
+        self.field_layer_median_threshold = float(getattr(args, "field_layer_median_threshold", 0.12))
+        self.field_layer_debug = bool(getattr(args, "field_layer_debug", 0))
+        self.field_layer_debug_max_events = int(getattr(args, "field_layer_debug_max_events", 4))
         self.field_appearance_only_train = bool(getattr(args, "field_appearance_only_train", 0))
         self.field_appearance_only_start = int(getattr(args, "field_appearance_only_start", 20000))
         self.field_appearance_only_allow = str(getattr(args, "field_appearance_only_allow", "f_dc,f_t,decoder"))
@@ -2057,6 +2697,38 @@ class GaussianModel:
             static_temporal_frames=self.field_static_temporal_frames,
             static_temporal_scale=self.field_static_temporal_scale,
         ).cuda()
+        if self.field_motion_model == "h2":
+            h2_resolutions = self._parse_field_level_resolutions(
+                self.field_h2_level_resolutions
+            )
+            if h2_resolutions is None:
+                raise ValueError(
+                    "field_h2_level_resolutions must define at least one "
+                    "velocity-grid level"
+                )
+            self.h2_velocity_field = EulerVelocityField(
+                bbox_min=bbox_min,
+                bbox_max=bbox_max,
+                level_resolutions=h2_resolutions,
+                feature_dim=self.field_h2_feature_dim,
+                hidden_dim=self.field_h2_hidden_dim,
+                fourier_degree=self.field_h2_fourier_degree,
+                max_normalized_speed=self.field_h2_max_normalized_speed,
+            ).cuda()
+            print(
+                "[STEGF] H2 shared transport: resolutions={}, feature_dim={}, "
+                "hidden={}, fourier={}, max_speed={}, integrator={}x{}".format(
+                    self._format_field_level_resolutions(h2_resolutions),
+                    self.field_h2_feature_dim,
+                    self.field_h2_hidden_dim,
+                    self.field_h2_fourier_degree,
+                    self.field_h2_max_normalized_speed,
+                    self.field_h2_integration_method,
+                    self.field_h2_integration_steps,
+                )
+            )
+        else:
+            self.h2_velocity_field = None
         router_input_dim = self.field_feature_dim + 2 * self.field_level_fourier_degree
         self.field_router = EulerLevelRouter(
             input_dim=router_input_dim,
@@ -2151,6 +2823,500 @@ class GaussianModel:
             values = values.to(device="cuda", dtype=torch.float32)
         self._field_residual_gate = nn.Parameter(values.requires_grad_(True))
 
+    def _parse_existence_router_init(self):
+        values = []
+        raw = str(getattr(self, "field_existence_router_init", "-4,-2,2"))
+        for token in raw.split(","):
+            token = token.strip()
+            if token:
+                try:
+                    values.append(float(token))
+                except ValueError:
+                    values = []
+                    break
+        if len(values) != 3 or not all(math.isfinite(value) for value in values):
+            values = [-4.0, -2.0, 2.0]
+        return values
+
+    def _default_existence_logits(self, num_points, device="cuda", dtype=torch.float32):
+        init = torch.tensor(
+            self._parse_existence_router_init(),
+            device=device,
+            dtype=dtype,
+        ).view(1, 3)
+        return init.repeat(int(num_points), 1)
+
+    @staticmethod
+    def _interval_center_to_raw(center):
+        center = torch.clamp(center, min=1e-4, max=1.0 - 1e-4)
+        return torch.log(center) - torch.log1p(-center)
+
+    def _default_interval_log_half_width(self, num_points, device="cuda", dtype=torch.float32):
+        half_width = max(float(self.field_existence_interval_init_half_width), 1e-4)
+        max_half_width = max(float(self.field_existence_interval_max_half_width), 1e-4)
+        width_ratio = min(max(half_width / max_half_width, 1e-4), 1.0 - 1e-4)
+        raw_value = math.log(width_ratio) - math.log1p(-width_ratio)
+        return torch.full((int(num_points), 1), raw_value, device=device, dtype=dtype)
+
+    def _init_existence_parameters(
+        self,
+        num_points,
+        times=None,
+        logits=None,
+        interval_center_raw=None,
+        interval_log_half_width=None,
+        motion_time_anchor=None,
+        active=False,
+    ):
+        single_expert = str(
+            getattr(self, "field_existence_single_expert", "none")
+        ).strip().lower()
+        uses_interval_parameters = single_expert == "interval"
+        uses_motion_anchor = (
+            single_expert == "transient"
+            or bool(getattr(self, "field_carrier_initialization", False))
+        )
+        if (
+            not self.field_existence_moe
+            and not uses_interval_parameters
+            and not uses_motion_anchor
+        ):
+            self._existence_logits = torch.empty(0, 3, device="cuda")
+            self._interval_center_raw = torch.empty(0, 1, device="cuda")
+            self._interval_log_half_width = torch.empty(0, 1, device="cuda")
+            self._motion_time_anchor = torch.empty(0, 1, device="cuda")
+            self._existence_active = single_expert == "persistent"
+            return
+
+        num_points = int(num_points)
+        if times is None:
+            times = torch.full((num_points, 1), 0.5, device="cuda", dtype=torch.float32)
+        else:
+            times = times.detach().to(device="cuda", dtype=torch.float32).reshape(num_points, 1)
+        if logits is None:
+            logits = self._default_existence_logits(num_points, device=times.device, dtype=times.dtype)
+        else:
+            logits = logits.to(device="cuda", dtype=torch.float32).reshape(num_points, 3)
+        if interval_center_raw is None:
+            interval_center_raw = self._interval_center_to_raw(times)
+        else:
+            interval_center_raw = interval_center_raw.to(device="cuda", dtype=torch.float32).reshape(num_points, 1)
+        if interval_log_half_width is None:
+            interval_log_half_width = self._default_interval_log_half_width(
+                num_points,
+                device=times.device,
+                dtype=times.dtype,
+            )
+        else:
+            interval_log_half_width = interval_log_half_width.to(
+                device="cuda",
+                dtype=torch.float32,
+            ).reshape(num_points, 1)
+
+        if uses_motion_anchor and not self.field_existence_moe:
+            if motion_time_anchor is None:
+                motion_time_anchor = times
+            else:
+                motion_time_anchor = motion_time_anchor.to(
+                    device="cuda",
+                    dtype=torch.float32,
+                ).reshape(num_points, 1)
+            self._existence_logits = torch.empty(
+                0,
+                3,
+                device=times.device,
+                dtype=times.dtype,
+            )
+            self._interval_center_raw = torch.empty(
+                0,
+                1,
+                device=times.device,
+                dtype=times.dtype,
+            )
+            self._interval_log_half_width = torch.empty(
+                0,
+                1,
+                device=times.device,
+                dtype=times.dtype,
+            )
+            self._motion_time_anchor = (
+                motion_time_anchor.detach().contiguous()
+            )
+            self._existence_active = True
+            return
+
+        if uses_interval_parameters and not self.field_existence_moe:
+            self._existence_logits = torch.empty(
+                0,
+                3,
+                device=times.device,
+                dtype=times.dtype,
+            )
+            self._interval_center_raw = nn.Parameter(
+                interval_center_raw.contiguous().requires_grad_(True)
+            )
+            self._interval_log_half_width = nn.Parameter(
+                interval_log_half_width.contiguous().requires_grad_(True)
+            )
+            self._motion_time_anchor = torch.empty(
+                0,
+                1,
+                device=times.device,
+                dtype=times.dtype,
+            )
+            self._existence_active = True
+            return
+
+        if motion_time_anchor is None:
+            motion_time_anchor = times
+        else:
+            motion_time_anchor = motion_time_anchor.to(
+                device="cuda",
+                dtype=torch.float32,
+            ).reshape(num_points, 1)
+
+        self._existence_logits = nn.Parameter(logits.contiguous().requires_grad_(True))
+        self._interval_center_raw = nn.Parameter(interval_center_raw.contiguous().requires_grad_(True))
+        self._interval_log_half_width = nn.Parameter(
+            interval_log_half_width.contiguous().requires_grad_(True)
+        )
+        self._motion_time_anchor = motion_time_anchor.detach().contiguous()
+        self._existence_active = bool(active)
+
+    def set_existence_iteration(self, iteration):
+        self._existence_iteration = int(iteration)
+        if self.field_existence_single_expert in {
+            "persistent",
+            "interval",
+            "transient",
+        }:
+            self._existence_active = True
+            return False
+        if not self.field_existence_moe:
+            return False
+        if self._existence_active or self._existence_iteration < self.field_existence_start:
+            return False
+        if self._existence_logits.numel() == 0:
+            self._init_existence_parameters(self.get_xyz.shape[0], times=self.get_trbfcenter)
+        with torch.no_grad():
+            num_points = self.get_xyz.shape[0]
+            self._existence_logits.copy_(
+                self._default_existence_logits(
+                    num_points,
+                    device=self.get_xyz.device,
+                    dtype=self.get_xyz.dtype,
+                )
+            )
+            self._interval_center_raw.copy_(
+                self._interval_center_to_raw(self.get_trbfcenter.detach())
+            )
+            self._interval_log_half_width.copy_(
+                self._default_interval_log_half_width(
+                    num_points,
+                    device=self.get_xyz.device,
+                    dtype=self.get_xyz.dtype,
+                )
+            )
+            self._motion_time_anchor = self.get_trbfcenter.detach().clone()
+        self._existence_active = True
+        return True
+
+    def _existence_temperature(self, iteration=None):
+        if iteration is None:
+            iteration = self._existence_iteration
+        start = int(self.field_existence_start)
+        until = max(int(self.field_existence_temperature_until), start + 1)
+        progress = min(max((float(iteration) - float(start)) / float(until - start), 0.0), 1.0)
+        temperature = (
+            float(self.field_existence_temperature_start) * (1.0 - progress)
+            + float(self.field_existence_temperature_end) * progress
+        )
+        return max(temperature, 1e-3)
+
+    def _interval_existence(self, timestamp):
+        if not torch.is_tensor(timestamp):
+            timestamp = torch.tensor(
+                timestamp,
+                device=self.get_xyz.device,
+                dtype=self.get_xyz.dtype,
+            )
+        timestamp = timestamp.reshape(1).to(
+            device=self.get_xyz.device,
+            dtype=self.get_xyz.dtype,
+        )
+        interval_center = torch.sigmoid(self._interval_center_raw)
+        max_half_width = max(
+            float(self.field_existence_interval_max_half_width),
+            1e-4,
+        )
+        interval_half_width = torch.clamp_min(
+            max_half_width * torch.sigmoid(
+                self._interval_log_half_width
+            ),
+            1e-4,
+        )
+        transition = max(
+            float(self.field_existence_interval_transition),
+            1e-4,
+        )
+        interval_left = interval_center - interval_half_width
+        interval_right = interval_center + interval_half_width
+        interval = torch.sigmoid(
+            (timestamp - interval_left) / transition
+        )
+        interval = interval * torch.sigmoid(
+            (interval_right - timestamp) / transition
+        )
+        return interval, interval_center, interval_half_width
+
+    def _existence_components(self, timestamp, basicfunction, iteration=None):
+        if not torch.is_tensor(timestamp):
+            timestamp = torch.tensor(
+                timestamp,
+                device=self.get_xyz.device,
+                dtype=self.get_xyz.dtype,
+            )
+        timestamp = timestamp.reshape(1).to(device=self.get_xyz.device, dtype=self.get_xyz.dtype)
+        pointtimes = torch.ones(
+            (self.get_xyz.shape[0], 1),
+            dtype=self.get_xyz.dtype,
+            requires_grad=False,
+            device=self.get_xyz.device,
+        )
+        trbf_offset = timestamp * pointtimes - self.get_trbfcenter
+        trbf_distance = trbf_offset / torch.exp(self._trbf_scale)
+        transient = basicfunction(trbf_distance)
+
+        temperature = self._existence_temperature(iteration)
+        route = torch.softmax(self._existence_logits / temperature, dim=1)
+        persistent = torch.ones_like(transient)
+        interval, interval_center, interval_half_width = (
+            self._interval_existence(timestamp)
+        )
+        expert_values = torch.cat((persistent, interval, transient), dim=1)
+        existence = torch.sum(route * expert_values, dim=1, keepdim=True)
+        return {
+            "existence": existence,
+            "route": route,
+            "persistent": persistent,
+            "interval": interval,
+            "transient": transient,
+            "interval_center": interval_center,
+            "interval_half_width": interval_half_width,
+            "trbf_offset": trbf_offset,
+        }
+
+    def get_existence_regularization_loss(self, iteration, basicfunction):
+        if (
+            not self.field_existence_moe
+            or not self._existence_active
+            or self._existence_logits.numel() == 0
+        ):
+            return None
+        timestamp = self._last_existence_timestamp
+        if timestamp is None:
+            return None
+        components = self._existence_components(timestamp, basicfunction, iteration=iteration)
+        route = components["route"]
+        material_weight = self.opacity_activation(self._opacity.detach()).squeeze(1)
+        weight_sum = material_weight.sum().clamp_min(1e-6)
+
+        transient_share = torch.sum(material_weight * route[:, 2]) / weight_sum
+        budget = float(self.field_existence_transient_budget)
+        budget_loss = float(self.field_existence_budget_weight) * torch.relu(
+            transient_share - budget
+        ).pow(2)
+
+        width_route_loss = torch.zeros((), device=route.device, dtype=route.dtype)
+        width_route_weight = float(self.field_existence_width_route_weight)
+        if width_route_weight > 0.0:
+            width_limit = max(float(self.field_existence_transient_width_limit), 1e-4)
+            log_width_excess = torch.clamp(
+                torch.relu(
+                    self._trbf_scale.detach().squeeze(1) - math.log(width_limit)
+                ),
+                max=4.0,
+            )
+            width_route_loss = width_route_weight * torch.sum(
+                material_weight * route[:, 2] * log_width_excess.pow(2)
+            ) / weight_sum
+
+        entropy_loss = torch.zeros((), device=route.device, dtype=route.dtype)
+        if int(iteration) >= int(self.field_existence_harden_start):
+            entropy = -torch.sum(route * torch.log(route.clamp_min(1e-8)), dim=1)
+            entropy_loss = float(self.field_existence_entropy_weight) * torch.sum(
+                material_weight * entropy
+            ) / weight_sum
+
+        coverage_loss = torch.zeros((), device=route.device, dtype=route.dtype)
+        coverage_weight = float(self.field_existence_coverage_weight)
+        coverage_delta = max(float(self.field_existence_coverage_delta), 0.0)
+        if coverage_weight > 0.0 and coverage_delta > 0.0:
+            previous = self._existence_components(
+                timestamp - coverage_delta,
+                basicfunction,
+                iteration=iteration,
+            )["existence"]
+            following = self._existence_components(
+                timestamp + coverage_delta,
+                basicfunction,
+                iteration=iteration,
+            )["existence"]
+            isolated = torch.relu(
+                components["existence"].squeeze(1)
+                - 0.5 * (previous.squeeze(1) + following.squeeze(1))
+                - float(self.field_existence_coverage_margin)
+            )
+            coverage_loss = coverage_weight * torch.sum(material_weight * isolated) / weight_sum
+
+        return budget_loss + width_route_loss + entropy_loss + coverage_loss
+
+    @torch.no_grad()
+    def get_existence_stats(self, iteration=None):
+        single_expert = str(
+            getattr(self, "field_existence_single_expert", "none")
+        ).strip().lower()
+        if single_expert in {"persistent", "interval", "transient"}:
+            point_count = int(self.get_xyz.shape[0])
+            trbf_width = torch.exp(self._trbf_scale).squeeze(1)
+            if single_expert == "persistent":
+                weighted = (1.0, 0.0, 0.0)
+                half_width_p50 = 0.0
+                half_width_p90 = 0.0
+                center_p50 = 0.0
+            elif single_expert == "interval":
+                half_width = torch.clamp_min(
+                    max(
+                        float(self.field_existence_interval_max_half_width),
+                        1e-4,
+                    )
+                    * torch.sigmoid(self._interval_log_half_width),
+                    1e-4,
+                ).squeeze(1)
+                interval_center = torch.sigmoid(
+                    self._interval_center_raw
+                ).squeeze(1)
+                weighted = (0.0, 1.0, 0.0)
+                half_width_p50 = float(
+                    torch.quantile(half_width, 0.50).item()
+                )
+                half_width_p90 = float(
+                    torch.quantile(half_width, 0.90).item()
+                )
+                center_p50 = float(
+                    torch.quantile(interval_center, 0.50).item()
+                )
+            else:
+                weighted = (0.0, 0.0, 1.0)
+                half_width_p50 = 0.0
+                half_width_p90 = 0.0
+                center_p50 = 0.0
+            stats = {
+                "active": 1,
+                "single_expert": single_expert,
+                "temperature": 0.0,
+                "num_points": point_count,
+                "persistent_soft": weighted[0],
+                "interval_soft": weighted[1],
+                "transient_soft": weighted[2],
+                "persistent_weighted": weighted[0],
+                "interval_weighted": weighted[1],
+                "transient_weighted": weighted[2],
+                "persistent_hard": weighted[0],
+                "interval_hard": weighted[1],
+                "transient_hard": weighted[2],
+                "wide_transient_weighted": 0.0,
+                "interval_center_p50": center_p50,
+                "interval_half_width_p50": half_width_p50,
+                "interval_half_width_p90": half_width_p90,
+                "trbf_width_p10": float(
+                    torch.quantile(trbf_width, 0.10).item()
+                ),
+                "trbf_width_p50": float(
+                    torch.quantile(trbf_width, 0.50).item()
+                ),
+            }
+            if single_expert == "transient":
+                transient_center = self.get_trbfcenter.detach().squeeze(1)
+                motion_anchor = self._motion_time_anchor.detach().squeeze(1)
+                stats.update(
+                    {
+                        "transient_center_p50": float(
+                            torch.quantile(
+                                transient_center,
+                                0.50,
+                            ).item()
+                        ),
+                        "motion_anchor_p50": float(
+                            torch.quantile(
+                                motion_anchor,
+                                0.50,
+                            ).item()
+                        ),
+                        "center_anchor_absdiff_p50": float(
+                            torch.quantile(
+                                torch.abs(
+                                    transient_center - motion_anchor
+                                ),
+                                0.50,
+                            ).item()
+                        ),
+                        "center_anchor_absdiff_p90": float(
+                            torch.quantile(
+                                torch.abs(
+                                    transient_center - motion_anchor
+                                ),
+                                0.90,
+                            ).item()
+                        ),
+                    }
+                )
+            return stats
+        if (
+            not self.field_existence_moe
+            or not self._existence_active
+            or self._existence_logits.numel() == 0
+        ):
+            return {}
+        route = torch.softmax(
+            self._existence_logits / self._existence_temperature(iteration),
+            dim=1,
+        )
+        hard = torch.argmax(route, dim=1)
+        material_weight = self.opacity_activation(self._opacity).squeeze(1)
+        weight_sum = material_weight.sum().clamp_min(1e-6)
+        weighted_route = torch.sum(route * material_weight.unsqueeze(1), dim=0) / weight_sum
+        trbf_width = torch.exp(self._trbf_scale).squeeze(1)
+        wide_transient = trbf_width > max(float(self.field_existence_transient_width_limit), 1e-4)
+        wide_transient_weighted = torch.sum(
+            material_weight * route[:, 2] * wide_transient.to(route.dtype)
+        ) / weight_sum
+        half_width = torch.clamp_min(
+            max(float(self.field_existence_interval_max_half_width), 1e-4)
+            * torch.sigmoid(self._interval_log_half_width),
+            1e-4,
+        )
+        stats = {
+            "active": 1,
+            "temperature": float(self._existence_temperature(iteration)),
+            "num_points": int(route.shape[0]),
+            "persistent_soft": float(route[:, 0].mean().item()),
+            "interval_soft": float(route[:, 1].mean().item()),
+            "transient_soft": float(route[:, 2].mean().item()),
+            "persistent_weighted": float(weighted_route[0].item()),
+            "interval_weighted": float(weighted_route[1].item()),
+            "transient_weighted": float(weighted_route[2].item()),
+            "persistent_hard": float((hard == 0).float().mean().item()),
+            "interval_hard": float((hard == 1).float().mean().item()),
+            "transient_hard": float((hard == 2).float().mean().item()),
+            "wide_transient_weighted": float(wide_transient_weighted.item()),
+            "interval_half_width_p50": float(torch.quantile(half_width, 0.50).item()),
+            "interval_half_width_p90": float(torch.quantile(half_width, 0.90).item()),
+            "trbf_width_p10": float(torch.quantile(trbf_width, 0.10).item()),
+            "trbf_width_p50": float(torch.quantile(trbf_width, 0.50).item()),
+        }
+        return stats
+
     def _time_fourier_basis(self, timestamp, degree, device, dtype):
         if degree <= 0:
             return torch.empty(0, device=device, dtype=dtype)
@@ -2190,8 +3356,23 @@ class GaussianModel:
         normalized_motion = motion_norm / bbox_scale
         return torch.log1p(10.0 * normalized_motion)
 
-    def _get_motion_acceleration(self, time_offset):
+    def _get_motion_acceleration(self, time_offset, timestamp=None):
         acceleration = 2.0 * self._motion[:, 3:6] + 6.0 * self._motion[:, 6:9] * time_offset
+        if self.field_motion_model == "carrier_hybrid":
+            if timestamp is None or self.carrier_motion_bank is None:
+                raise RuntimeError(
+                    "carrier_hybrid acceleration requires a timestamp and MotionBank"
+                )
+            carrier_acceleration = self.carrier_motion_bank.acceleration(
+                self._carrier_id,
+                timestamp,
+                dtype=self.get_xyz.dtype,
+            )
+            acceleration = torch.where(
+                (self._carrier_id >= 0).unsqueeze(1),
+                carrier_acceleration,
+                acceleration,
+            )
         acceleration_norm = torch.norm(acceleration.detach(), dim=1, keepdim=True)
         if self.euler_field is not None:
             bbox_scale = torch.linalg.norm(self.euler_field.bbox_span, dim=1, keepdim=True).to(
@@ -2203,9 +3384,11 @@ class GaussianModel:
         normalized_accel = acceleration_norm / bbox_scale
         return torch.log1p(10.0 * normalized_accel)
 
-    def _get_motion_state_weights(self, motion_offset, time_offset):
+    def _get_motion_state_weights(self, motion_offset, time_offset, timestamp=None):
         motion_strength = self._get_motion_strength(motion_offset)
-        motion_acceleration = self._get_motion_acceleration(time_offset)
+        motion_acceleration = self._get_motion_acceleration(
+            time_offset, timestamp=timestamp
+        )
         dynamic_weight = torch.sigmoid(self.field_dyn_slope * (motion_strength - self.field_dyn_threshold))
         fast_weight = torch.sigmoid(self.field_fast_slope * (motion_strength - self.field_fast_threshold))
         return motion_strength, motion_acceleration, dynamic_weight, fast_weight
@@ -2496,6 +3679,27 @@ class GaussianModel:
             for name, param in self.euler_field.named_parameters():
                 self.field_grd[name] = torch.zeros_like(param, requires_grad=False, device=param.device)
 
+        self.h2_velocity_field_grd = {}
+        if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
+            for name, param in self.h2_velocity_field.named_parameters():
+                self.h2_velocity_field_grd[name] = torch.zeros_like(
+                    param,
+                    requires_grad=False,
+                    device=param.device,
+                )
+
+        self.carrier_motion_bank_grd = {}
+        if (
+            self.field_motion_model == "carrier_hybrid"
+            and self.carrier_motion_bank is not None
+        ):
+            for name, param in self.carrier_motion_bank.named_parameters():
+                self.carrier_motion_bank_grd[name] = torch.zeros_like(
+                    param,
+                    requires_grad=False,
+                    device=param.device,
+                )
+
         self.field_router_grd = {}
         if self.use_euler_field and self.field_router is not None:
             for name, param in self.field_router.named_parameters():
@@ -2537,13 +3741,119 @@ class GaussianModel:
         app_residual = None
         static_warmup = 0.0
         trbfdistanceoffset = timestamp * pointtimes - self.get_trbfcenter
-        tforpoly = trbfdistanceoffset.detach()
+        if self.field_motion_model == "carrier_hybrid":
+            if (
+                self.carrier_motion_bank is None
+                or self._carrier_id.shape != (self.get_xyz.shape[0],)
+                or self._motion_time_anchor.shape != self.get_trbfcenter.shape
+            ):
+                raise RuntimeError("carrier_hybrid topology is not initialized")
+            tforpoly = (
+                timestamp * pointtimes - self._motion_time_anchor
+            ).detach()
+        elif self.field_existence_single_expert == "transient":
+            if (
+                not self._existence_active
+                or self._motion_time_anchor.shape
+                != self.get_trbfcenter.shape
+            ):
+                raise RuntimeError(
+                    "Transient-only requires one fixed motion-time anchor "
+                    "per Gaussian"
+                )
+            tforpoly = (
+                timestamp * pointtimes - self._motion_time_anchor
+            ).detach()
+        elif (
+            self.field_existence_moe
+            and self._existence_active
+            and self._motion_time_anchor.numel() == self.get_xyz.shape[0]
+        ):
+            tforpoly = (timestamp * pointtimes - self._motion_time_anchor).detach()
+        else:
+            tforpoly = trbfdistanceoffset.detach()
+
+        h2_means3D = None
+        if self.field_motion_model == "h2":
+            if self.h2_velocity_field is None:
+                raise RuntimeError(
+                    "H2 motion is active but the shared velocity field was "
+                    "not initialized"
+                )
+            if self._motion_time_anchor.shape != self.get_trbfcenter.shape:
+                raise RuntimeError(
+                    "H2 motion requires one fixed source-time anchor per "
+                    "Gaussian"
+                )
+            h2_means3D, h2_aux = self.h2_velocity_field.transport(
+                self.get_xyz,
+                self._motion_time_anchor.detach(),
+                timestamp,
+                steps=self.field_h2_integration_steps,
+                method=self.field_h2_integration_method,
+            )
+            motion_query_offset = h2_means3D - self.get_xyz
+            displacement = h2_aux["displacement"]
+            self._last_h2_aux = {
+                "normalized_velocity_energy": h2_aux[
+                    "normalized_velocity_energy"
+                ],
+                "displacement_mean": torch.linalg.norm(
+                    displacement.detach(), dim=1
+                ).mean(),
+                "displacement_max": torch.linalg.norm(
+                    displacement.detach(), dim=1
+                ).max(),
+            }
+        elif self.field_motion_model == "carrier_hybrid":
+            legacy_offset = (
+                self._motion[:, 0:3] * tforpoly
+                + self._motion[:, 3:6] * tforpoly * tforpoly
+                + self._motion[:, 6:9]
+                * tforpoly
+                * tforpoly
+                * tforpoly
+            )
+            carrier_offset, carrier_aux = self.carrier_motion_bank.displacement(
+                self._carrier_id,
+                timestamp,
+                dtype=self.get_xyz.dtype,
+            )
+            carrier_mask = (self._carrier_id >= 0).unsqueeze(1)
+            motion_query_offset = torch.where(
+                carrier_mask, carrier_offset, legacy_offset
+            )
+            displacement_norm = torch.linalg.norm(
+                motion_query_offset.detach(), dim=1
+            )
+            self._last_carrier_aux = dict(carrier_aux)
+            self._last_carrier_aux.update(
+                {
+                    "fallback_points": (self._carrier_id < 0).sum(),
+                    "displacement_mean": displacement_norm.mean(),
+                    "displacement_max": displacement_norm.max(),
+                }
+            )
+            self._last_h2_aux = {}
+        else:
+            motion_query_offset = (
+                self._motion[:, 0:3] * tforpoly
+                + self._motion[:, 3:6] * tforpoly * tforpoly
+                + self._motion[:, 6:9]
+                * tforpoly
+                * tforpoly
+                * tforpoly
+            )
+            self._last_h2_aux = {}
 
         if self.use_euler_field and self.euler_field is not None and self.field_decoder is not None:
             canonical_points = self._xyz
-            motion_query_offset = self._motion[:, 0:3] * tforpoly + self._motion[:, 3:6] * tforpoly * tforpoly + self._motion[:, 6:9] * tforpoly * tforpoly * tforpoly
             motion_query_points = canonical_points + motion_query_offset
-            motion_strength, motion_acceleration, dynamic_weight, fast_weight = self._get_motion_state_weights(motion_query_offset, tforpoly)
+            motion_strength, motion_acceleration, dynamic_weight, fast_weight = self._get_motion_state_weights(
+                motion_query_offset,
+                tforpoly,
+                timestamp=timestamp,
+            )
             if self.field_query_detach:
                 canonical_points = canonical_points.detach()
                 motion_query_points = motion_query_points.detach()
@@ -2684,15 +3994,108 @@ class GaussianModel:
 
         trbfdistance = trbfdistanceoffset / torch.exp(self._trbf_scale)
         trbfoutput = basicfunction(trbfdistance)
-        opacity = self.opacity_activation(opacity_param) * trbfoutput
-        means3D = self.get_xyz + motion[:, 0:3] * tforpoly + motion[:, 3:6] * tforpoly * tforpoly + motion[:, 6:9] * tforpoly * tforpoly * tforpoly
+        existence_output = trbfoutput
+        if self.field_existence_single_expert == "persistent":
+            existence_output = torch.ones_like(trbfoutput)
+        elif self.field_existence_single_expert == "interval":
+            existence_output, interval_center, interval_half_width = (
+                self._interval_existence(timestamp)
+            )
+            self._last_existence_timestamp = torch.as_tensor(
+                timestamp,
+                device=self.get_xyz.device,
+                dtype=self.get_xyz.dtype,
+            ).detach().clone()
+            self._last_existence_aux = {
+                "existence": existence_output.detach(),
+                "interval": existence_output.detach(),
+                "interval_center": interval_center.detach(),
+                "interval_half_width": interval_half_width.detach(),
+            }
+        elif self.field_existence_single_expert == "transient":
+            self._last_existence_timestamp = torch.as_tensor(
+                timestamp,
+                device=self.get_xyz.device,
+                dtype=self.get_xyz.dtype,
+            ).detach().clone()
+            self._last_existence_aux = {
+                "existence": existence_output.detach(),
+                "transient": existence_output.detach(),
+                "transient_center": self.get_trbfcenter.detach(),
+                "transient_width": torch.exp(self._trbf_scale).detach(),
+                "motion_time_anchor": self._motion_time_anchor.detach(),
+            }
+        elif (
+            self.field_existence_moe
+            and self._existence_active
+            and self._existence_logits.numel() == self.get_xyz.shape[0] * 3
+        ):
+            existence_components = self._existence_components(
+                timestamp,
+                basicfunction,
+                iteration=self._existence_iteration,
+            )
+            existence_output = existence_components["existence"]
+            self._last_existence_timestamp = torch.as_tensor(
+                timestamp,
+                device=self.get_xyz.device,
+                dtype=self.get_xyz.dtype,
+            ).detach().clone()
+            self._last_existence_aux = {
+                key: value.detach()
+                for key, value in existence_components.items()
+                if key not in {"trbf_offset"}
+            }
+        opacity = self.opacity_activation(opacity_param) * existence_output
+        if h2_means3D is not None:
+            means3D = h2_means3D
+        elif self.field_motion_model == "carrier_hybrid":
+            means3D = self.get_xyz + motion_query_offset
+        else:
+            means3D = (
+                self.get_xyz
+                + motion[:, 0:3] * tforpoly
+                + motion[:, 3:6] * tforpoly * tforpoly
+                + motion[:, 6:9] * tforpoly * tforpoly * tforpoly
+            )
         rotations = self.get_rotation(tforpoly)
         colors_precomp = torch.cat((features_dc, tforpoly * features_t), dim=1)
         if self.use_euler_field and (not self.field_v23_compat) and app_residual is not None:
             app_delta = torch.cat((app_residual, torch.zeros_like(features_t)), dim=1)
             colors_precomp = colors_precomp + static_warmup * self.field_static_app_scale * app_delta
-        self.trbfoutput = trbfoutput
+        self.trbfoutput = existence_output
         return means3D, opacity, rotations, colors_precomp
+
+    def get_h2_motion_regularization_loss(self):
+        if self.field_motion_model != "h2":
+            return None
+        weight = float(self.field_h2_velocity_reg_weight)
+        energy = self._last_h2_aux.get("normalized_velocity_energy")
+        if weight <= 0.0 or energy is None:
+            return None
+        return weight * energy
+
+    def get_h2_motion_stats(self):
+        if self.field_motion_model != "h2" or not self._last_h2_aux:
+            return {}
+        result = {}
+        for key in ("normalized_velocity_energy", "displacement_mean", "displacement_max"):
+            value = self._last_h2_aux.get(key)
+            if value is not None:
+                result[key] = float(value.detach().cpu().item())
+        return result
+
+    def get_carrier_motion_stats(self):
+        if self.field_motion_model != "carrier_hybrid":
+            return {}
+        result = {}
+        for key, value in self._last_carrier_aux.items():
+            if torch.is_tensor(value):
+                result[key] = float(value.detach().cpu().item())
+            else:
+                result[key] = value
+        result.update(self._carrier_initialization_stats)
+        return result
 
     def static_far_segment_radiance_features(self, viewpoint_camera, depth, unreliable_mask, iteration):
         if not bool(getattr(self, "field_static_radiance_branch", False)):
@@ -2802,8 +4205,604 @@ class GaussianModel:
         out[:, y, x] = (scale * radiance_feature).transpose(0, 1)
         return out
 
+    def _resolve_carrier_initialization_path(self):
+        raw_path = str(self.field_carrier_initialization_path).strip()
+        if not raw_path:
+            raw_path = os.path.join(
+                os.path.dirname(os.path.abspath(self._carrier_source_path)),
+                "colmap_carrier_initialization_map_v2",
+            )
+        elif not os.path.isabs(raw_path):
+            raw_path = os.path.join(
+                os.path.abspath(self._carrier_source_path), raw_path
+            )
+        return os.path.normpath(os.path.abspath(raw_path))
+
+    @staticmethod
+    def _require_npz_keys(table, table_name, keys):
+        missing = [key for key in keys if key not in table.files]
+        if missing:
+            raise RuntimeError(
+                f"{table_name} is missing required keys: {missing}"
+            )
+
+    def _load_carrier_initialization(self, raw_count, raw_dist2, raw_times):
+        root = self._resolve_carrier_initialization_path()
+        _init_status(f"Loading Carrier initialization map: {root}")
+        required_files = {
+            "manifest": "manifest.json",
+            "raw": "raw_point_initialization_map.npz",
+            "alias": "alias_initialization_map.npz",
+            "carrier": "carrier_initialization_table.npz",
+            "cohort": "cohort_initialization_table.npz",
+        }
+        paths = {key: os.path.join(root, value) for key, value in required_files.items()}
+        missing = [path for path in paths.values() if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                "Carrier initialization map is incomplete: " + ", ".join(missing)
+            )
+        with open(paths["manifest"], "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        expected_schema = self.field_carrier_initialization_schema
+        if manifest.get("schema") != expected_schema:
+            raise RuntimeError(
+                "Carrier initialization schema mismatch: expected {!r}, got {!r}".format(
+                    expected_schema, manifest.get("schema")
+                )
+            )
+        no_fallback_schema = (
+            expected_schema
+            == "stegf_colmap_high_confidence_carrier_initialization_map_v1"
+        )
+        time_convention = manifest.get("time_convention", {})
+        if not bool(time_convention.get("matches_stegf_colmap_loader", False)):
+            raise RuntimeError(
+                "Carrier initialization time convention does not match the STEGF loader"
+            )
+        if time_convention.get("formula") != "(source_frame - sequence_start) / duration":
+            raise RuntimeError("Unexpected Carrier initialization time formula")
+        if int(manifest.get("total_raw_points", -1)) != int(raw_count):
+            raise RuntimeError(
+                "Carrier map raw-point count {} does not match loaded point cloud {}".format(
+                    manifest.get("total_raw_points"), raw_count
+                )
+            )
+
+        raw = np.load(paths["raw"], allow_pickle=False)
+        alias = np.load(paths["alias"], allow_pickle=False)
+        carrier = np.load(paths["carrier"], allow_pickle=False)
+        cohort = np.load(paths["cohort"], allow_pickle=False)
+        self._require_npz_keys(
+            raw,
+            "raw_point_initialization_map.npz",
+            (
+                "raw_point_index",
+                "alias_id",
+                "carrier_id",
+                "initialization_role",
+                "collapse_into_carrier",
+            ),
+        )
+        self._require_npz_keys(
+            alias,
+            "alias_initialization_map.npz",
+            (
+                "alias_id",
+                "source_frame",
+                "carrier_id",
+                "initialization_role",
+                "collapse_into_carrier",
+            ),
+        )
+        if no_fallback_schema:
+            self._require_npz_keys(
+                raw,
+                "raw_point_initialization_map.npz",
+                ("initialize_as_fallback",),
+            )
+            self._require_npz_keys(
+                alias,
+                "alias_initialization_map.npz",
+                ("initialize_as_fallback",),
+            )
+        self._require_npz_keys(
+            carrier,
+            "carrier_initialization_table.npz",
+            (
+                "carrier_id",
+                "carrier_role",
+                "cohort_id",
+                "canonical_xyz",
+                "canonical_rgb",
+                "motion_anchor_time",
+                "support_start_time",
+                "support_end_time",
+                "independent_motion_coefficients",
+                "individual_residual_coefficients",
+                "carrier_raw_point_offsets",
+                "carrier_raw_point_indices",
+            ),
+        )
+        self._require_npz_keys(
+            cohort,
+            "cohort_initialization_table.npz",
+            (
+                "cohort_id",
+                "motion_anchor_time",
+                "support_start_time",
+                "support_end_time",
+                "shared_motion_coefficients",
+                "member_offsets",
+                "member_carrier_ids",
+            ),
+        )
+
+        raw_indices = raw["raw_point_index"].astype(np.int64, copy=False)
+        expected_raw_indices = np.arange(raw_count, dtype=np.int64)
+        if not np.array_equal(raw_indices, expected_raw_indices):
+            raise RuntimeError(
+                "Carrier raw_point_index must be the unchanged contiguous PCD order"
+            )
+        collapse = raw["collapse_into_carrier"].astype(np.bool_, copy=False)
+        raw_alias_id = raw["alias_id"].astype(np.int64, copy=False)
+        raw_carrier_id = raw["carrier_id"].astype(np.int64, copy=False)
+        raw_role = raw["initialization_role"].astype(np.int8, copy=False)
+        fallback = (
+            raw["initialize_as_fallback"].astype(np.bool_, copy=False)
+            if no_fallback_schema
+            else ~collapse
+        )
+        if any(
+            value.shape != (raw_count,)
+            for value in (
+                collapse,
+                raw_alias_id,
+                raw_carrier_id,
+                raw_role,
+                fallback,
+            )
+        ):
+            raise RuntimeError("Carrier raw-point columns have an invalid shape")
+        if not np.array_equal(collapse, raw_carrier_id >= 0):
+            raise RuntimeError("Carrier collapse mask and raw carrier ids disagree")
+        if np.any(raw_carrier_id[~collapse] != -1):
+            raise RuntimeError("Fallback raw points must use carrier_id=-1")
+        if np.any(fallback & collapse):
+            raise RuntimeError("A collapsed raw point cannot also be a fallback")
+        if no_fallback_schema:
+            if np.any(fallback):
+                raise RuntimeError(
+                    "High-confidence no-fallback schema emitted a fallback raw point"
+                )
+            if not np.all(
+                np.isin(raw_role[~collapse], np.asarray([7, 8], dtype=np.int8))
+            ):
+                raise RuntimeError(
+                    "Excluded raw points must be unknown-valid or invalid"
+                )
+        elif not np.all(
+            np.isin(raw_role[~collapse], np.asarray([0, 1, 5, 6], dtype=np.int8))
+        ):
+            raise RuntimeError("Fallback raw points contain an invalid diagnostic role")
+
+        alias_ids = alias["alias_id"].astype(np.int64, copy=False)
+        alias_count = int(alias_ids.size)
+        if not np.array_equal(alias_ids, np.arange(alias_count, dtype=np.int64)):
+            raise RuntimeError("Alias ids must be dense and zero based")
+        if np.any(raw_alias_id < 0) or np.any(raw_alias_id >= alias_count):
+            raise RuntimeError("Raw point references an invalid alias id")
+        for key in (
+            "carrier_id",
+            "initialization_role",
+            "collapse_into_carrier",
+        ):
+            if not np.array_equal(raw[key], alias[key][raw_alias_id]):
+                raise RuntimeError(
+                    f"Raw-point {key} disagrees with alias provenance"
+                )
+        if no_fallback_schema and not np.array_equal(
+            raw["initialize_as_fallback"],
+            alias["initialize_as_fallback"][raw_alias_id],
+        ):
+            raise RuntimeError(
+                "Raw-point fallback policy disagrees with alias provenance"
+            )
+        duration = int(manifest.get("duration", -1))
+        sequence_start = int(manifest.get("sequence_start", 0))
+        if duration <= 0:
+            raise RuntimeError("Carrier manifest duration must be positive")
+        alias_source_frame = alias["source_frame"].astype(np.int64, copy=False)
+        expected_raw_times = (
+            alias_source_frame[raw_alias_id].astype(np.float64)
+            - float(sequence_start)
+        ) / float(duration)
+        loaded_raw_times = np.asarray(raw_times, dtype=np.float64).reshape(-1)
+        if loaded_raw_times.shape != (raw_count,) or not np.allclose(
+            loaded_raw_times,
+            expected_raw_times,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise RuntimeError(
+                "Loaded PCD timestamps do not match Carrier alias provenance"
+            )
+
+        carrier_ids = carrier["carrier_id"].astype(np.int64, copy=False)
+        carrier_count = int(carrier_ids.size)
+        if not np.array_equal(carrier_ids, np.arange(carrier_count, dtype=np.int64)):
+            raise RuntimeError("Carrier ids must be dense and zero based")
+        carrier_role = carrier["carrier_role"].astype(np.int8, copy=False)
+        expected_carrier_shapes = {
+            "carrier_role": (carrier_count,),
+            "cohort_id": (carrier_count,),
+            "canonical_xyz": (carrier_count, 3),
+            "canonical_rgb": (carrier_count, 3),
+            "motion_anchor_time": (carrier_count,),
+            "support_start_time": (carrier_count,),
+            "support_end_time": (carrier_count,),
+            "independent_motion_coefficients": (carrier_count, 3, 3),
+            "individual_residual_coefficients": (carrier_count, 2, 3),
+        }
+        for key, expected_shape in expected_carrier_shapes.items():
+            if carrier[key].shape != expected_shape:
+                raise RuntimeError(
+                    f"Carrier table {key} has shape {carrier[key].shape}, "
+                    f"expected {expected_shape}"
+                )
+        if not np.all(np.isin(carrier_role, np.asarray([2, 3, 4], dtype=np.int8))):
+            raise RuntimeError("Carrier table contains a role outside H0/H1/H2")
+        if np.any(raw_carrier_id[collapse] >= carrier_count):
+            raise RuntimeError("Raw point references an invalid Carrier id")
+        if not np.array_equal(
+            raw_role[collapse], carrier_role[raw_carrier_id[collapse]]
+        ):
+            raise RuntimeError("Raw-point roles disagree with their Carrier roles")
+
+        raw_offsets = carrier["carrier_raw_point_offsets"].astype(np.int64, copy=False)
+        carrier_raw_indices = carrier["carrier_raw_point_indices"].astype(np.int64, copy=False)
+        if raw_offsets.shape != (carrier_count + 1,) or raw_offsets[0] != 0:
+            raise RuntimeError("Carrier raw-point offsets have an invalid shape")
+        if raw_offsets[-1] != carrier_raw_indices.size or np.any(np.diff(raw_offsets) <= 0):
+            raise RuntimeError("Carrier raw-point offsets are inconsistent")
+        if np.any(carrier_raw_indices < 0) or np.any(carrier_raw_indices >= raw_count):
+            raise RuntimeError("Carrier table references an out-of-range raw point")
+        if np.unique(carrier_raw_indices).size != carrier_raw_indices.size:
+            raise RuntimeError("A raw point is assigned to multiple Carriers")
+        if not np.array_equal(
+            np.sort(carrier_raw_indices), np.flatnonzero(collapse)
+        ):
+            raise RuntimeError("Collapsed raw points do not exactly match Carrier members")
+
+        cohort_ids = cohort["cohort_id"].astype(np.int64, copy=False)
+        cohort_count = int(cohort_ids.size)
+        if not np.array_equal(cohort_ids, np.arange(cohort_count, dtype=np.int64)):
+            raise RuntimeError("Cohort ids must be dense and zero based")
+        carrier_cohort_id = carrier["cohort_id"].astype(np.int64, copy=False)
+        expected_cohort_shapes = {
+            "motion_anchor_time": (cohort_count,),
+            "support_start_time": (cohort_count,),
+            "support_end_time": (cohort_count,),
+            "shared_motion_coefficients": (cohort_count, 3, 3),
+            "member_offsets": (cohort_count + 1,),
+        }
+        for key, expected_shape in expected_cohort_shapes.items():
+            if cohort[key].shape != expected_shape:
+                raise RuntimeError(
+                    f"Cohort table {key} has shape {cohort[key].shape}, "
+                    f"expected {expected_shape}"
+                )
+        h2_mask = carrier_role == 4
+        if np.any(carrier_cohort_id[h2_mask] < 0) or np.any(
+            carrier_cohort_id[h2_mask] >= cohort_count
+        ):
+            raise RuntimeError("H2 Carrier references an invalid Cohort")
+        if np.any(carrier_cohort_id[~h2_mask] != -1):
+            raise RuntimeError("Only H2 Carriers may reference a Cohort")
+        member_offsets = cohort["member_offsets"].astype(np.int64, copy=False)
+        member_carrier_ids = cohort["member_carrier_ids"].astype(
+            np.int64, copy=False
+        )
+        if (
+            member_offsets[0] != 0
+            or member_offsets[-1] != member_carrier_ids.size
+            or np.any(np.diff(member_offsets) <= 0)
+            or np.any(member_carrier_ids < 0)
+            or np.any(member_carrier_ids >= carrier_count)
+            or np.unique(member_carrier_ids).size != member_carrier_ids.size
+        ):
+            raise RuntimeError("Cohort membership CSR is inconsistent")
+        if not np.array_equal(np.sort(member_carrier_ids), np.flatnonzero(h2_mask)):
+            raise RuntimeError("Cohort members do not exactly match H2 Carriers")
+        for cohort_index in range(cohort_count):
+            start = int(member_offsets[cohort_index])
+            stop = int(member_offsets[cohort_index + 1])
+            if not np.all(
+                carrier_cohort_id[member_carrier_ids[start:stop]]
+                == cohort_index
+            ):
+                raise RuntimeError("Carrier-to-Cohort membership is inconsistent")
+
+        finite_arrays = (
+            carrier["canonical_xyz"],
+            carrier["canonical_rgb"],
+            carrier["motion_anchor_time"],
+            carrier["support_start_time"],
+            carrier["support_end_time"],
+            carrier["independent_motion_coefficients"],
+            carrier["individual_residual_coefficients"],
+            cohort["motion_anchor_time"],
+            cohort["support_start_time"],
+            cohort["support_end_time"],
+            cohort["shared_motion_coefficients"],
+        )
+        if not all(np.all(np.isfinite(value)) for value in finite_arrays):
+            raise RuntimeError("Carrier initialization contains a non-finite value")
+        if np.any(carrier["canonical_rgb"] < 0.0) or np.any(
+            carrier["canonical_rgb"] > 1.0
+        ):
+            raise RuntimeError("Carrier canonical RGB must be in [0, 1]")
+        carrier_anchor = carrier["motion_anchor_time"].astype(np.float32, copy=False)
+        carrier_start = carrier["support_start_time"].astype(np.float32, copy=False)
+        carrier_end = carrier["support_end_time"].astype(np.float32, copy=False)
+        if np.any(carrier_start > carrier_anchor) or np.any(carrier_anchor > carrier_end):
+            raise RuntimeError("Carrier anchor lies outside its observed support")
+        cohort_anchor = cohort["motion_anchor_time"].astype(np.float32, copy=False)
+        cohort_start = cohort["support_start_time"].astype(np.float32, copy=False)
+        cohort_end = cohort["support_end_time"].astype(np.float32, copy=False)
+        if np.any(cohort_start > cohort_anchor) or np.any(cohort_anchor > cohort_end):
+            raise RuntimeError("Cohort anchor lies outside its observed support")
+        if np.any(h2_mask) and not np.allclose(
+            carrier_anchor[h2_mask],
+            cohort_anchor[carrier_cohort_id[h2_mask]],
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise RuntimeError(
+                "H2 Carrier and Cohort motion anchors must be identical"
+            )
+
+        raw_dist2_cpu = raw_dist2.detach().cpu().numpy().reshape(-1)
+        carrier_dist2 = np.empty((carrier_count,), dtype=np.float32)
+        for carrier_index in range(carrier_count):
+            start = int(raw_offsets[carrier_index])
+            stop = int(raw_offsets[carrier_index + 1])
+            carrier_dist2[carrier_index] = np.median(
+                raw_dist2_cpu[carrier_raw_indices[start:stop]]
+            )
+
+        residual = carrier["individual_residual_coefficients"].astype(
+            np.float32, copy=False
+        )
+        if residual.ndim != 3 or residual.shape[0] != carrier_count or residual.shape[2] != 3:
+            raise RuntimeError("Carrier residual motion has an invalid shape")
+        residual_padded = np.zeros((carrier_count, 3, 3), dtype=np.float32)
+        residual_degree = min(int(residual.shape[1]), 3)
+        residual_padded[:, :residual_degree, :] = residual[:, :residual_degree, :]
+
+        device = raw_dist2.device
+        dtype = raw_dist2.dtype
+        bank = CarrierMotionBank(
+            torch.from_numpy(carrier_role).to(device=device),
+            torch.from_numpy(carrier_cohort_id).to(device=device),
+            torch.from_numpy(carrier_anchor).to(device=device, dtype=dtype),
+            torch.from_numpy(carrier_start).to(device=device, dtype=dtype),
+            torch.from_numpy(carrier_end).to(device=device, dtype=dtype),
+            torch.from_numpy(
+                carrier["independent_motion_coefficients"].astype(
+                    np.float32, copy=False
+                )
+            ).to(device=device, dtype=dtype),
+            torch.from_numpy(residual_padded).to(device=device, dtype=dtype),
+            torch.from_numpy(cohort_anchor).to(device=device, dtype=dtype),
+            torch.from_numpy(cohort_start).to(device=device, dtype=dtype),
+            torch.from_numpy(cohort_end).to(device=device, dtype=dtype),
+            torch.from_numpy(
+                cohort["shared_motion_coefficients"].astype(
+                    np.float32, copy=False
+                )
+            ).to(device=device, dtype=dtype),
+        ).to(device=device)
+
+        expected_initial_gaussians = int(np.count_nonzero(fallback) + carrier_count)
+        if (
+            int(manifest.get("collapsed_raw_points", -1))
+            != int(np.count_nonzero(collapse))
+            or int(manifest.get("projected_raw_primitive_count", -1))
+            != expected_initial_gaussians
+            or (
+                no_fallback_schema
+                and int(manifest.get("fallback_raw_points", -1)) != 0
+            )
+        ):
+            raise RuntimeError("Carrier manifest topology counts are inconsistent")
+        initial_role = np.concatenate((raw_role[fallback], carrier_role), axis=0)
+        initial_carrier_id = np.concatenate(
+            (
+                np.full(int(np.count_nonzero(fallback)), -1, dtype=np.int64),
+                carrier_ids,
+            ),
+            axis=0,
+        )
+        self.carrier_motion_bank = bank
+        self._carrier_initialization_stats = {
+            "schema": expected_schema,
+            "path": root,
+            "raw_points": int(raw_count),
+            "collapsed_raw_points": int(np.count_nonzero(collapse)),
+            "initial_gaussians": expected_initial_gaussians,
+            "fallback_gaussians": int(np.count_nonzero(fallback)),
+            "fallback_role0": int(np.count_nonzero(raw_role[fallback] == 0)),
+            "fallback_role1": int(np.count_nonzero(raw_role[fallback] == 1)),
+            "fallback_role5": int(np.count_nonzero(raw_role[fallback] == 5)),
+            "fallback_role6": int(np.count_nonzero(raw_role[fallback] == 6)),
+            "excluded_raw_points": int(
+                raw_count - np.count_nonzero(collapse) - np.count_nonzero(fallback)
+            ),
+            "carrier_count": carrier_count,
+            "cohort_count": cohort_count,
+            "h0_carriers": int(np.count_nonzero(carrier_role == 2)),
+            "h1_carriers": int(np.count_nonzero(carrier_role == 3)),
+            "h2_carriers": int(np.count_nonzero(carrier_role == 4)),
+            "motion_extrapolation": "endpoint_clamped",
+            "duration": duration,
+            "sequence_start": sequence_start,
+            "first_timestamp": float(expected_raw_times.min()),
+            "last_timestamp": float(expected_raw_times.max()),
+        }
+        _init_status(
+            "Carrier map validated: raw={}, collapsed={}, fallback={}, excluded={}, "
+            "carriers={}, cohorts={}, H0/H1/H2={}/{}/{}".format(
+                int(raw_count),
+                int(np.count_nonzero(collapse)),
+                int(np.count_nonzero(fallback)),
+                int(raw_count - np.count_nonzero(collapse) - np.count_nonzero(fallback)),
+                carrier_count,
+                cohort_count,
+                int(np.count_nonzero(carrier_role == 2)),
+                int(np.count_nonzero(carrier_role == 3)),
+                int(np.count_nonzero(carrier_role == 4)),
+            )
+        )
+        return {
+            "fallback_mask": fallback,
+            "canonical_xyz": carrier["canonical_xyz"].astype(np.float32, copy=False),
+            "canonical_rgb": carrier["canonical_rgb"].astype(np.float32, copy=False),
+            "carrier_anchor": carrier_anchor.reshape(-1, 1),
+            "carrier_dist2": carrier_dist2,
+            "initialization_role": initial_role,
+            "carrier_id": initial_carrier_id,
+        }
+
+    def _assert_carrier_topology(self):
+        if not self.field_carrier_initialization:
+            return
+        count = int(self.get_xyz.shape[0])
+        if self.carrier_motion_bank is None:
+            raise RuntimeError("Carrier initialization is active without a MotionBank")
+        if self._carrier_id.shape != (count,):
+            raise RuntimeError("carrier_id is not aligned with Gaussian topology")
+        if self._initialization_role.shape != (count,):
+            raise RuntimeError(
+                "initialization_role is not aligned with Gaussian topology"
+            )
+        if self._motion_time_anchor.shape != (count, 1):
+            raise RuntimeError(
+                "motion_time_anchor is not aligned with Gaussian topology"
+            )
+        if not bool(torch.all(torch.isfinite(self._motion_time_anchor))):
+            raise RuntimeError("Carrier motion_time_anchor contains a non-finite value")
+        if bool(torch.any(self._carrier_id < -1)):
+            raise RuntimeError("Gaussian carrier_id must be -1 or a valid bank id")
+        valid = self._carrier_id >= 0
+        if bool(torch.any(self._carrier_id[valid] >= self.carrier_motion_bank.carrier_count)):
+            raise RuntimeError("Gaussian references an invalid Carrier id")
+        if bool(torch.any(valid)):
+            expected_role = self.carrier_motion_bank.carrier_role[
+                self._carrier_id[valid]
+            ]
+            if not bool(torch.all(self._initialization_role[valid] == expected_role)):
+                raise RuntimeError("Gaussian Carrier role disagrees with MotionBank")
+            expected_anchor = self.carrier_motion_bank.carrier_anchor_time[
+                self._carrier_id[valid]
+            ].to(
+                device=self._motion_time_anchor.device,
+                dtype=self._motion_time_anchor.dtype,
+            )
+            if not bool(
+                torch.allclose(
+                    self._motion_time_anchor[valid],
+                    expected_anchor,
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+            ):
+                raise RuntimeError(
+                    "Gaussian Carrier motion anchor disagrees with MotionBank"
+                )
+        if bool(torch.any(self._carrier_id[~valid] != -1)):
+            raise RuntimeError("Fallback Gaussian must use carrier_id=-1")
+        fallback_role = self._initialization_role[~valid]
+        valid_fallback_role = (
+            (fallback_role == 0)
+            | (fallback_role == 1)
+            | (fallback_role == 5)
+            | (fallback_role == 6)
+        )
+        if not bool(torch.all(valid_fallback_role)):
+            raise RuntimeError("Fallback Gaussian contains an invalid diagnostic role")
+        if self.field_existence_single_expert != "persistent":
+            raise RuntimeError("Carrier topology requires Persistent-only existence")
+
+    @torch.no_grad()
+    def _carrier_motion_preflight(self):
+        if not self.field_carrier_initialization:
+            return
+        self._assert_carrier_topology()
+        ids = torch.arange(
+            self.carrier_motion_bank.carrier_count,
+            device=self.get_xyz.device,
+            dtype=torch.long,
+        )
+        first_time = float(self._carrier_initialization_stats["first_timestamp"])
+        last_time = float(self._carrier_initialization_stats["last_timestamp"])
+        query_times = (first_time, 0.5 * (first_time + last_time), last_time)
+        max_displacement = 0.0
+        max_q90 = 0.0
+        for query_time in query_times:
+            displacement, _ = self.carrier_motion_bank.displacement(
+                ids, query_time, dtype=self.get_xyz.dtype
+            )
+            if not bool(torch.all(torch.isfinite(displacement))):
+                raise RuntimeError(
+                    "Carrier motion preflight produced a non-finite displacement"
+                )
+            h0 = self.carrier_motion_bank.carrier_role == 2
+            if bool(torch.any(torch.abs(displacement[h0]) > 1e-7)):
+                raise RuntimeError("H0 Carrier displacement must be identically zero")
+            norm = torch.linalg.norm(displacement, dim=1)
+            max_displacement = max(max_displacement, float(norm.max().item()))
+            max_q90 = max(
+                max_q90,
+                float(torch.quantile(norm.float(), 0.90).item()),
+            )
+        bbox_span = torch.amax(self.get_xyz.detach(), dim=0) - torch.amin(
+            self.get_xyz.detach(), dim=0
+        )
+        bbox_diagonal = float(torch.linalg.norm(bbox_span).item())
+        if max_displacement > max(10.0 * bbox_diagonal, 1.0):
+            raise RuntimeError(
+                "Carrier endpoint-clamped displacement exceeds the scene-scale "
+                "preflight envelope"
+            )
+        self._carrier_initialization_stats.update(
+            {
+                "preflight_displacement_q90_max": max_q90,
+                "preflight_displacement_max": max_displacement,
+                "preflight_bbox_diagonal": bbox_diagonal,
+            }
+        )
+        print(
+            "[STEGF] Carrier motion preflight: times={:.4g},{:.4g},{:.4g}, "
+            "disp_q90_max={:.6g}, disp_max={:.6g}, bbox_diag={:.6g}".format(
+                query_times[0],
+                query_times[1],
+                query_times[2],
+                max_q90,
+                max_displacement,
+                bbox_diagonal,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
+        if self.field_carrier_initialization and int(self.preprocesspoints) != 0:
+            raise ValueError(
+                "Carrier initialization requires preprocesspoints=0 so the "
+                "raw COLMAP point order remains unchanged"
+            )
         if self.preprocesspoints == 3:
             pcd = interpolate_point(pcd, 4) 
         
@@ -2834,14 +4833,68 @@ class GaussianModel:
         else:
             pass 
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
-        times = torch.tensor(np.asarray(pcd.times)).float().cuda()
+        raw_points = np.asarray(pcd.points)
+        raw_colors = np.asarray(pcd.colors)
+        raw_times = np.asarray(pcd.times)
+        _init_status(f"Computing point scales: points={raw_points.shape[0]}")
+        raw_point_cloud = torch.from_numpy(raw_points).float().cuda()
+        raw_dist2 = torch.clamp_min(distCUDA2(raw_point_cloud), 0.0000001)
 
+        if self.field_carrier_initialization:
+            carrier_init = self._load_carrier_initialization(
+                raw_points.shape[0], raw_dist2, raw_times
+            )
+            fallback = carrier_init["fallback_mask"]
+            fused_points_np = np.concatenate(
+                (raw_points[fallback], carrier_init["canonical_xyz"]), axis=0
+            )
+            fused_colors_np = np.concatenate(
+                (raw_colors[fallback], carrier_init["canonical_rgb"]), axis=0
+            )
+            fused_times_np = np.concatenate(
+                (raw_times[fallback], carrier_init["carrier_anchor"]), axis=0
+            )
+            fused_point_cloud = torch.from_numpy(
+                np.ascontiguousarray(fused_points_np)
+            ).float().cuda()
+            fused_color = torch.from_numpy(
+                np.ascontiguousarray(fused_colors_np)
+            ).float().cuda()
+            times = torch.from_numpy(
+                np.ascontiguousarray(fused_times_np)
+            ).float().cuda()
+            fallback_tensor = torch.from_numpy(fallback).to(
+                device=raw_dist2.device, dtype=torch.bool
+            )
+            carrier_dist2 = torch.from_numpy(
+                carrier_init["carrier_dist2"]
+            ).to(device=raw_dist2.device, dtype=raw_dist2.dtype)
+            dist2 = torch.cat((raw_dist2[fallback_tensor], carrier_dist2), dim=0)
+            self._carrier_id = torch.from_numpy(
+                carrier_init["carrier_id"]
+            ).to(device="cuda", dtype=torch.long)
+            self._initialization_role = torch.from_numpy(
+                carrier_init["initialization_role"]
+            ).to(device="cuda", dtype=torch.int8)
+        else:
+            fused_point_cloud = raw_point_cloud
+            fused_color = torch.from_numpy(raw_colors).float().cuda()
+            times = torch.from_numpy(raw_times).float().cuda()
+            dist2 = raw_dist2
+            self._carrier_id = torch.full(
+                (fused_point_cloud.shape[0],),
+                -1,
+                device="cuda",
+                dtype=torch.long,
+            )
+            self._initialization_role = torch.zeros(
+                (fused_point_cloud.shape[0],),
+                device="cuda",
+                dtype=torch.int8,
+            )
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        _init_status(f"Allocating Gaussian parameters: points={fused_point_cloud.shape[0]}")
 
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         scales = torch.clamp(scales, -10, 1.0)
 
@@ -2891,6 +4944,12 @@ class GaussianModel:
 
         nn.init.constant_(self._features_t, 0)
         nn.init.constant_(self._omega, 0)
+        self._init_existence_parameters(
+            self.get_xyz.shape[0],
+            times=self.get_trbfcenter.detach(),
+            active=False,
+        )
+        self._carrier_motion_preflight()
 
 
 
@@ -2899,6 +4958,7 @@ class GaussianModel:
         self.maxx, self.minx = torch.amax(self._xyz[:,0]), torch.amin(self._xyz[:,0]) 
         self.maxz = min((self.maxz, 200.0)) # some outliers in the n4d datasets.. 
         if self.use_euler_field:
+            _init_status("Building radiance field and routers")
             bbox_min = torch.amin(self._xyz.detach(), dim=0)
             bbox_max = torch.amax(self._xyz.detach(), dim=0)
             self._build_euler_modules(
@@ -2964,10 +5024,19 @@ class GaussianModel:
         self._scaling_grd += self._scaling.grad.clone()
         self._rotation_grd += self._rotation.grad.clone()
         self._opacity_grd += self._opacity.grad.clone()
-        self._trbf_center_grd += self._trbf_center.grad.clone()
-        self._trbf_scale_grd += self._trbf_scale.grad.clone()
-        self._motion_grd += self._motion.grad.clone()
+        if self._trbf_center.grad is not None:
+            self._trbf_center_grd += self._trbf_center.grad.clone()
+        if self._trbf_scale.grad is not None:
+            self._trbf_scale_grd += self._trbf_scale.grad.clone()
+        if self._motion.grad is not None:
+            self._motion_grd += self._motion.grad.clone()
         self._omega_grd += self._omega.grad.clone()
+        if self._existence_logits.numel() > 0 and self._existence_logits.grad is not None:
+            self._existence_logits_grd += self._existence_logits.grad.clone()
+        if self._interval_center_raw.numel() > 0 and self._interval_center_raw.grad is not None:
+            self._interval_center_raw_grd += self._interval_center_raw.grad.clone()
+        if self._interval_log_half_width.numel() > 0 and self._interval_log_half_width.grad is not None:
+            self._interval_log_half_width_grd += self._interval_log_half_width.grad.clone()
         if self.use_euler_field and self._static_level_logits.numel() > 0 and self._static_level_logits.grad is not None:
             self._static_level_logits_grd += self._static_level_logits.grad.clone()
         if self.use_euler_field and self._dynamic_level_logits.numel() > 0 and self._dynamic_level_logits.grad is not None:
@@ -2987,6 +5056,21 @@ class GaussianModel:
             for name, param in self.euler_field.named_parameters():
                 if param.grad is not None:
                     self.field_grd[name] = self.field_grd[name] + param.grad.clone()
+        if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
+            for name, param in self.h2_velocity_field.named_parameters():
+                if param.grad is not None:
+                    self.h2_velocity_field_grd[name] = (
+                        self.h2_velocity_field_grd[name] + param.grad.clone()
+                    )
+        if (
+            self.field_motion_model == "carrier_hybrid"
+            and self.carrier_motion_bank is not None
+        ):
+            for name, param in self.carrier_motion_bank.named_parameters():
+                if param.grad is not None:
+                    self.carrier_motion_bank_grd[name] = (
+                        self.carrier_motion_bank_grd[name] + param.grad.clone()
+                    )
         if self.use_euler_field and self.field_router is not None:
             for name, param in self.field_router.named_parameters():
                 if param.grad is not None:
@@ -3029,6 +5113,15 @@ class GaussianModel:
         self._trbf_scale_grd = torch.zeros_like(self._trbf_scale, requires_grad=False)
         self._motion_grd = torch.zeros_like(self._motion, requires_grad=False)
         self._omega_grd = torch.zeros_like(self._omega, requires_grad=False)
+        if self._existence_logits.numel() > 0:
+            self._existence_logits_grd = torch.zeros_like(self._existence_logits, requires_grad=False)
+        if self._interval_center_raw.numel() > 0:
+            self._interval_center_raw_grd = torch.zeros_like(self._interval_center_raw, requires_grad=False)
+        if self._interval_log_half_width.numel() > 0:
+            self._interval_log_half_width_grd = torch.zeros_like(
+                self._interval_log_half_width,
+                requires_grad=False,
+            )
         if self.use_euler_field and self._static_level_logits.numel() > 0:
             self._static_level_logits_grd = torch.zeros_like(self._static_level_logits, requires_grad=False)
         if self.use_euler_field and self._dynamic_level_logits.numel() > 0:
@@ -3047,6 +5140,10 @@ class GaussianModel:
             self.rgb_grd[name].zero_()
         for name in self.field_grd.keys():
             self.field_grd[name].zero_()
+        for name in self.h2_velocity_field_grd.keys():
+            self.h2_velocity_field_grd[name].zero_()
+        for name in self.carrier_motion_bank_grd.keys():
+            self.carrier_motion_bank_grd[name].zero_()
         for name in self.field_router_grd.keys():
             self.field_router_grd[name].zero_()
         for name in self.field_query_gate_grd.keys():
@@ -3074,6 +5171,12 @@ class GaussianModel:
         self._trbf_scale.grad = self._trbf_scale_grd* ratio
         self._motion.grad = self._motion_grd * ratio
         self._omega.grad = self._omega_grd * ratio
+        if self._existence_logits.numel() > 0:
+            self._existence_logits.grad = self._existence_logits_grd * ratio
+        if self._interval_center_raw.numel() > 0:
+            self._interval_center_raw.grad = self._interval_center_raw_grd * ratio
+        if self._interval_log_half_width.numel() > 0:
+            self._interval_log_half_width.grad = self._interval_log_half_width_grd * ratio
         if self.use_euler_field and self._static_level_logits.numel() > 0:
             self._static_level_logits.grad = self._static_level_logits_grd * ratio
         if self.use_euler_field and self._dynamic_level_logits.numel() > 0:
@@ -3091,6 +5194,15 @@ class GaussianModel:
         if self.use_euler_field and self.euler_field is not None:
             for name, param in self.euler_field.named_parameters():
                 param.grad = self.field_grd[name] * ratio
+        if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
+            for name, param in self.h2_velocity_field.named_parameters():
+                param.grad = self.h2_velocity_field_grd[name] * ratio
+        if (
+            self.field_motion_model == "carrier_hybrid"
+            and self.carrier_motion_bank is not None
+        ):
+            for name, param in self.carrier_motion_bank.named_parameters():
+                param.grad = self.carrier_motion_bank_grd[name] * ratio
         if self.use_euler_field and self.field_router is not None:
             for name, param in self.field_router.named_parameters():
                 param.grad = self.field_router_grd[name] * ratio
@@ -3163,8 +5275,12 @@ class GaussianModel:
         self._ensure_content_exposure_head()
         if self.content_exposure_head is not None:
             self.content_exposure_head.cuda()
+        if self.carrier_motion_bank is not None:
+            self.carrier_motion_bank.cuda()
         if self.use_euler_field and self.euler_field is not None:
             self.euler_field.cuda()
+            if self.h2_velocity_field is not None:
+                self.h2_velocity_field.cuda()
             self.field_router.cuda()
             self.field_query_gate.cuda()
             self.field_decoder.cuda()
@@ -3184,10 +5300,71 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._omega], 'lr': training_args.omega_lr, "name": "omega"},
-            {'params': [self._trbf_center], 'lr': training_args.trbfc_lr, "name": "trbf_center"},
-            {'params': [self._trbf_scale], 'lr': training_args.trbfs_lr, "name": "trbf_scale"},
-            {'params': [self._motion], 'lr':  training_args.position_lr_init * self.spatial_lr_scale * 0.5 * training_args.movelr , "name": "motion"},
+            {
+                'params': [self._trbf_center],
+                'lr': 0.0 if self.field_motion_model == "carrier_hybrid" else training_args.trbfc_lr,
+                "name": "trbf_center",
+            },
+            {
+                'params': [self._trbf_scale],
+                'lr': 0.0 if self.field_motion_model == "carrier_hybrid" else training_args.trbfs_lr,
+                "name": "trbf_scale",
+            },
+            {
+                'params': [self._motion],
+                'lr': (
+                    0.0
+                    if self.field_motion_model == "h2"
+                    else training_args.position_lr_init
+                    * self.spatial_lr_scale
+                    * 0.5
+                    * training_args.movelr
+                ),
+                "name": "motion",
+            },
         ]
+        if self.field_motion_model == "carrier_hybrid":
+            if self.carrier_motion_bank is None:
+                raise RuntimeError(
+                    "carrier_hybrid training requires an initialized CarrierMotionBank"
+                )
+            carrier_lr = (
+                training_args.position_lr_init
+                * self.spatial_lr_scale
+                * 0.5
+                * training_args.movelr
+            )
+            l.append(
+                {
+                    'params': list(self.carrier_motion_bank.parameters()),
+                    'lr': carrier_lr,
+                    "name": "carrier_motion_bank",
+                }
+            )
+        if self.field_existence_moe and self._existence_logits.numel() > 0:
+            l.append(
+                {
+                    'params': [self._existence_logits],
+                    'lr': training_args.field_existence_lr,
+                    "name": "existence_logits",
+                }
+            )
+        if (
+            (self.field_existence_moe or self.field_existence_single_expert == "interval")
+            and self._interval_center_raw.numel() > 0
+        ):
+            l.extend([
+                {
+                    'params': [self._interval_center_raw],
+                    'lr': training_args.field_interval_center_lr,
+                    "name": "interval_center_raw",
+                },
+                {
+                    'params': [self._interval_log_half_width],
+                    'lr': training_args.field_interval_width_lr,
+                    "name": "interval_log_half_width",
+                },
+            ])
         if self.rgbdecoder is not None:
             l.append({'params': list(self.rgbdecoder.parameters()), 'lr': training_args.rgb_lr, "name": "decoder"})
         if self.content_exposure_head is not None:
@@ -3212,6 +5389,14 @@ class GaussianModel:
                 {'params': list(self.field_static_view_mapper.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_static_view_mapper"},
                 {'params': list(self.field_static_app_head.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_static_app"},
             ])
+            if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
+                l.append(
+                    {
+                        'params': list(self.h2_velocity_field.parameters()),
+                        'lr': training_args.field_h2_lr,
+                        "name": "h2_velocity_field",
+                    }
+                )
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         for group in self.optimizer.param_groups:
@@ -3480,6 +5665,16 @@ class GaussianModel:
             "field_bg_dense_beit_band_low": self.field_bg_dense_beit_band_low,
             "field_bg_dense_beit_band_high": self.field_bg_dense_beit_band_high,
             "field_bg_dense_beit_threshold": self.field_bg_dense_beit_threshold,
+            "field_bg_dense_source_time_select": int(self.field_bg_dense_source_time_select),
+            "field_bg_dense_source_time_indices": self.field_bg_dense_source_time_indices,
+            "field_bg_dense_source_min_support": self.field_bg_dense_source_min_support,
+            "field_bg_dense_source_beit_background_threshold": self.field_bg_dense_source_beit_background_threshold,
+            "field_bg_dense_source_dilate": self.field_bg_dense_source_dilate,
+            "field_bg_dense_source_motion_threshold": self.field_bg_dense_source_motion_threshold,
+            "field_bg_dense_source_median_threshold": self.field_bg_dense_source_median_threshold,
+            "field_bg_dense_source_score_beit_weight": self.field_bg_dense_source_score_beit_weight,
+            "field_bg_dense_source_score_motion_weight": self.field_bg_dense_source_score_motion_weight,
+            "field_bg_dense_source_score_median_weight": self.field_bg_dense_source_score_median_weight,
             "field_bg_dense_cell_dedup": int(self.field_bg_dense_cell_dedup),
             "field_bg_dense_dedup_level": self.field_bg_dense_dedup_level,
             "field_bg_dense_dedup_priority": self.field_bg_dense_dedup_priority,
@@ -3495,6 +5690,101 @@ class GaussianModel:
             "field_highfreq_densify_min_pixels": self.field_highfreq_densify_min_pixels,
             "field_highfreq_densify_gate_start": self.field_highfreq_densify_gate_start,
             "field_highfreq_densify_gate_width": self.field_highfreq_densify_gate_width,
+            "field_existence_moe": int(self.field_existence_moe),
+            "field_existence_single_expert": self.field_existence_single_expert,
+            "field_existence_start": self.field_existence_start,
+            "field_existence_temperature_start": self.field_existence_temperature_start,
+            "field_existence_temperature_end": self.field_existence_temperature_end,
+            "field_existence_temperature_until": self.field_existence_temperature_until,
+            "field_existence_router_init": self.field_existence_router_init,
+            "field_existence_interval_init_half_width": self.field_existence_interval_init_half_width,
+            "field_existence_interval_transition": self.field_existence_interval_transition,
+            "field_existence_interval_max_half_width": self.field_existence_interval_max_half_width,
+            "field_existence_transient_budget": self.field_existence_transient_budget,
+            "field_existence_budget_weight": self.field_existence_budget_weight,
+            "field_existence_transient_width_limit": self.field_existence_transient_width_limit,
+            "field_existence_width_route_weight": self.field_existence_width_route_weight,
+            "field_existence_entropy_weight": self.field_existence_entropy_weight,
+            "field_existence_harden_start": self.field_existence_harden_start,
+            "field_existence_coverage_delta": self.field_existence_coverage_delta,
+            "field_existence_coverage_margin": self.field_existence_coverage_margin,
+            "field_existence_coverage_weight": self.field_existence_coverage_weight,
+            "field_existence_log_interval": self.field_existence_log_interval,
+            "field_motion_model": self.field_motion_model,
+            "field_carrier_initialization": int(self.field_carrier_initialization),
+            "field_carrier_initialization_path": self.field_carrier_initialization_path,
+            "field_carrier_initialization_resolved_path": self._carrier_initialization_stats.get("path", ""),
+            "field_carrier_initialization_schema": self.field_carrier_initialization_schema,
+            "field_carrier_motion_extrapolation": "endpoint_clamped" if self.field_carrier_initialization else "none",
+            "field_h2_level_resolutions": self.field_h2_level_resolutions,
+            "field_h2_feature_dim": self.field_h2_feature_dim,
+            "field_h2_hidden_dim": self.field_h2_hidden_dim,
+            "field_h2_fourier_degree": self.field_h2_fourier_degree,
+            "field_h2_max_normalized_speed": self.field_h2_max_normalized_speed,
+            "field_h2_integration_steps": self.field_h2_integration_steps,
+            "field_h2_integration_method": self.field_h2_integration_method,
+            "field_h2_velocity_reg_weight": self.field_h2_velocity_reg_weight,
+            "field_mvstruct": int(self.field_mvstruct),
+            "field_mvstruct_start": self.field_mvstruct_start,
+            "field_mvstruct_until": self.field_mvstruct_until,
+            "field_mvstruct_interval": self.field_mvstruct_interval,
+            "field_mvstruct_views": self.field_mvstruct_views,
+            "field_mvstruct_min_event_views": self.field_mvstruct_min_event_views,
+            "field_mvstruct_dssim_weight": self.field_mvstruct_dssim_weight,
+            "field_mvstruct_densify": int(self.field_mvstruct_densify),
+            "field_mvstruct_densify_start": self.field_mvstruct_densify_start,
+            "field_mvstruct_densify_until": self.field_mvstruct_densify_until,
+            "field_mvstruct_densify_interval": self.field_mvstruct_densify_interval,
+            "field_mvstruct_grad_threshold": self.field_mvstruct_grad_threshold,
+            "field_mvstruct_min_observations": self.field_mvstruct_min_observations,
+            "field_mvstruct_min_visibility_ratio": self.field_mvstruct_min_visibility_ratio,
+            "field_mvstruct_min_opacity": self.field_mvstruct_min_opacity,
+            "field_mvstruct_event_max_ratio": self.field_mvstruct_event_max_ratio,
+            "field_mvstruct_total_max_ratio": self.field_mvstruct_total_max_ratio,
+            "field_mvstruct_cooldown": self.field_mvstruct_cooldown,
+            "field_mvstruct_oversize_split": int(self.field_mvstruct_oversize_split),
+            "field_mvstruct_oversize_radius": self.field_mvstruct_oversize_radius,
+            "field_mvstruct_oversize_budget_ratio": self.field_mvstruct_oversize_budget_ratio,
+            "field_mvstruct_hard_time": int(self.field_mvstruct_hard_time),
+            "field_mvstruct_hard_time_ema_decay": self.field_mvstruct_hard_time_ema_decay,
+            "field_mvstruct_hard_time_sampling": self.field_mvstruct_hard_time_sampling,
+            "field_mvstruct_hard_time_diverse_views": int(self.field_mvstruct_hard_time_diverse_views),
+            "field_mvstruct_conflict_split": int(self.field_mvstruct_conflict_split),
+            "field_mvstruct_conflict_source": self.field_mvstruct_conflict_source,
+            "field_mvstruct_conflict_threshold": self.field_mvstruct_conflict_threshold,
+            "field_mvstruct_conflict_min_events": self.field_mvstruct_conflict_min_events,
+            "field_mvstruct_conflict_budget_ratio": self.field_mvstruct_conflict_budget_ratio,
+            "field_mvstruct_conflict_min_radius": self.field_mvstruct_conflict_min_radius,
+            "field_mvstruct_conflict_children": self.field_mvstruct_conflict_children,
+            "field_mvstruct_conflict_specialize": int(self.field_mvstruct_conflict_specialize),
+            "field_mvstruct_conflict_directional_split": int(self.field_mvstruct_conflict_directional_split),
+            "field_mvstruct_directional_min_events": self.field_mvstruct_directional_min_events,
+            "field_mvstruct_directional_min_axis_ratio": self.field_mvstruct_directional_min_axis_ratio,
+            "field_mvstruct_directional_min_trace": self.field_mvstruct_directional_min_trace,
+            "field_mvstruct_directional_offset_ratio": self.field_mvstruct_directional_offset_ratio,
+            "field_mvstruct_specialize_min_events": self.field_mvstruct_specialize_min_events,
+            "field_mvstruct_specialize_axis_ratio": self.field_mvstruct_specialize_axis_ratio,
+            "field_mvstruct_specialize_min_radius": self.field_mvstruct_specialize_min_radius,
+            "field_mvstruct_specialize_feature_delta": self.field_mvstruct_specialize_feature_delta,
+            "field_mvstruct_specialize_offset_ratio": self.field_mvstruct_specialize_offset_ratio,
+            "field_mvstruct_specialize_scale_ratio": self.field_mvstruct_specialize_scale_ratio,
+            "field_layer_responsibility": int(self.field_layer_responsibility),
+            "field_layer_responsibility_start": self.field_layer_responsibility_start,
+            "field_layer_responsibility_until": self.field_layer_responsibility_until,
+            "field_layer_responsibility_interval": self.field_layer_responsibility_interval,
+            "field_layer_far_depth": self.field_layer_far_depth,
+            "field_layer_near_depth": self.field_layer_near_depth,
+            "field_layer_far_loss_weight": self.field_layer_far_loss_weight,
+            "field_layer_front_opacity_weight": self.field_layer_front_opacity_weight,
+            "field_layer_front_opacity_budget": self.field_layer_front_opacity_budget,
+            "field_layer_mask_erode": self.field_layer_mask_erode,
+            "field_layer_min_pixels": self.field_layer_min_pixels,
+            "field_layer_beit_time_indices": self.field_layer_beit_time_indices,
+            "field_layer_beit_background_threshold": self.field_layer_beit_background_threshold,
+            "field_layer_motion_threshold": self.field_layer_motion_threshold,
+            "field_layer_median_threshold": self.field_layer_median_threshold,
+            "field_layer_debug": int(self.field_layer_debug),
+            "field_layer_debug_max_events": self.field_layer_debug_max_events,
             "field_appearance_only_train": int(self.field_appearance_only_train),
             "field_appearance_only_start": self.field_appearance_only_start,
             "field_appearance_only_allow": self.field_appearance_only_allow,
@@ -3622,6 +5912,66 @@ class GaussianModel:
             if key in module_state and module_state[key].shape == value.shape:
                 compatible_state[key] = value
         module.load_state_dict(compatible_state, strict=False)
+
+    @staticmethod
+    def _carrier_bank_from_state_dict(state_dict, device="cuda"):
+        required = {
+            "carrier_role",
+            "carrier_cohort_id",
+            "carrier_anchor_time",
+            "carrier_support_start",
+            "carrier_support_end",
+            "cohort_anchor_time",
+            "cohort_support_start",
+            "cohort_support_end",
+            "h1_motion",
+            "h2_residual_motion",
+            "h2_shared_motion",
+        }
+        if not isinstance(state_dict, dict):
+            raise RuntimeError("Carrier checkpoint is missing MotionBank state")
+        actual = set(state_dict.keys())
+        if actual != required:
+            raise RuntimeError(
+                "Carrier MotionBank state keys mismatch: missing={}, extra={}".format(
+                    sorted(required - actual), sorted(actual - required)
+                )
+            )
+
+        def value(name, dtype=None):
+            tensor = state_dict[name]
+            if not torch.is_tensor(tensor):
+                raise RuntimeError(f"Carrier MotionBank {name} is not a tensor")
+            if dtype is None:
+                return tensor.detach().to(device=device)
+            return tensor.detach().to(device=device, dtype=dtype)
+
+        bank = CarrierMotionBank(
+            value("carrier_role", torch.int8),
+            value("carrier_cohort_id", torch.long),
+            value("carrier_anchor_time", torch.float32),
+            value("carrier_support_start", torch.float32),
+            value("carrier_support_end", torch.float32),
+            value("h1_motion", torch.float32),
+            value("h2_residual_motion", torch.float32),
+            value("cohort_anchor_time", torch.float32),
+            value("cohort_support_start", torch.float32),
+            value("cohort_support_end", torch.float32),
+            value("h2_shared_motion", torch.float32),
+        ).to(device=device)
+        bank.load_state_dict(
+            {
+                name: value(
+                    name,
+                    torch.float32
+                    if name not in {"carrier_role", "carrier_cohort_id"}
+                    else (torch.int8 if name == "carrier_role" else torch.long),
+                )
+                for name in required
+            },
+            strict=True,
+        )
+        return bank
 
     def _apply_loaded_field_state(self, payload, num_points, bbox_min, bbox_max, mask=None, append=False):
         config = payload.get("field_config", {})
@@ -3848,6 +6198,16 @@ class GaussianModel:
             self.field_bg_dense_beit_band_low = float(config.get("field_bg_dense_beit_band_low", self.field_bg_dense_beit_band_low))
             self.field_bg_dense_beit_band_high = float(config.get("field_bg_dense_beit_band_high", self.field_bg_dense_beit_band_high))
             self.field_bg_dense_beit_threshold = float(config.get("field_bg_dense_beit_threshold", self.field_bg_dense_beit_threshold))
+            self.field_bg_dense_source_time_select = bool(config.get("field_bg_dense_source_time_select", int(self.field_bg_dense_source_time_select)))
+            self.field_bg_dense_source_time_indices = str(config.get("field_bg_dense_source_time_indices", self.field_bg_dense_source_time_indices))
+            self.field_bg_dense_source_min_support = int(config.get("field_bg_dense_source_min_support", self.field_bg_dense_source_min_support))
+            self.field_bg_dense_source_beit_background_threshold = float(config.get("field_bg_dense_source_beit_background_threshold", self.field_bg_dense_source_beit_background_threshold))
+            self.field_bg_dense_source_dilate = int(config.get("field_bg_dense_source_dilate", self.field_bg_dense_source_dilate))
+            self.field_bg_dense_source_motion_threshold = float(config.get("field_bg_dense_source_motion_threshold", self.field_bg_dense_source_motion_threshold))
+            self.field_bg_dense_source_median_threshold = float(config.get("field_bg_dense_source_median_threshold", self.field_bg_dense_source_median_threshold))
+            self.field_bg_dense_source_score_beit_weight = float(config.get("field_bg_dense_source_score_beit_weight", self.field_bg_dense_source_score_beit_weight))
+            self.field_bg_dense_source_score_motion_weight = float(config.get("field_bg_dense_source_score_motion_weight", self.field_bg_dense_source_score_motion_weight))
+            self.field_bg_dense_source_score_median_weight = float(config.get("field_bg_dense_source_score_median_weight", self.field_bg_dense_source_score_median_weight))
             self.field_bg_dense_cell_dedup = bool(config.get("field_bg_dense_cell_dedup", int(self.field_bg_dense_cell_dedup)))
             self.field_bg_dense_dedup_level = int(config.get("field_bg_dense_dedup_level", self.field_bg_dense_dedup_level))
             self.field_bg_dense_dedup_priority = str(config.get("field_bg_dense_dedup_priority", self.field_bg_dense_dedup_priority))
@@ -3863,6 +6223,200 @@ class GaussianModel:
             self.field_highfreq_densify_min_pixels = int(config.get("field_highfreq_densify_min_pixels", self.field_highfreq_densify_min_pixels))
             self.field_highfreq_densify_gate_start = float(config.get("field_highfreq_densify_gate_start", self.field_highfreq_densify_gate_start))
             self.field_highfreq_densify_gate_width = float(config.get("field_highfreq_densify_gate_width", self.field_highfreq_densify_gate_width))
+            self.field_existence_moe = bool(config.get("field_existence_moe", int(self.field_existence_moe)))
+            self.field_existence_single_expert = str(
+                config.get(
+                    "field_existence_single_expert",
+                    self.field_existence_single_expert,
+                )
+            ).strip().lower()
+            if self.field_existence_single_expert in {"", "off", "legacy"}:
+                self.field_existence_single_expert = "none"
+            if self.field_existence_single_expert not in {
+                "none",
+                "persistent",
+                "interval",
+                "transient",
+            }:
+                raise ValueError(
+                    "Invalid checkpoint field_existence_single_expert={!r}".format(
+                        self.field_existence_single_expert
+                    )
+                )
+            if self.field_existence_single_expert != "none":
+                self.field_existence_moe = False
+            self.field_motion_model = str(
+                config.get("field_motion_model", self.field_motion_model)
+            ).strip().lower()
+            self.field_carrier_initialization = bool(
+                config.get(
+                    "field_carrier_initialization",
+                    int(self.field_carrier_initialization),
+                )
+            )
+            self.field_carrier_initialization_path = str(
+                config.get(
+                    "field_carrier_initialization_path",
+                    self.field_carrier_initialization_path,
+                )
+            )
+            self.field_carrier_initialization_schema = str(
+                config.get(
+                    "field_carrier_initialization_schema",
+                    self.field_carrier_initialization_schema,
+                )
+            )
+            if self.field_carrier_initialization:
+                if self.field_motion_model != "carrier_hybrid":
+                    raise RuntimeError(
+                        "Carrier checkpoint must use field_motion_model=carrier_hybrid"
+                    )
+                if self.field_existence_single_expert != "persistent":
+                    raise RuntimeError(
+                        "Carrier checkpoint must use Persistent-only existence"
+                    )
+                if self.field_existence_moe:
+                    raise RuntimeError(
+                        "Carrier checkpoint cannot contain existence MoE"
+                    )
+                if config.get("field_carrier_motion_extrapolation") not in {
+                    None,
+                    "endpoint_clamped",
+                }:
+                    raise RuntimeError(
+                        "Unsupported Carrier checkpoint extrapolation policy"
+                    )
+            elif self.field_motion_model == "carrier_hybrid":
+                raise RuntimeError(
+                    "carrier_hybrid checkpoint is missing Carrier initialization"
+                )
+            self.field_h2_level_resolutions = str(
+                config.get(
+                    "field_h2_level_resolutions",
+                    self.field_h2_level_resolutions,
+                )
+            )
+            self.field_h2_feature_dim = int(
+                config.get("field_h2_feature_dim", self.field_h2_feature_dim)
+            )
+            self.field_h2_hidden_dim = int(
+                config.get("field_h2_hidden_dim", self.field_h2_hidden_dim)
+            )
+            self.field_h2_fourier_degree = int(
+                config.get(
+                    "field_h2_fourier_degree",
+                    self.field_h2_fourier_degree,
+                )
+            )
+            self.field_h2_max_normalized_speed = float(
+                config.get(
+                    "field_h2_max_normalized_speed",
+                    self.field_h2_max_normalized_speed,
+                )
+            )
+            self.field_h2_integration_steps = max(
+                int(
+                    config.get(
+                        "field_h2_integration_steps",
+                        self.field_h2_integration_steps,
+                    )
+                ),
+                1,
+            )
+            self.field_h2_integration_method = str(
+                config.get(
+                    "field_h2_integration_method",
+                    self.field_h2_integration_method,
+                )
+            ).strip().lower()
+            self.field_h2_velocity_reg_weight = max(
+                float(
+                    config.get(
+                        "field_h2_velocity_reg_weight",
+                        self.field_h2_velocity_reg_weight,
+                    )
+                ),
+                0.0,
+            )
+            self.field_existence_start = int(config.get("field_existence_start", self.field_existence_start))
+            self.field_existence_temperature_start = float(config.get("field_existence_temperature_start", self.field_existence_temperature_start))
+            self.field_existence_temperature_end = float(config.get("field_existence_temperature_end", self.field_existence_temperature_end))
+            self.field_existence_temperature_until = int(config.get("field_existence_temperature_until", self.field_existence_temperature_until))
+            self.field_existence_router_init = str(config.get("field_existence_router_init", self.field_existence_router_init))
+            self.field_existence_interval_init_half_width = float(config.get("field_existence_interval_init_half_width", self.field_existence_interval_init_half_width))
+            self.field_existence_interval_transition = float(config.get("field_existence_interval_transition", self.field_existence_interval_transition))
+            self.field_existence_interval_max_half_width = float(config.get("field_existence_interval_max_half_width", self.field_existence_interval_max_half_width))
+            self.field_existence_transient_budget = float(config.get("field_existence_transient_budget", self.field_existence_transient_budget))
+            self.field_existence_budget_weight = float(config.get("field_existence_budget_weight", self.field_existence_budget_weight))
+            self.field_existence_transient_width_limit = float(config.get("field_existence_transient_width_limit", self.field_existence_transient_width_limit))
+            self.field_existence_width_route_weight = float(config.get("field_existence_width_route_weight", self.field_existence_width_route_weight))
+            self.field_existence_entropy_weight = float(config.get("field_existence_entropy_weight", self.field_existence_entropy_weight))
+            self.field_existence_harden_start = int(config.get("field_existence_harden_start", self.field_existence_harden_start))
+            self.field_existence_coverage_delta = float(config.get("field_existence_coverage_delta", self.field_existence_coverage_delta))
+            self.field_existence_coverage_margin = float(config.get("field_existence_coverage_margin", self.field_existence_coverage_margin))
+            self.field_existence_coverage_weight = float(config.get("field_existence_coverage_weight", self.field_existence_coverage_weight))
+            self.field_existence_log_interval = int(config.get("field_existence_log_interval", self.field_existence_log_interval))
+            self.field_mvstruct = bool(config.get("field_mvstruct", int(self.field_mvstruct)))
+            self.field_mvstruct_start = int(config.get("field_mvstruct_start", self.field_mvstruct_start))
+            self.field_mvstruct_until = int(config.get("field_mvstruct_until", self.field_mvstruct_until))
+            self.field_mvstruct_interval = int(config.get("field_mvstruct_interval", self.field_mvstruct_interval))
+            self.field_mvstruct_views = int(config.get("field_mvstruct_views", self.field_mvstruct_views))
+            self.field_mvstruct_min_event_views = int(config.get("field_mvstruct_min_event_views", self.field_mvstruct_min_event_views))
+            self.field_mvstruct_dssim_weight = float(config.get("field_mvstruct_dssim_weight", self.field_mvstruct_dssim_weight))
+            self.field_mvstruct_densify = bool(config.get("field_mvstruct_densify", int(self.field_mvstruct_densify)))
+            self.field_mvstruct_densify_start = int(config.get("field_mvstruct_densify_start", self.field_mvstruct_densify_start))
+            self.field_mvstruct_densify_until = int(config.get("field_mvstruct_densify_until", self.field_mvstruct_densify_until))
+            self.field_mvstruct_densify_interval = int(config.get("field_mvstruct_densify_interval", self.field_mvstruct_densify_interval))
+            self.field_mvstruct_grad_threshold = float(config.get("field_mvstruct_grad_threshold", self.field_mvstruct_grad_threshold))
+            self.field_mvstruct_min_observations = int(config.get("field_mvstruct_min_observations", self.field_mvstruct_min_observations))
+            self.field_mvstruct_min_visibility_ratio = float(config.get("field_mvstruct_min_visibility_ratio", self.field_mvstruct_min_visibility_ratio))
+            self.field_mvstruct_min_opacity = float(config.get("field_mvstruct_min_opacity", self.field_mvstruct_min_opacity))
+            self.field_mvstruct_event_max_ratio = float(config.get("field_mvstruct_event_max_ratio", self.field_mvstruct_event_max_ratio))
+            self.field_mvstruct_total_max_ratio = float(config.get("field_mvstruct_total_max_ratio", self.field_mvstruct_total_max_ratio))
+            self.field_mvstruct_cooldown = int(config.get("field_mvstruct_cooldown", self.field_mvstruct_cooldown))
+            self.field_mvstruct_oversize_split = bool(config.get("field_mvstruct_oversize_split", int(self.field_mvstruct_oversize_split)))
+            self.field_mvstruct_oversize_radius = float(config.get("field_mvstruct_oversize_radius", self.field_mvstruct_oversize_radius))
+            self.field_mvstruct_oversize_budget_ratio = float(config.get("field_mvstruct_oversize_budget_ratio", self.field_mvstruct_oversize_budget_ratio))
+            self.field_mvstruct_hard_time = bool(config.get("field_mvstruct_hard_time", int(self.field_mvstruct_hard_time)))
+            self.field_mvstruct_hard_time_ema_decay = float(config.get("field_mvstruct_hard_time_ema_decay", self.field_mvstruct_hard_time_ema_decay))
+            self.field_mvstruct_hard_time_sampling = str(config.get("field_mvstruct_hard_time_sampling", self.field_mvstruct_hard_time_sampling))
+            self.field_mvstruct_hard_time_diverse_views = bool(config.get("field_mvstruct_hard_time_diverse_views", int(self.field_mvstruct_hard_time_diverse_views)))
+            self.field_mvstruct_conflict_split = bool(config.get("field_mvstruct_conflict_split", int(self.field_mvstruct_conflict_split)))
+            self.field_mvstruct_conflict_source = str(config.get("field_mvstruct_conflict_source", self.field_mvstruct_conflict_source))
+            self.field_mvstruct_conflict_threshold = float(config.get("field_mvstruct_conflict_threshold", self.field_mvstruct_conflict_threshold))
+            self.field_mvstruct_conflict_min_events = int(config.get("field_mvstruct_conflict_min_events", self.field_mvstruct_conflict_min_events))
+            self.field_mvstruct_conflict_budget_ratio = float(config.get("field_mvstruct_conflict_budget_ratio", self.field_mvstruct_conflict_budget_ratio))
+            self.field_mvstruct_conflict_min_radius = float(config.get("field_mvstruct_conflict_min_radius", self.field_mvstruct_conflict_min_radius))
+            self.field_mvstruct_conflict_children = int(config.get("field_mvstruct_conflict_children", self.field_mvstruct_conflict_children))
+            self.field_mvstruct_conflict_specialize = bool(config.get("field_mvstruct_conflict_specialize", int(self.field_mvstruct_conflict_specialize)))
+            self.field_mvstruct_conflict_directional_split = bool(config.get("field_mvstruct_conflict_directional_split", int(self.field_mvstruct_conflict_directional_split)))
+            self.field_mvstruct_directional_min_events = int(config.get("field_mvstruct_directional_min_events", self.field_mvstruct_directional_min_events))
+            self.field_mvstruct_directional_min_axis_ratio = float(config.get("field_mvstruct_directional_min_axis_ratio", self.field_mvstruct_directional_min_axis_ratio))
+            self.field_mvstruct_directional_min_trace = float(config.get("field_mvstruct_directional_min_trace", self.field_mvstruct_directional_min_trace))
+            self.field_mvstruct_directional_offset_ratio = float(config.get("field_mvstruct_directional_offset_ratio", self.field_mvstruct_directional_offset_ratio))
+            self.field_mvstruct_specialize_min_events = int(config.get("field_mvstruct_specialize_min_events", self.field_mvstruct_specialize_min_events))
+            self.field_mvstruct_specialize_axis_ratio = float(config.get("field_mvstruct_specialize_axis_ratio", self.field_mvstruct_specialize_axis_ratio))
+            self.field_mvstruct_specialize_min_radius = float(config.get("field_mvstruct_specialize_min_radius", self.field_mvstruct_specialize_min_radius))
+            self.field_mvstruct_specialize_feature_delta = float(config.get("field_mvstruct_specialize_feature_delta", self.field_mvstruct_specialize_feature_delta))
+            self.field_mvstruct_specialize_offset_ratio = float(config.get("field_mvstruct_specialize_offset_ratio", self.field_mvstruct_specialize_offset_ratio))
+            self.field_mvstruct_specialize_scale_ratio = float(config.get("field_mvstruct_specialize_scale_ratio", self.field_mvstruct_specialize_scale_ratio))
+            self.field_layer_responsibility = bool(config.get("field_layer_responsibility", int(self.field_layer_responsibility)))
+            self.field_layer_responsibility_start = int(config.get("field_layer_responsibility_start", self.field_layer_responsibility_start))
+            self.field_layer_responsibility_until = int(config.get("field_layer_responsibility_until", self.field_layer_responsibility_until))
+            self.field_layer_responsibility_interval = int(config.get("field_layer_responsibility_interval", self.field_layer_responsibility_interval))
+            self.field_layer_far_depth = float(config.get("field_layer_far_depth", self.field_layer_far_depth))
+            self.field_layer_near_depth = float(config.get("field_layer_near_depth", self.field_layer_near_depth))
+            self.field_layer_far_loss_weight = float(config.get("field_layer_far_loss_weight", self.field_layer_far_loss_weight))
+            self.field_layer_front_opacity_weight = float(config.get("field_layer_front_opacity_weight", self.field_layer_front_opacity_weight))
+            self.field_layer_front_opacity_budget = float(config.get("field_layer_front_opacity_budget", self.field_layer_front_opacity_budget))
+            self.field_layer_mask_erode = int(config.get("field_layer_mask_erode", self.field_layer_mask_erode))
+            self.field_layer_min_pixels = int(config.get("field_layer_min_pixels", self.field_layer_min_pixels))
+            self.field_layer_beit_time_indices = str(config.get("field_layer_beit_time_indices", self.field_layer_beit_time_indices))
+            self.field_layer_beit_background_threshold = float(config.get("field_layer_beit_background_threshold", self.field_layer_beit_background_threshold))
+            self.field_layer_motion_threshold = float(config.get("field_layer_motion_threshold", self.field_layer_motion_threshold))
+            self.field_layer_median_threshold = float(config.get("field_layer_median_threshold", self.field_layer_median_threshold))
+            self.field_layer_debug = bool(config.get("field_layer_debug", int(self.field_layer_debug)))
+            self.field_layer_debug_max_events = int(config.get("field_layer_debug_max_events", self.field_layer_debug_max_events))
             self.field_appearance_only_train = bool(config.get("field_appearance_only_train", int(self.field_appearance_only_train)))
             self.field_appearance_only_start = int(config.get("field_appearance_only_start", self.field_appearance_only_start))
             self.field_appearance_only_allow = str(config.get("field_appearance_only_allow", self.field_appearance_only_allow))
@@ -3976,6 +6530,302 @@ class GaussianModel:
         if payload.get("content_exposure_head") is not None and self.content_exposure_head is not None:
             self._load_module_state_compatible(self.content_exposure_head, payload["content_exposure_head"])
 
+        if self.field_carrier_initialization:
+            if append:
+                raise RuntimeError(
+                    "Appending PLY files is unsupported for carrier_hybrid because "
+                    "Carrier id namespaces cannot be merged safely"
+                )
+            required_carrier_payload = (
+                "carrier_id",
+                "initialization_role",
+                "motion_time_anchor",
+                "carrier_motion_bank",
+                "carrier_initialization_stats",
+            )
+            missing = [
+                key for key in required_carrier_payload if payload.get(key) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Carrier checkpoint is incomplete; missing: " + ", ".join(missing)
+                )
+
+            point_mask = mask
+            if point_mask is not None:
+                if isinstance(point_mask, np.ndarray):
+                    point_mask = torch.from_numpy(point_mask.astype(np.bool_))
+                elif torch.is_tensor(point_mask):
+                    point_mask = point_mask.detach().cpu().to(dtype=torch.bool)
+                else:
+                    raise RuntimeError("Unsupported Carrier checkpoint mask type")
+
+            def restore_point_tensor(key, dtype, trailing_shape):
+                value = payload[key]
+                if not torch.is_tensor(value):
+                    raise RuntimeError(f"Carrier checkpoint {key} is not a tensor")
+                value = value.detach().cpu()
+                if point_mask is not None:
+                    if value.shape[0] != point_mask.shape[0]:
+                        raise RuntimeError(
+                            f"Carrier checkpoint {key} does not match the PLY mask"
+                        )
+                    value = value[point_mask]
+                expected_shape = (int(num_points),) + tuple(trailing_shape)
+                if tuple(value.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"Carrier checkpoint {key} has shape {tuple(value.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                return value.to(device="cuda", dtype=dtype).contiguous()
+
+            self._carrier_id = restore_point_tensor(
+                "carrier_id", torch.long, ()
+            )
+            self._initialization_role = restore_point_tensor(
+                "initialization_role", torch.int8, ()
+            )
+            saved_motion_anchor = restore_point_tensor(
+                "motion_time_anchor", torch.float32, (1,)
+            )
+            self.carrier_motion_bank = self._carrier_bank_from_state_dict(
+                payload["carrier_motion_bank"], device="cuda"
+            )
+            stats = payload["carrier_initialization_stats"]
+            if not isinstance(stats, dict):
+                raise RuntimeError(
+                    "Carrier checkpoint initialization stats must be a dictionary"
+                )
+            if stats.get("schema") != self.field_carrier_initialization_schema:
+                raise RuntimeError(
+                    "Carrier checkpoint schema does not match field_config"
+                )
+            if stats.get("motion_extrapolation") != "endpoint_clamped":
+                raise RuntimeError(
+                    "Carrier checkpoint must use endpoint-clamped motion"
+                )
+            self._carrier_initialization_stats = dict(stats)
+            self._init_existence_parameters(
+                self.get_xyz.shape[0],
+                times=self.get_trbfcenter.detach(),
+                motion_time_anchor=saved_motion_anchor,
+                active=True,
+            )
+            self._existence_iteration = int(
+                payload.get("existence_iteration", 0)
+            )
+            self._assert_carrier_topology()
+        elif self.field_existence_moe:
+            saved_existence_logits = payload.get("existence_logits")
+            saved_interval_center = payload.get("interval_center_raw")
+            saved_interval_width = payload.get("interval_log_half_width")
+            saved_motion_anchor = payload.get("motion_time_anchor")
+            existence_mask = mask
+            if existence_mask is not None:
+                if isinstance(existence_mask, np.ndarray):
+                    existence_mask = torch.from_numpy(existence_mask.astype(np.bool_))
+                elif torch.is_tensor(existence_mask):
+                    existence_mask = existence_mask.detach().cpu()
+                if saved_existence_logits is not None:
+                    saved_existence_logits = saved_existence_logits[existence_mask]
+                if saved_interval_center is not None:
+                    saved_interval_center = saved_interval_center[existence_mask]
+                if saved_interval_width is not None:
+                    saved_interval_width = saved_interval_width[existence_mask]
+                if saved_motion_anchor is not None:
+                    saved_motion_anchor = saved_motion_anchor[existence_mask]
+
+            new_count = int(num_points)
+            new_times = self.get_trbfcenter.detach()[-new_count:]
+            if saved_existence_logits is None:
+                saved_existence_logits = self._default_existence_logits(
+                    new_count,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+            else:
+                saved_existence_logits = saved_existence_logits.to(device="cuda", dtype=torch.float32)
+            if saved_interval_center is None:
+                saved_interval_center = self._interval_center_to_raw(new_times)
+            else:
+                saved_interval_center = saved_interval_center.to(device="cuda", dtype=torch.float32)
+            if saved_interval_width is None:
+                saved_interval_width = self._default_interval_log_half_width(
+                    new_count,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+            else:
+                saved_interval_width = saved_interval_width.to(device="cuda", dtype=torch.float32)
+            if saved_motion_anchor is None:
+                saved_motion_anchor = new_times
+            else:
+                saved_motion_anchor = saved_motion_anchor.to(device="cuda", dtype=torch.float32)
+
+            if append:
+                base_count = int(self.get_xyz.shape[0]) - new_count
+                if self._existence_logits.numel() == base_count * 3:
+                    base_logits = self._existence_logits.detach()
+                    base_center = self._interval_center_raw.detach()
+                    base_width = self._interval_log_half_width.detach()
+                    base_anchor = self._motion_time_anchor.detach()
+                else:
+                    base_times = self.get_trbfcenter.detach()[:base_count]
+                    base_logits = self._default_existence_logits(
+                        base_count,
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    base_center = self._interval_center_to_raw(base_times)
+                    base_width = self._default_interval_log_half_width(
+                        base_count,
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    base_anchor = base_times
+                saved_existence_logits = torch.cat((base_logits, saved_existence_logits), dim=0)
+                saved_interval_center = torch.cat((base_center, saved_interval_center), dim=0)
+                saved_interval_width = torch.cat((base_width, saved_interval_width), dim=0)
+                saved_motion_anchor = torch.cat((base_anchor, saved_motion_anchor), dim=0)
+
+            self._init_existence_parameters(
+                self.get_xyz.shape[0],
+                times=self.get_trbfcenter.detach(),
+                logits=saved_existence_logits,
+                interval_center_raw=saved_interval_center,
+                interval_log_half_width=saved_interval_width,
+                motion_time_anchor=saved_motion_anchor,
+                active=bool(payload.get("existence_active", False)) or (append and self._existence_active),
+            )
+            self._existence_iteration = int(
+                payload.get("existence_iteration", self.field_existence_temperature_until)
+            )
+        elif self.field_existence_single_expert == "interval":
+            saved_interval_center = payload.get("interval_center_raw")
+            saved_interval_width = payload.get("interval_log_half_width")
+            interval_mask = mask
+            if interval_mask is not None:
+                if isinstance(interval_mask, np.ndarray):
+                    interval_mask = torch.from_numpy(
+                        interval_mask.astype(np.bool_)
+                    )
+                elif torch.is_tensor(interval_mask):
+                    interval_mask = interval_mask.detach().cpu()
+                if saved_interval_center is not None:
+                    saved_interval_center = saved_interval_center[
+                        interval_mask
+                    ]
+                if saved_interval_width is not None:
+                    saved_interval_width = saved_interval_width[
+                        interval_mask
+                    ]
+
+            new_count = int(num_points)
+            new_times = self.get_trbfcenter.detach()[-new_count:]
+            if saved_interval_center is None:
+                saved_interval_center = self._interval_center_to_raw(
+                    new_times
+                )
+            else:
+                saved_interval_center = saved_interval_center.to(
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+            if saved_interval_width is None:
+                saved_interval_width = (
+                    self._default_interval_log_half_width(
+                        new_count,
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                )
+            else:
+                saved_interval_width = saved_interval_width.to(
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+
+            if append:
+                base_count = int(self.get_xyz.shape[0]) - new_count
+                if (
+                    self._interval_center_raw.numel() == base_count
+                    and self._interval_log_half_width.numel() == base_count
+                ):
+                    base_center = self._interval_center_raw.detach()
+                    base_width = self._interval_log_half_width.detach()
+                else:
+                    base_times = self.get_trbfcenter.detach()[:base_count]
+                    base_center = self._interval_center_to_raw(base_times)
+                    base_width = self._default_interval_log_half_width(
+                        base_count,
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                saved_interval_center = torch.cat(
+                    (base_center, saved_interval_center),
+                    dim=0,
+                )
+                saved_interval_width = torch.cat(
+                    (base_width, saved_interval_width),
+                    dim=0,
+                )
+
+            self._init_existence_parameters(
+                self.get_xyz.shape[0],
+                times=self.get_trbfcenter.detach(),
+                interval_center_raw=saved_interval_center,
+                interval_log_half_width=saved_interval_width,
+                active=True,
+            )
+            self._existence_iteration = int(
+                payload.get("existence_iteration", 0)
+            )
+        elif self.field_existence_single_expert == "transient":
+            saved_motion_anchor = payload.get("motion_time_anchor")
+            anchor_mask = mask
+            if anchor_mask is not None:
+                if isinstance(anchor_mask, np.ndarray):
+                    anchor_mask = torch.from_numpy(
+                        anchor_mask.astype(np.bool_)
+                    )
+                elif torch.is_tensor(anchor_mask):
+                    anchor_mask = anchor_mask.detach().cpu()
+                if saved_motion_anchor is not None:
+                    saved_motion_anchor = saved_motion_anchor[anchor_mask]
+
+            new_count = int(num_points)
+            new_times = self.get_trbfcenter.detach()[-new_count:]
+            if saved_motion_anchor is None:
+                saved_motion_anchor = new_times
+            else:
+                saved_motion_anchor = saved_motion_anchor.to(
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+
+            if append:
+                base_count = int(self.get_xyz.shape[0]) - new_count
+                if self._motion_time_anchor.numel() == base_count:
+                    base_anchor = self._motion_time_anchor.detach()
+                else:
+                    base_anchor = self.get_trbfcenter.detach()[:base_count]
+                saved_motion_anchor = torch.cat(
+                    (base_anchor, saved_motion_anchor),
+                    dim=0,
+                )
+
+            self._init_existence_parameters(
+                self.get_xyz.shape[0],
+                times=self.get_trbfcenter.detach(),
+                motion_time_anchor=saved_motion_anchor,
+                active=True,
+            )
+            self._existence_iteration = int(
+                payload.get("existence_iteration", 0)
+            )
+        else:
+            self._init_existence_parameters(self.get_xyz.shape[0], times=self.get_trbfcenter.detach())
+
         if not self.use_euler_field:
             self._static_level_logits = torch.empty(0, device="cuda")
             self._dynamic_level_logits = torch.empty(0, device="cuda")
@@ -3986,11 +6836,31 @@ class GaussianModel:
             self.field_static_app_head = None
             return
 
-        if self.euler_field is None or self.field_router is None or self.field_query_gate is None or self.field_decoder is None or self.field_temporal_opacity_head is None or self.field_static_view_mapper is None or self.field_static_app_head is None:
+        if (
+            self.euler_field is None
+            or self.field_router is None
+            or self.field_query_gate is None
+            or self.field_decoder is None
+            or self.field_temporal_opacity_head is None
+            or self.field_static_view_mapper is None
+            or self.field_static_app_head is None
+            or (
+                self.field_motion_model == "h2"
+                and self.h2_velocity_field is None
+            )
+        ):
             self._build_euler_modules(bbox_min, bbox_max)
 
         if payload.get("euler_field") is not None:
             self.euler_field.load_state_dict(payload["euler_field"])
+        if (
+            payload.get("h2_velocity_field") is not None
+            and self.h2_velocity_field is not None
+        ):
+            self._load_module_state_compatible(
+                self.h2_velocity_field,
+                payload["h2_velocity_field"],
+            )
         if payload.get("field_router") is not None:
             self.field_router.load_state_dict(payload["field_router"])
         if payload.get("field_query_gate") is not None:
@@ -4253,6 +7123,7 @@ class GaussianModel:
 
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
+        self._assert_carrier_topology()
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -4286,6 +7157,28 @@ class GaussianModel:
             "rgbdecoder": self.rgbdecoder.state_dict() if self.rgbdecoder is not None else None,
             "content_exposure_head": self.content_exposure_head.state_dict() if self.content_exposure_head is not None else None,
             "field_config": self._checkpoint_field_config(),
+            "existence_logits": self._existence_logits.detach().cpu() if self._existence_logits.numel() > 0 else None,
+            "interval_center_raw": self._interval_center_raw.detach().cpu() if self._interval_center_raw.numel() > 0 else None,
+            "interval_log_half_width": self._interval_log_half_width.detach().cpu() if self._interval_log_half_width.numel() > 0 else None,
+            "motion_time_anchor": self._motion_time_anchor.detach().cpu() if self._motion_time_anchor.numel() > 0 else None,
+            "carrier_id": self._carrier_id.detach().cpu() if self.field_carrier_initialization else None,
+            "initialization_role": self._initialization_role.detach().cpu() if self.field_carrier_initialization else None,
+            "carrier_motion_bank": (
+                {
+                    name: value.detach().cpu()
+                    for name, value in self.carrier_motion_bank.state_dict().items()
+                }
+                if self.field_carrier_initialization
+                and self.carrier_motion_bank is not None
+                else None
+            ),
+            "carrier_initialization_stats": (
+                dict(self._carrier_initialization_stats)
+                if self.field_carrier_initialization
+                else None
+            ),
+            "existence_active": bool(self._existence_active),
+            "existence_iteration": int(self._existence_iteration),
             "static_level_logits": self._static_level_logits.detach().cpu() if self.use_euler_field and self._static_level_logits.numel() > 0 else None,
             "static_radiance_level_logits": self._static_radiance_level_logits.detach().cpu() if self.use_euler_field and self._static_radiance_level_logits.numel() > 0 else None,
             "dynamic_level_logits": self._dynamic_level_logits.detach().cpu() if self.use_euler_field and self._dynamic_level_logits.numel() > 0 else None,
@@ -4295,6 +7188,7 @@ class GaussianModel:
             "grid_level_time_coeff": self._dynamic_level_time_coeff.detach().cpu() if self.use_euler_field and self._dynamic_level_time_coeff.numel() > 0 else None,
             "field_residual_gate": self._field_residual_gate.detach().cpu() if self.use_euler_field and self._field_residual_gate.numel() > 0 else None,
             "euler_field": self.euler_field.state_dict() if self.use_euler_field and self.euler_field is not None else None,
+            "h2_velocity_field": self.h2_velocity_field.state_dict() if self.field_motion_model == "h2" and self.h2_velocity_field is not None else None,
             "field_router": self.field_router.state_dict() if self.use_euler_field and self.field_router is not None else None,
             "field_query_gate": self.field_query_gate.state_dict() if self.use_euler_field and self.field_query_gate is not None else None,
             "field_decoder": self.field_decoder.state_dict() if self.use_euler_field and self.field_decoder is not None else None,
@@ -4861,6 +7755,14 @@ class GaussianModel:
 
         plydata = PlyData.read(path)
         payload = self._load_aux_payload(path)
+        payload_config = payload.get("field_config", {})
+        if self.field_carrier_initialization or bool(
+            payload_config.get("field_carrier_initialization", 0)
+        ) or str(payload_config.get("field_motion_model", "")).lower() == "carrier_hybrid":
+            raise RuntimeError(
+                "load_plyandminmaxall append mode is unsupported for "
+                "carrier_hybrid checkpoints"
+            )
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
@@ -5065,8 +7967,35 @@ class GaussianModel:
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
+        point_parameter_groups = {
+            "xyz",
+            "f_dc",
+            "f_t",
+            "opacity",
+            "scaling",
+            "rotation",
+            "omega",
+            "trbf_center",
+            "trbf_scale",
+            "motion",
+            "existence_logits",
+            "interval_center_raw",
+            "interval_log_half_width",
+            "static_grid_logits",
+            "dynamic_grid_logits",
+            "dynamic_grid_time_coeff",
+            "static_route_logits",
+        }
         for group in self.optimizer.param_groups:
-            if len(group["params"]) == 1 and group["name"] not in ['decoder', 'field_gate', 'field_temporal_opacity', 'static_radiance_level_logits']:
+            if group.get("name") not in point_parameter_groups:
+                continue
+            if len(group["params"]) != 1:
+                raise RuntimeError(
+                    "Point optimizer group {!r} must contain exactly one tensor".format(
+                        group.get("name")
+                    )
+                )
+            if len(group["params"]) == 1:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 if stored_state is not None:
                     stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -5084,6 +8013,7 @@ class GaussianModel:
 
     def prune_points(self, mask):
         valid_points_mask = ~mask
+        old_motion_time_anchor = self._motion_time_anchor
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -5096,6 +8026,50 @@ class GaussianModel:
         self._motion = optimizable_tensors["motion"]
         self._omega = optimizable_tensors["omega"]
         self._features_t = optimizable_tensors["f_t"]
+        if self.field_existence_moe and "existence_logits" in optimizable_tensors:
+            self._existence_logits = optimizable_tensors["existence_logits"]
+            self._interval_center_raw = optimizable_tensors["interval_center_raw"]
+            self._interval_log_half_width = optimizable_tensors["interval_log_half_width"]
+        elif (
+            self.field_existence_single_expert == "interval"
+            and "interval_center_raw" in optimizable_tensors
+        ):
+            self._interval_center_raw = optimizable_tensors[
+                "interval_center_raw"
+            ]
+            self._interval_log_half_width = optimizable_tensors[
+                "interval_log_half_width"
+            ]
+        if self.field_carrier_initialization:
+            if self._carrier_id.shape[0] != valid_points_mask.shape[0]:
+                raise RuntimeError("Carrier metadata is misaligned before prune")
+            self._carrier_id = self._carrier_id[valid_points_mask]
+            self._initialization_role = self._initialization_role[
+                valid_points_mask
+            ]
+            if (
+                old_motion_time_anchor is None
+                or old_motion_time_anchor.shape[0]
+                != valid_points_mask.shape[0]
+            ):
+                raise RuntimeError("Carrier motion anchors are misaligned before prune")
+            self._motion_time_anchor = old_motion_time_anchor[valid_points_mask]
+        elif (
+            self.field_existence_moe
+            or self.field_existence_single_expert == "transient"
+        ):
+            if (
+                old_motion_time_anchor is not None
+                and old_motion_time_anchor.shape[0]
+                == valid_points_mask.shape[0]
+            ):
+                self._motion_time_anchor = old_motion_time_anchor[
+                    valid_points_mask
+                ]
+            else:
+                self._motion_time_anchor = (
+                    self.get_trbfcenter.detach().clone()
+                )
         if self.use_euler_field and "static_grid_logits" in optimizable_tensors:
             self._static_level_logits = optimizable_tensors["static_grid_logits"]
         if self.use_euler_field and "dynamic_grid_logits" in optimizable_tensors:
@@ -5148,6 +8122,8 @@ class GaussianModel:
                 self._bg_birth_iter = self._bg_birth_iter[valid_points_mask]
             else:
                 self._bg_birth_iter = torch.full((int(torch.count_nonzero(valid_points_mask).item()), 1), -1.0, device="cuda", dtype=torch.float32)
+        self._mvstruct_on_prune(valid_points_mask)
+        self._assert_carrier_topology()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -5171,8 +8147,21 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None, new_existence_logits=None, new_interval_center_raw=None, new_interval_log_half_width=None, new_motion_time_anchor=None, new_existence_parent_indices=None, new_carrier_id=None, new_initialization_role=None):
         old_count = self._xyz.shape[0]
+        if (
+            int(new_xyz.shape[0]) > 0
+            and self.field_carrier_initialization_schema
+            == "stegf_colmap_high_confidence_carrier_initialization_map_v1"
+            and new_existence_parent_indices is None
+        ):
+            raise RuntimeError(
+                "S2.0.1-noadd forbids Gaussian injection without a parent "
+                "Carrier identity"
+            )
+        old_motion_time_anchor = self._motion_time_anchor
+        old_carrier_id = self._carrier_id
+        old_initialization_role = self._initialization_role
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "opacity": new_opacities,
@@ -5196,6 +8185,176 @@ class GaussianModel:
                 device="cuda",
                 dtype=torch.float32,
             )
+        if self.field_existence_moe and self._existence_logits.numel() > 0:
+            new_count = int(new_xyz.shape[0])
+            if new_existence_parent_indices is not None:
+                parent_indices = new_existence_parent_indices.to(
+                    device=self.get_xyz.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                if parent_indices.shape[0] != new_count:
+                    raise ValueError(
+                        "new_existence_parent_indices must have one entry per new Gaussian"
+                    )
+                new_existence_logits = self._existence_logits[parent_indices]
+                new_interval_center_raw = self._interval_center_raw[parent_indices]
+                new_interval_log_half_width = self._interval_log_half_width[parent_indices]
+                if self._motion_time_anchor.shape[0] == old_count:
+                    new_motion_time_anchor = self._motion_time_anchor[parent_indices]
+            if new_existence_logits is None:
+                new_existence_logits = self._default_existence_logits(
+                    new_count,
+                    device=new_xyz.device,
+                    dtype=new_xyz.dtype,
+                )
+            if new_interval_center_raw is None:
+                new_interval_center_raw = self._interval_center_to_raw(new_trbf_center.detach())
+            if new_interval_log_half_width is None:
+                new_interval_log_half_width = self._default_interval_log_half_width(
+                    new_count,
+                    device=new_xyz.device,
+                    dtype=new_xyz.dtype,
+                )
+            if new_motion_time_anchor is None:
+                new_motion_time_anchor = new_trbf_center.detach()
+            d["existence_logits"] = new_existence_logits
+            d["interval_center_raw"] = new_interval_center_raw
+            d["interval_log_half_width"] = new_interval_log_half_width
+        elif (
+            self.field_existence_single_expert == "interval"
+            and self._interval_center_raw.numel() > 0
+        ):
+            new_count = int(new_xyz.shape[0])
+            if new_existence_parent_indices is not None:
+                parent_indices = new_existence_parent_indices.to(
+                    device=self.get_xyz.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                if parent_indices.shape[0] != new_count:
+                    raise ValueError(
+                        "new_existence_parent_indices must have one entry "
+                        "per new Gaussian"
+                    )
+                new_interval_center_raw = self._interval_center_raw[
+                    parent_indices
+                ]
+                new_interval_log_half_width = (
+                    self._interval_log_half_width[parent_indices]
+                )
+            if new_interval_center_raw is None:
+                new_interval_center_raw = self._interval_center_to_raw(
+                    new_trbf_center.detach()
+                )
+            if new_interval_log_half_width is None:
+                new_interval_log_half_width = (
+                    self._default_interval_log_half_width(
+                        new_count,
+                        device=new_xyz.device,
+                        dtype=new_xyz.dtype,
+                    )
+                )
+            d["interval_center_raw"] = new_interval_center_raw
+            d["interval_log_half_width"] = new_interval_log_half_width
+        elif self.field_existence_single_expert == "transient":
+            new_count = int(new_xyz.shape[0])
+            if new_existence_parent_indices is not None:
+                parent_indices = new_existence_parent_indices.to(
+                    device=self.get_xyz.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                if parent_indices.shape[0] != new_count:
+                    raise ValueError(
+                        "new_existence_parent_indices must have one entry "
+                        "per new Gaussian"
+                    )
+                if self._motion_time_anchor.shape[0] == old_count:
+                    new_motion_time_anchor = self._motion_time_anchor[
+                        parent_indices
+                    ]
+            if new_motion_time_anchor is None:
+                new_motion_time_anchor = new_trbf_center.detach()
+
+        if self.field_carrier_initialization:
+            new_count = int(new_xyz.shape[0])
+            parent_indices = None
+            if new_existence_parent_indices is not None:
+                parent_indices = new_existence_parent_indices.to(
+                    device=self.get_xyz.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                if parent_indices.shape[0] != new_count:
+                    raise ValueError(
+                        "Parent indices must have one entry per new Gaussian"
+                    )
+                if torch.any(parent_indices < 0) or torch.any(
+                    parent_indices >= old_count
+                ):
+                    raise ValueError("Parent index is outside the old topology")
+            if parent_indices is not None:
+                inherited_carrier_id = old_carrier_id[parent_indices]
+                inherited_role = old_initialization_role[parent_indices]
+                inherited_anchor = old_motion_time_anchor[parent_indices]
+                if new_carrier_id is not None and not torch.equal(
+                    new_carrier_id.to(
+                        device=inherited_carrier_id.device,
+                        dtype=inherited_carrier_id.dtype,
+                    ).reshape(-1),
+                    inherited_carrier_id,
+                ):
+                    raise ValueError("Explicit carrier_id disagrees with parent")
+                if new_initialization_role is not None and not torch.equal(
+                    new_initialization_role.to(
+                        device=inherited_role.device,
+                        dtype=inherited_role.dtype,
+                    ).reshape(-1),
+                    inherited_role,
+                ):
+                    raise ValueError(
+                        "Explicit initialization_role disagrees with parent"
+                    )
+                new_carrier_id = inherited_carrier_id
+                new_initialization_role = inherited_role
+                new_motion_time_anchor = inherited_anchor
+            else:
+                if new_carrier_id is None:
+                    new_carrier_id = torch.full(
+                        (new_count,),
+                        -1,
+                        device=self.get_xyz.device,
+                        dtype=torch.long,
+                    )
+                else:
+                    new_carrier_id = new_carrier_id.to(
+                        device=self.get_xyz.device,
+                        dtype=torch.long,
+                    ).reshape(-1)
+                if new_initialization_role is None:
+                    new_initialization_role = torch.zeros(
+                        (new_count,),
+                        device=self.get_xyz.device,
+                        dtype=torch.int8,
+                    )
+                else:
+                    new_initialization_role = new_initialization_role.to(
+                        device=self.get_xyz.device,
+                        dtype=torch.int8,
+                    ).reshape(-1)
+                if new_motion_time_anchor is None:
+                    raise ValueError(
+                        "carrier_hybrid requires an explicit motion-time anchor "
+                        "for every no-parent Gaussian addition"
+                    )
+                else:
+                    new_motion_time_anchor = new_motion_time_anchor.to(
+                        device=self.get_xyz.device,
+                        dtype=self.get_xyz.dtype,
+                    ).reshape(-1, 1)
+            if new_carrier_id.shape != (new_count,):
+                raise ValueError("new_carrier_id has an invalid shape")
+            if new_initialization_role.shape != (new_count,):
+                raise ValueError("new_initialization_role has an invalid shape")
+            if new_motion_time_anchor.shape != (new_count, 1):
+                raise ValueError("new_motion_time_anchor has an invalid shape")
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -5209,6 +8368,62 @@ class GaussianModel:
         self._trbf_scale = optimizable_tensors["trbf_scale"]
         self._motion = optimizable_tensors["motion"]
         self._omega = optimizable_tensors["omega"]
+        if self.field_existence_moe and "existence_logits" in optimizable_tensors:
+            self._existence_logits = optimizable_tensors["existence_logits"]
+            self._interval_center_raw = optimizable_tensors["interval_center_raw"]
+            self._interval_log_half_width = optimizable_tensors["interval_log_half_width"]
+        elif (
+            self.field_existence_single_expert == "interval"
+            and "interval_center_raw" in optimizable_tensors
+        ):
+            self._interval_center_raw = optimizable_tensors[
+                "interval_center_raw"
+            ]
+            self._interval_log_half_width = optimizable_tensors[
+                "interval_log_half_width"
+            ]
+        if self.field_carrier_initialization:
+            if (
+                old_carrier_id.shape[0] != old_count
+                or old_initialization_role.shape[0] != old_count
+                or old_motion_time_anchor.shape[0] != old_count
+            ):
+                raise RuntimeError(
+                    "Carrier metadata is misaligned before densification"
+                )
+            self._carrier_id = torch.cat(
+                (old_carrier_id, new_carrier_id.detach()), dim=0
+            )
+            self._initialization_role = torch.cat(
+                (old_initialization_role, new_initialization_role.detach()),
+                dim=0,
+            )
+            self._motion_time_anchor = torch.cat(
+                (old_motion_time_anchor, new_motion_time_anchor.detach()), dim=0
+            )
+        elif (
+            (
+                self.field_existence_moe
+                and self._existence_logits.numel() > 0
+            )
+            or self.field_existence_single_expert == "transient"
+        ):
+            if (
+                old_motion_time_anchor is not None
+                and old_motion_time_anchor.shape[0] == old_count
+                and new_motion_time_anchor is not None
+            ):
+                self._motion_time_anchor = torch.cat(
+                    (
+                        old_motion_time_anchor,
+                        new_motion_time_anchor.detach(),
+                    ),
+                    dim=0,
+                )
+            else:
+                self._motion_time_anchor = (
+                    self.get_trbfcenter.detach().clone()
+                )
         if self.use_euler_field and "static_grid_logits" in optimizable_tensors:
             self._static_level_logits = optimizable_tensors["static_grid_logits"]
         if self.use_euler_field and "dynamic_grid_logits" in optimizable_tensors:
@@ -5299,6 +8514,8 @@ class GaussianModel:
         else:
             old_bg_birth = torch.full((old_count, 1), -1.0, device="cuda", dtype=torch.float32)
             self._bg_birth_iter = torch.cat((old_bg_birth, new_bg_birth_iter), dim=0)
+        self._mvstruct_on_points_added(old_count, new_xyz.shape[0])
+        self._assert_carrier_topology()
 
     
 
@@ -5341,8 +8558,9 @@ class GaussianModel:
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
+        existence_parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1).repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask, new_existence_parent_indices=existence_parent_indices)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -5390,8 +8608,9 @@ class GaussianModel:
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
+        existence_parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1).repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask, new_existence_parent_indices=existence_parent_indices)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -5437,8 +8656,9 @@ class GaussianModel:
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
+        existence_parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1).repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega, new_feature_t, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask, new_existence_parent_indices=existence_parent_indices)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -5468,7 +8688,8 @@ class GaussianModel:
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask]
         new_ems_mask = self.maskforems[selected_pts_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None
-        self.densification_postfix(new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        existence_parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
+        self.densification_postfix(new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask, new_existence_parent_indices=existence_parent_indices)
 
 
     def densify_and_cloneim(self, grads, grad_threshold, scene_extent):
@@ -5499,7 +8720,8 @@ class GaussianModel:
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask]
         new_ems_mask = self.maskforems[selected_pts_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None
-        self.densification_postfix(new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        existence_parent_indices = torch.nonzero(selected_pts_mask, as_tuple=False).squeeze(1)
+        self.densification_postfix(new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask, new_existence_parent_indices=existence_parent_indices)
 
 
 
@@ -5574,6 +8796,954 @@ class GaussianModel:
         gate = point_gate[update_filter].to(device=grad.device, dtype=grad.dtype).clamp(0.0, 1.0)
         self.xyz_gradient_accum[update_filter] += grad * gate
         self.denom[update_filter] += 1
+
+    def _mvstruct_feature_dim(self):
+        if self._features_dc is None or self._features_dc.numel() == 0:
+            return 0
+        return int(self._features_dc.reshape(self.get_xyz.shape[0], -1).shape[1])
+
+    def _mvstruct_conflict_source_is_position(self):
+        source = str(getattr(self, "field_mvstruct_conflict_source", "feature")).lower()
+        return source in ("position", "pos", "xyz", "means3d")
+
+    def _mvstruct_conflict_dim(self):
+        return 3 if self._mvstruct_conflict_source_is_position() else self._mvstruct_feature_dim()
+
+    def _mvstruct_buffers_ready(self):
+        conflict_dim = self._mvstruct_conflict_dim()
+        return (
+            self._mvstruct_gradient_accum is not None
+            and self._mvstruct_visibility_count is not None
+            and self._mvstruct_max_radii2D is not None
+            and self._mvstruct_last_topology_iter is not None
+            and self._mvstruct_conflict_accum is not None
+            and self._mvstruct_conflict_event_count is not None
+            and self._mvstruct_conflict_cov_accum is not None
+            and self._mvstruct_conflict_cov_event_count is not None
+            and self._mvstruct_gradient_accum.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_visibility_count.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_max_radii2D.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_last_topology_iter.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_conflict_accum.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_conflict_event_count.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_conflict_cov_accum.shape[0] == self.get_xyz.shape[0]
+            and self._mvstruct_conflict_cov_accum.shape[1] == conflict_dim
+            and self._mvstruct_conflict_cov_accum.shape[2] == conflict_dim
+            and self._mvstruct_conflict_cov_event_count.shape[0] == self.get_xyz.shape[0]
+        )
+
+    def initialize_mvstruct_stats(self):
+        n_points = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        conflict_dim = self._mvstruct_conflict_dim()
+        self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_max_radii2D = torch.zeros((n_points,), device=device, dtype=torch.float32)
+        self._mvstruct_last_topology_iter = torch.zeros((n_points,), device=device, dtype=torch.int32)
+        self._mvstruct_conflict_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_event_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_cov_accum = torch.zeros((n_points, conflict_dim, conflict_dim), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_cov_event_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_total_views = 0
+        self._mvstruct_event_records = []
+        if self._mvstruct_budget_reference_points <= 0:
+            self._mvstruct_budget_reference_points = int(n_points)
+        return self._mvstruct_budget_reference_points
+
+    def reset_mvstruct_window(self):
+        if self._mvstruct_budget_reference_points <= 0:
+            self._mvstruct_budget_reference_points = int(self.get_xyz.shape[0])
+        n_points = self.get_xyz.shape[0]
+        device = self.get_xyz.device
+        conflict_dim = self._mvstruct_conflict_dim()
+        self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_max_radii2D = torch.zeros((n_points,), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_event_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_cov_accum = torch.zeros((n_points, conflict_dim, conflict_dim), device=device, dtype=torch.float32)
+        self._mvstruct_conflict_cov_event_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        if self._mvstruct_last_topology_iter is None or self._mvstruct_last_topology_iter.shape[0] != n_points:
+            self._mvstruct_last_topology_iter = torch.zeros((n_points,), device=device, dtype=torch.int32)
+        self._mvstruct_total_views = 0
+        self._mvstruct_event_records = []
+
+    def _mvstruct_on_points_added(self, old_count, new_count):
+        if new_count <= 0:
+            return
+        if self._mvstruct_gradient_accum is None:
+            return
+        device = self.get_xyz.device
+        if (
+            self._mvstruct_gradient_accum.shape[0] == old_count
+            and self._mvstruct_visibility_count is not None
+            and self._mvstruct_visibility_count.shape[0] == old_count
+            and self._mvstruct_max_radii2D is not None
+            and self._mvstruct_max_radii2D.shape[0] == old_count
+            and self._mvstruct_last_topology_iter is not None
+            and self._mvstruct_last_topology_iter.shape[0] == old_count
+            and self._mvstruct_conflict_accum is not None
+            and self._mvstruct_conflict_accum.shape[0] == old_count
+            and self._mvstruct_conflict_event_count is not None
+            and self._mvstruct_conflict_event_count.shape[0] == old_count
+            and self._mvstruct_conflict_cov_accum is not None
+            and self._mvstruct_conflict_cov_accum.shape[0] == old_count
+            and self._mvstruct_conflict_cov_event_count is not None
+            and self._mvstruct_conflict_cov_event_count.shape[0] == old_count
+        ):
+            conflict_dim = self._mvstruct_conflict_dim()
+            self._mvstruct_gradient_accum = torch.cat(
+                (self._mvstruct_gradient_accum, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_visibility_count = torch.cat(
+                (self._mvstruct_visibility_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_max_radii2D = torch.cat(
+                (self._mvstruct_max_radii2D, torch.zeros((new_count,), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_last_topology_iter = torch.cat(
+                (self._mvstruct_last_topology_iter, torch.zeros((new_count,), device=device, dtype=torch.int32)),
+                dim=0,
+            )
+            self._mvstruct_conflict_accum = torch.cat(
+                (self._mvstruct_conflict_accum, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_conflict_event_count = torch.cat(
+                (self._mvstruct_conflict_event_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_conflict_cov_accum = torch.cat(
+                (self._mvstruct_conflict_cov_accum, torch.zeros((new_count, conflict_dim, conflict_dim), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+            self._mvstruct_conflict_cov_event_count = torch.cat(
+                (self._mvstruct_conflict_cov_event_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                dim=0,
+            )
+        else:
+            self.reset_mvstruct_window()
+        self._mvstruct_assert_shapes()
+
+    def _mvstruct_on_prune(self, valid_points_mask):
+        if self._mvstruct_gradient_accum is None:
+            return
+        if (
+            self._mvstruct_gradient_accum.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_visibility_count is not None
+            and self._mvstruct_visibility_count.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_max_radii2D is not None
+            and self._mvstruct_max_radii2D.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_last_topology_iter is not None
+            and self._mvstruct_last_topology_iter.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_conflict_accum is not None
+            and self._mvstruct_conflict_accum.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_conflict_event_count is not None
+            and self._mvstruct_conflict_event_count.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_conflict_cov_accum is not None
+            and self._mvstruct_conflict_cov_accum.shape[0] == valid_points_mask.shape[0]
+            and self._mvstruct_conflict_cov_event_count is not None
+            and self._mvstruct_conflict_cov_event_count.shape[0] == valid_points_mask.shape[0]
+        ):
+            self._mvstruct_gradient_accum = self._mvstruct_gradient_accum[valid_points_mask]
+            self._mvstruct_visibility_count = self._mvstruct_visibility_count[valid_points_mask]
+            self._mvstruct_max_radii2D = self._mvstruct_max_radii2D[valid_points_mask]
+            self._mvstruct_last_topology_iter = self._mvstruct_last_topology_iter[valid_points_mask]
+            self._mvstruct_conflict_accum = self._mvstruct_conflict_accum[valid_points_mask]
+            self._mvstruct_conflict_event_count = self._mvstruct_conflict_event_count[valid_points_mask]
+            self._mvstruct_conflict_cov_accum = self._mvstruct_conflict_cov_accum[valid_points_mask]
+            self._mvstruct_conflict_cov_event_count = self._mvstruct_conflict_cov_event_count[valid_points_mask]
+        else:
+            self.reset_mvstruct_window()
+        self._mvstruct_event_records = []
+        self._mvstruct_assert_shapes()
+
+    def _mvstruct_assert_shapes(self):
+        if self._mvstruct_gradient_accum is None:
+            return
+        n_points = self.get_xyz.shape[0]
+        assert self._mvstruct_gradient_accum.shape[0] == n_points
+        assert self._mvstruct_visibility_count.shape[0] == n_points
+        assert self._mvstruct_max_radii2D.shape[0] == n_points
+        assert self._mvstruct_last_topology_iter.shape[0] == n_points
+        assert self._mvstruct_conflict_accum.shape[0] == n_points
+        assert self._mvstruct_conflict_event_count.shape[0] == n_points
+        assert self._mvstruct_conflict_cov_accum.shape[0] == n_points
+        assert self._mvstruct_conflict_cov_event_count.shape[0] == n_points
+
+    def mvstruct_begin_event(self, expected_views=5):
+        if not self._mvstruct_buffers_ready():
+            self.initialize_mvstruct_stats()
+        self._mvstruct_event_records = []
+
+    def mvstruct_capture_view(self, viewspace_grad, visibility_filter, radii, feature_dc_grad=None, position_grad=None):
+        if not bool(getattr(self, "field_mvstruct", False)):
+            return False
+        if viewspace_grad is None or visibility_filter is None or radii is None:
+            return False
+        if not self._mvstruct_buffers_ready():
+            self.initialize_mvstruct_stats()
+        n_points = self.get_xyz.shape[0]
+        if viewspace_grad.shape[0] != n_points or visibility_filter.shape[0] != n_points or radii.shape[0] != n_points:
+            return False
+        grad_norm = torch.norm(viewspace_grad[:, :2].detach(), dim=-1, keepdim=True).to(device=self.get_xyz.device, dtype=torch.float32)
+        visible = visibility_filter.detach().to(device=self.get_xyz.device, dtype=torch.bool)
+        radii = radii.detach().to(device=self.get_xyz.device, dtype=torch.float32)
+        feature_grad = None
+        if bool(getattr(self, "field_mvstruct_conflict_split", False)) and (not self._mvstruct_conflict_source_is_position()) and feature_dc_grad is not None:
+            if feature_dc_grad.shape[0] == n_points:
+                feature_grad = feature_dc_grad.detach().reshape(n_points, -1).to(device=self.get_xyz.device, dtype=torch.float32)
+        pos_grad = None
+        if bool(getattr(self, "field_mvstruct_conflict_split", False)) and self._mvstruct_conflict_source_is_position() and position_grad is not None:
+            if position_grad.shape[0] == n_points:
+                pos_grad = position_grad.detach().reshape(n_points, -1)[:, :3].to(device=self.get_xyz.device, dtype=torch.float32)
+        self._mvstruct_event_records.append((grad_norm, visible, radii, feature_grad, pos_grad))
+        return True
+
+    def mvstruct_commit_event(self, min_event_views=3):
+        stats = {"views": 0, "consistent_points": 0, "observations": 0, "conflict_points": 0}
+        if not self._mvstruct_buffers_ready() or len(self._mvstruct_event_records) == 0:
+            self._mvstruct_event_records = []
+            return stats
+        n_points = self.get_xyz.shape[0]
+        visible_count = torch.zeros((n_points,), device=self.get_xyz.device, dtype=torch.int32)
+        for _, visible, _, _, _ in self._mvstruct_event_records:
+            if visible.shape[0] == n_points:
+                visible_count += visible.to(dtype=torch.int32)
+        min_event_views = max(int(min_event_views), 1)
+        event_consistent = visible_count >= min_event_views
+        stats["views"] = len(self._mvstruct_event_records)
+        stats["consistent_points"] = int(torch.count_nonzero(event_consistent).item())
+        conflict_enabled = bool(getattr(self, "field_mvstruct_conflict_split", False))
+        conflict_grad_sum = None
+        conflict_norm_sum = None
+        conflict_valid_count = None
+        conflict_unit_sum = None
+        conflict_unit_outer_sum = None
+        if conflict_enabled:
+            conflict_dim = self._mvstruct_conflict_dim()
+            conflict_grad_sum = torch.zeros((n_points, conflict_dim), device=self.get_xyz.device, dtype=torch.float32)
+            conflict_norm_sum = torch.zeros((n_points, 1), device=self.get_xyz.device, dtype=torch.float32)
+            conflict_valid_count = torch.zeros((n_points,), device=self.get_xyz.device, dtype=torch.int32)
+            conflict_unit_sum = torch.zeros((n_points, conflict_dim), device=self.get_xyz.device, dtype=torch.float32)
+            conflict_unit_outer_sum = torch.zeros((n_points, conflict_dim, conflict_dim), device=self.get_xyz.device, dtype=torch.float32)
+        use_position_conflict = self._mvstruct_conflict_source_is_position()
+        for grad_norm, visible, radii, feature_grad, pos_grad in self._mvstruct_event_records:
+            if grad_norm.shape[0] != n_points or visible.shape[0] != n_points or radii.shape[0] != n_points:
+                continue
+            valid = visible & event_consistent
+            if torch.count_nonzero(valid) == 0:
+                continue
+            self._mvstruct_gradient_accum[valid] += grad_norm[valid]
+            self._mvstruct_visibility_count[valid] += 1.0
+            self._mvstruct_max_radii2D[valid] = torch.max(self._mvstruct_max_radii2D[valid], radii[valid])
+            stats["observations"] += int(torch.count_nonzero(valid).item())
+            conflict_grad = pos_grad if use_position_conflict else feature_grad
+            if conflict_enabled and conflict_grad is not None and conflict_grad.shape[0] == n_points:
+                conflict_norm = torch.norm(conflict_grad, dim=1, keepdim=True)
+                conflict_view_valid = valid & (conflict_norm.squeeze(1) > 1e-12)
+                if torch.count_nonzero(conflict_view_valid) > 0:
+                    conflict_grad_sum[conflict_view_valid] += conflict_grad[conflict_view_valid]
+                    conflict_norm_sum[conflict_view_valid] += conflict_norm[conflict_view_valid]
+                    conflict_valid_count[conflict_view_valid] += 1
+                    conflict_unit = conflict_grad[conflict_view_valid] / (conflict_norm[conflict_view_valid] + 1e-12)
+                    conflict_unit_sum[conflict_view_valid] += conflict_unit
+                    conflict_unit_outer_sum[conflict_view_valid] += torch.einsum("bi,bj->bij", conflict_unit, conflict_unit)
+        if conflict_enabled and conflict_valid_count is not None:
+            conflict_event_valid = conflict_valid_count >= min_event_views
+            if torch.count_nonzero(conflict_event_valid) > 0:
+                resultant = torch.norm(conflict_grad_sum, dim=1, keepdim=True)
+                conflict = 1.0 - resultant / (conflict_norm_sum + 1e-12)
+                conflict = torch.clamp(conflict, min=0.0, max=1.0)
+                self._mvstruct_conflict_accum[conflict_event_valid] += conflict[conflict_event_valid]
+                self._mvstruct_conflict_event_count[conflict_event_valid] += 1.0
+                valid_indices = torch.nonzero(conflict_event_valid, as_tuple=False).squeeze(1)
+                count = conflict_valid_count[valid_indices].to(dtype=torch.float32).clamp_min(1.0)
+                mean_outer = conflict_unit_outer_sum[valid_indices] / count.view(-1, 1, 1)
+                mean_unit = conflict_unit_sum[valid_indices] / count.view(-1, 1)
+                covariance = mean_outer - torch.einsum("bi,bj->bij", mean_unit, mean_unit)
+                covariance = 0.5 * (covariance + covariance.transpose(1, 2))
+                cov_trace = covariance.diagonal(dim1=1, dim2=2).sum(dim=1)
+                event_conflict = conflict[valid_indices, 0]
+                axis_event_valid = (
+                    torch.isfinite(event_conflict)
+                    & torch.isfinite(cov_trace)
+                    & (event_conflict >= float(getattr(self, "field_mvstruct_conflict_threshold", 0.35)))
+                    & (cov_trace > 1e-6)
+                )
+                if torch.count_nonzero(axis_event_valid) > 0:
+                    axis_indices = valid_indices[axis_event_valid]
+                    weighted_covariance = covariance[axis_event_valid] * event_conflict[axis_event_valid].view(-1, 1, 1)
+                    self._mvstruct_conflict_cov_accum[axis_indices] += weighted_covariance
+                    self._mvstruct_conflict_cov_event_count[axis_indices] += 1.0
+                stats["conflict_points"] = int(torch.count_nonzero(conflict_event_valid).item())
+        self._mvstruct_total_views += len(self._mvstruct_event_records)
+        self._mvstruct_event_records = []
+        return stats
+
+    def _mvstruct_make_child_tensors(self, selected_mask, split=False, children=2):
+        if torch.count_nonzero(selected_mask) == 0:
+            return None
+        if split:
+            repeats = int(children)
+            parent_xyz = self.get_xyz[selected_mask]
+            parent_scales = self.get_scaling[selected_mask]
+            stds = parent_scales.repeat(repeats, 1)
+            means = torch.zeros((stds.size(0), 3), device="cuda")
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(self._rotation[selected_mask]).repeat(repeats, 1, 1)
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + parent_xyz.repeat(repeats, 1)
+            new_scaling = self.scaling_inverse_activation(parent_scales.repeat(repeats, 1) / (0.8 * repeats))
+            repeat_fn = lambda tensor: tensor[selected_mask].repeat(repeats, *([1] * (tensor.dim() - 1)))
+        else:
+            repeats = 1
+            new_xyz = self._xyz[selected_mask]
+            new_scaling = self._scaling[selected_mask]
+            repeat_fn = lambda tensor: tensor[selected_mask]
+
+        new_features_dc = repeat_fn(self._features_dc)
+        new_opacity = repeat_fn(self._opacity)
+        new_rotation = repeat_fn(self._rotation)
+        new_motion = repeat_fn(self._motion)
+        new_omega = repeat_fn(self._omega)
+        new_featuret = repeat_fn(self._features_t)
+
+        parent_trbf_center = self._trbf_center[selected_mask]
+        parent_trbf_scale = self._trbf_scale[selected_mask]
+        if split:
+            new_trbf_center, new_trbf_scale = self._get_temporal_child_support(
+                parent_trbf_center,
+                parent_trbf_scale,
+                self._motion[selected_mask],
+                error_prior=self.maskforems[selected_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None,
+                copies_per_parent=repeats,
+            )
+        else:
+            new_trbf_center = parent_trbf_center
+            new_trbf_scale = parent_trbf_scale
+
+        new_static_level_logits = None
+        new_dynamic_level_logits = None
+        new_dynamic_level_time_coeff = None
+        if self.use_euler_field:
+            new_static_level_logits = repeat_fn(self._static_level_logits)
+            new_dynamic_level_logits = repeat_fn(self._dynamic_level_logits)
+            if self._dynamic_level_time_coeff.numel() > 0:
+                new_dynamic_level_time_coeff = repeat_fn(self._dynamic_level_time_coeff)
+
+        new_ems_mask = None
+        if self.maskforems is not None and self.maskforems.numel() > 0:
+            new_ems_mask = repeat_fn(self.maskforems)
+
+        if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() > 0 and self._bg_candidate_mask.shape[0] == selected_mask.shape[0]:
+            new_bg_candidate_mask = repeat_fn(self._bg_candidate_mask)
+        else:
+            new_bg_candidate_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0 and self._bg_birth_iter.shape[0] == selected_mask.shape[0]:
+            new_bg_birth_iter = repeat_fn(self._bg_birth_iter)
+        else:
+            new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), -1.0, device="cuda", dtype=torch.float32)
+        existence_parent_indices = torch.nonzero(
+            selected_mask,
+            as_tuple=False,
+        ).squeeze(1).repeat(repeats)
+
+        return (
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+            existence_parent_indices,
+        )
+
+    def _mvstruct_make_specialized_child_tensors(
+        self,
+        selected_indices,
+        feature_axes,
+        feature_delta=0.05,
+        offset_ratio=0.5,
+        scale_ratio=0.5,
+    ):
+        if selected_indices is None or int(selected_indices.numel()) == 0:
+            return None
+        device = self.get_xyz.device
+        selected_indices = selected_indices.to(device=device, dtype=torch.long)
+        parent_xyz = self.get_xyz[selected_indices]
+        parent_scales = self.get_scaling[selected_indices]
+        parent_rotation = self._rotation[selected_indices]
+        parent_features = self._features_dc[selected_indices]
+        feature_axes = feature_axes.to(device=device, dtype=parent_features.dtype).reshape_as(parent_features)
+        feature_axes = feature_axes / (torch.norm(feature_axes.reshape(feature_axes.shape[0], -1), dim=1, keepdim=True).reshape(-1, *([1] * (feature_axes.dim() - 1))) + 1e-12)
+
+        max_axis = torch.argmax(parent_scales, dim=1)
+        local_axis = torch.zeros((selected_indices.shape[0], 3), device=device, dtype=parent_scales.dtype)
+        local_axis[torch.arange(selected_indices.shape[0], device=device), max_axis] = 1.0
+        world_axis = torch.bmm(build_rotation(parent_rotation), local_axis.unsqueeze(-1)).squeeze(-1)
+        world_axis = world_axis / (torch.norm(world_axis, dim=1, keepdim=True) + 1e-12)
+        max_scale = torch.max(parent_scales, dim=1, keepdim=True).values
+        offset = float(offset_ratio) * max_scale * world_axis
+
+        new_xyz = torch.cat((parent_xyz + offset, parent_xyz - offset), dim=0)
+        new_features_dc = torch.cat(
+            (
+                parent_features + float(feature_delta) * feature_axes,
+                parent_features - float(feature_delta) * feature_axes,
+            ),
+            dim=0,
+        )
+        new_scaling = self.scaling_inverse_activation(parent_scales.repeat(2, 1) * float(scale_ratio))
+
+        def repeat_children(tensor):
+            return tensor[selected_indices].repeat(2, *([1] * (tensor.dim() - 1)))
+
+        new_opacity = repeat_children(self._opacity)
+        new_rotation = repeat_children(self._rotation)
+        new_motion = repeat_children(self._motion)
+        new_omega = repeat_children(self._omega)
+        new_featuret = repeat_children(self._features_t)
+        new_trbf_center, new_trbf_scale = self._get_temporal_child_support(
+            self._trbf_center[selected_indices],
+            self._trbf_scale[selected_indices],
+            self._motion[selected_indices],
+            error_prior=self.maskforems[selected_indices] if self.maskforems is not None and self.maskforems.numel() > 0 else None,
+            copies_per_parent=2,
+        )
+
+        new_static_level_logits = None
+        new_dynamic_level_logits = None
+        new_dynamic_level_time_coeff = None
+        if self.use_euler_field:
+            new_static_level_logits = repeat_children(self._static_level_logits)
+            new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
+            if self._dynamic_level_time_coeff.numel() > 0:
+                new_dynamic_level_time_coeff = repeat_children(self._dynamic_level_time_coeff)
+
+        new_ems_mask = None
+        if self.maskforems is not None and self.maskforems.numel() > 0:
+            new_ems_mask = repeat_children(self.maskforems)
+
+        if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() > 0 and self._bg_candidate_mask.shape[0] == self.get_xyz.shape[0]:
+            new_bg_candidate_mask = repeat_children(self._bg_candidate_mask)
+        else:
+            new_bg_candidate_mask = torch.zeros((new_xyz.shape[0], 1), device=device, dtype=torch.float32)
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0 and self._bg_birth_iter.shape[0] == self.get_xyz.shape[0]:
+            new_bg_birth_iter = repeat_children(self._bg_birth_iter)
+        else:
+            new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), -1.0, device=device, dtype=torch.float32)
+        existence_parent_indices = selected_indices.repeat(2)
+
+        return (
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+            existence_parent_indices,
+        )
+
+    def _mvstruct_make_directional_position_child_tensors(
+        self,
+        selected_indices,
+        position_axes,
+        offset_ratio=0.5,
+    ):
+        if selected_indices is None or int(selected_indices.numel()) == 0:
+            return None
+        device = self.get_xyz.device
+        selected_indices = selected_indices.to(device=device, dtype=torch.long)
+        parent_xyz = self.get_xyz[selected_indices]
+        parent_scales = self.get_scaling[selected_indices]
+        parent_rotation = self._rotation[selected_indices]
+
+        position_axes = position_axes.to(device=device, dtype=parent_xyz.dtype).reshape(-1, 3)
+        position_axes = position_axes / (torch.norm(position_axes, dim=1, keepdim=True) + 1e-12)
+        rotations = build_rotation(parent_rotation)
+        local_axes = torch.bmm(rotations.transpose(1, 2), position_axes.unsqueeze(-1)).squeeze(-1)
+        sigma_q = torch.sqrt(torch.sum((local_axes * parent_scales) ** 2, dim=1, keepdim=True).clamp_min(1e-12))
+        offset = float(offset_ratio) * sigma_q * position_axes
+
+        new_xyz = torch.cat((parent_xyz + offset, parent_xyz - offset), dim=0)
+        new_scaling = self.scaling_inverse_activation(parent_scales.repeat(2, 1) / (0.8 * 2))
+
+        def repeat_children(tensor):
+            return tensor[selected_indices].repeat(2, *([1] * (tensor.dim() - 1)))
+
+        new_features_dc = repeat_children(self._features_dc)
+        new_opacity = repeat_children(self._opacity)
+        new_rotation = repeat_children(self._rotation)
+        new_motion = repeat_children(self._motion)
+        new_omega = repeat_children(self._omega)
+        new_featuret = repeat_children(self._features_t)
+        new_trbf_center = repeat_children(self._trbf_center)
+        new_trbf_scale = repeat_children(self._trbf_scale)
+
+        new_static_level_logits = None
+        new_dynamic_level_logits = None
+        new_dynamic_level_time_coeff = None
+        if self.use_euler_field:
+            new_static_level_logits = repeat_children(self._static_level_logits)
+            new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
+            if self._dynamic_level_time_coeff.numel() > 0:
+                new_dynamic_level_time_coeff = repeat_children(self._dynamic_level_time_coeff)
+
+        new_ems_mask = None
+        if self.maskforems is not None and self.maskforems.numel() > 0:
+            new_ems_mask = repeat_children(self.maskforems)
+
+        if self._bg_candidate_mask is not None and self._bg_candidate_mask.numel() > 0 and self._bg_candidate_mask.shape[0] == self.get_xyz.shape[0]:
+            new_bg_candidate_mask = repeat_children(self._bg_candidate_mask)
+        else:
+            new_bg_candidate_mask = torch.zeros((new_xyz.shape[0], 1), device=device, dtype=torch.float32)
+        if self._bg_birth_iter is not None and self._bg_birth_iter.numel() > 0 and self._bg_birth_iter.shape[0] == self.get_xyz.shape[0]:
+            new_bg_birth_iter = repeat_children(self._bg_birth_iter)
+        else:
+            new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), -1.0, device=device, dtype=torch.float32)
+        existence_parent_indices = selected_indices.repeat(2)
+
+        return (
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_bg_candidate_mask,
+            new_bg_birth_iter,
+            existence_parent_indices,
+        )
+
+    def densify_mvstruct_budgeted(self, iteration, scene_extent):
+        stats = {
+            "due": 0,
+            "base_eligible": 0,
+            "eligible": 0,
+            "recent_child_rejected": 0,
+            "recent_would_select": 0,
+            "oversize_eligible": 0,
+            "oversize_selected": 0,
+            "oversize_radius_p50": 0.0,
+            "oversize_radius_p90": 0.0,
+            "oversize_radius_max": 0.0,
+            "conflict_eligible": 0,
+            "conflict_selected": 0,
+            "conflict_budget": 0,
+            "conflict_score_p50": 0.0,
+            "conflict_score_p90": 0.0,
+            "conflict_score_max": 0.0,
+            "conflict_event_count_p50": 0.0,
+            "conflict_event_count_p90": 0.0,
+            "conflict_selected_radius_p50": 0.0,
+            "conflict_selected_radius_p90": 0.0,
+            "specialize_eligible": 0,
+            "specialize_selected": 0,
+            "specialize_fallback": 0,
+            "directional_eligible": 0,
+            "directional_selected": 0,
+            "directional_fallback": 0,
+            "directional_sigma_p50": 0.0,
+            "directional_sigma_p90": 0.0,
+            "axis_ratio_p50": 0.0,
+            "axis_ratio_p90": 0.0,
+            "axis_event_count_p50": 0.0,
+            "axis_event_count_p90": 0.0,
+            "parent_radius_p50": 0.0,
+            "parent_radius_p90": 0.0,
+            "estimated_child_radius_p50": 0.0,
+            "estimated_child_radius_p90": 0.0,
+            "feature_delta_norm": 0.0,
+            "child_offset_ratio": 0.0,
+            "specialize_scale_ratio": 0.0,
+            "normal_selected": 0,
+            "selected": 0,
+            "clone_candidates": 0,
+            "split_candidates": 0,
+            "cloned": 0,
+            "split_parents": 0,
+            "new_points": 0,
+            "net_points": 0,
+            "total_added": int(self._mvstruct_total_added),
+            "event_budget": 0,
+            "remaining_budget": 0,
+            "score_p50": 0.0,
+            "score_p90": 0.0,
+            "score_p99": 0.0,
+            "score_max": 0.0,
+        }
+        if not bool(getattr(self, "field_mvstruct", False)) or not bool(getattr(self, "field_mvstruct_densify", False)):
+            return stats
+        iteration = int(iteration)
+        if iteration < int(self.field_mvstruct_densify_start) or iteration > int(self.field_mvstruct_densify_until):
+            return stats
+        interval = max(int(self.field_mvstruct_densify_interval), 1)
+        if (iteration - int(self.field_mvstruct_densify_start)) % interval != 0:
+            return stats
+        stats["due"] = 1
+        if self._mvstruct_conflict_source_is_position() and bool(getattr(self, "field_mvstruct_conflict_directional_split", False)):
+            stats["feature_delta_norm"] = 0.0
+            stats["child_offset_ratio"] = float(getattr(self, "field_mvstruct_directional_offset_ratio", 0.5))
+            stats["specialize_scale_ratio"] = 1.0 / (0.8 * 2)
+        else:
+            stats["feature_delta_norm"] = float(getattr(self, "field_mvstruct_specialize_feature_delta", 0.05))
+            stats["child_offset_ratio"] = float(getattr(self, "field_mvstruct_specialize_offset_ratio", 0.5))
+            stats["specialize_scale_ratio"] = float(getattr(self, "field_mvstruct_specialize_scale_ratio", 0.5))
+        if not self._mvstruct_buffers_ready() or self._mvstruct_total_views <= 0:
+            return stats
+        if self._mvstruct_budget_reference_points <= 0:
+            self._mvstruct_budget_reference_points = int(self.get_xyz.shape[0])
+
+        denom = torch.clamp(self._mvstruct_visibility_count, min=1.0)
+        mean_grad = self._mvstruct_gradient_accum / denom
+        visibility_ratio = self._mvstruct_visibility_count / max(float(self._mvstruct_total_views), 1.0)
+        score = mean_grad * visibility_ratio
+        opacity = self.get_opacity
+        observed_candidate = (
+            (self._mvstruct_visibility_count.squeeze(1) >= float(self.field_mvstruct_min_observations))
+            & (visibility_ratio.squeeze(1) >= float(self.field_mvstruct_min_visibility_ratio))
+            & (opacity.squeeze(1) >= float(self.field_mvstruct_min_opacity))
+        )
+        base_candidate = (
+            (mean_grad.squeeze(1) >= float(self.field_mvstruct_grad_threshold))
+            & observed_candidate
+        )
+        cooldown = max(int(getattr(self, "field_mvstruct_cooldown", 0)), 0)
+        if cooldown > 0:
+            cooldown_ready = (iteration - self._mvstruct_last_topology_iter.to(device=self.get_xyz.device)) >= cooldown
+        else:
+            cooldown_ready = torch.ones_like(base_candidate, dtype=torch.bool, device=self.get_xyz.device)
+        candidate = base_candidate & cooldown_ready
+        stats["base_eligible"] = int(torch.count_nonzero(base_candidate).item())
+        stats["recent_child_rejected"] = int(torch.count_nonzero(base_candidate & torch.logical_not(cooldown_ready)).item())
+        event_budget = int(float(self.field_mvstruct_event_max_ratio) * float(self._mvstruct_budget_reference_points))
+        total_budget = int(float(self.field_mvstruct_total_max_ratio) * float(self._mvstruct_budget_reference_points))
+        event_budget = max(event_budget, 1)
+        remaining_budget = max(total_budget - int(self._mvstruct_total_added), 0)
+        stats["event_budget"] = int(event_budget)
+        stats["remaining_budget"] = int(remaining_budget)
+        base_candidate_indices = torch.nonzero(base_candidate, as_tuple=False).squeeze(1)
+        base_select_count = min(int(base_candidate_indices.numel()), event_budget, remaining_budget)
+        if base_select_count > 0:
+            base_candidate_scores = score.squeeze(1)[base_candidate_indices].float()
+            _, base_topk = torch.topk(base_candidate_scores, k=base_select_count, largest=True)
+            base_selected_indices = base_candidate_indices[base_topk]
+            stats["recent_would_select"] = int(torch.count_nonzero(torch.logical_not(cooldown_ready[base_selected_indices])).item())
+
+        radii2d = self._mvstruct_max_radii2D.float()
+        oversize_selected_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
+        oversize_enabled = bool(getattr(self, "field_mvstruct_oversize_split", False))
+        if oversize_enabled and remaining_budget > 0:
+            oversize_radius = float(getattr(self, "field_mvstruct_oversize_radius", 64.0))
+            oversize_budget_ratio = max(float(getattr(self, "field_mvstruct_oversize_budget_ratio", 0.25)), 0.0)
+            oversize_candidate = observed_candidate & cooldown_ready & (radii2d >= oversize_radius)
+            oversize_indices = torch.nonzero(oversize_candidate, as_tuple=False).squeeze(1)
+            stats["oversize_eligible"] = int(oversize_indices.numel())
+            oversize_budget = int(float(event_budget) * oversize_budget_ratio)
+            oversize_budget = min(oversize_budget, event_budget, remaining_budget)
+            oversize_select_count = min(int(oversize_indices.numel()), int(oversize_budget))
+            if oversize_select_count > 0:
+                oversize_scores = radii2d[oversize_indices]
+                _, oversize_topk = torch.topk(oversize_scores, k=oversize_select_count, largest=True)
+                oversize_selected_indices = oversize_indices[oversize_topk]
+                oversize_selected_mask[oversize_selected_indices] = True
+                selected_radii = radii2d[oversize_selected_indices]
+                stats["oversize_selected"] = int(oversize_select_count)
+                stats["oversize_radius_p50"] = float(torch.quantile(selected_radii, 0.50).item())
+                stats["oversize_radius_p90"] = float(torch.quantile(selected_radii, 0.90).item())
+                stats["oversize_radius_max"] = float(torch.max(selected_radii).item())
+
+        used_budget = int(stats["oversize_selected"])
+        conflict_selected_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
+        specialize_selected_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
+        specialize_selected_indices = torch.empty((0,), device="cuda", dtype=torch.long)
+        specialize_feature_axes = None
+        directional_selected_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
+        directional_selected_indices = torch.empty((0,), device="cuda", dtype=torch.long)
+        directional_position_axes = None
+        conflict_enabled = bool(getattr(self, "field_mvstruct_conflict_split", False))
+        if conflict_enabled and remaining_budget > used_budget:
+            conflict_denom = torch.clamp(self._mvstruct_conflict_event_count, min=1.0)
+            mean_conflict = self._mvstruct_conflict_accum / conflict_denom
+            conflict_event_count = self._mvstruct_conflict_event_count.squeeze(1)
+            conflict_candidate = (
+                base_candidate
+                & cooldown_ready
+                & torch.logical_not(oversize_selected_mask)
+                & (mean_conflict.squeeze(1) >= float(getattr(self, "field_mvstruct_conflict_threshold", 0.35)))
+                & (conflict_event_count >= float(getattr(self, "field_mvstruct_conflict_min_events", 3)))
+                & (radii2d >= float(getattr(self, "field_mvstruct_conflict_min_radius", 4.0)))
+            )
+            conflict_indices = torch.nonzero(conflict_candidate, as_tuple=False).squeeze(1)
+            stats["conflict_eligible"] = int(conflict_indices.numel())
+            conflict_budget_ratio = max(float(getattr(self, "field_mvstruct_conflict_budget_ratio", 0.25)), 0.0)
+            conflict_budget = int(float(event_budget) * conflict_budget_ratio)
+            conflict_budget = min(conflict_budget, event_budget - used_budget, remaining_budget - used_budget)
+            stats["conflict_budget"] = int(max(conflict_budget, 0))
+            conflict_select_count = min(int(conflict_indices.numel()), int(stats["conflict_budget"]))
+            if conflict_indices.numel() > 0:
+                raw_conflicts = mean_conflict.squeeze(1)[conflict_indices].float()
+                rank_scores = raw_conflicts * score.squeeze(1)[conflict_indices].float()
+                stats["conflict_score_p50"] = float(torch.quantile(raw_conflicts, 0.50).item())
+                stats["conflict_score_p90"] = float(torch.quantile(raw_conflicts, 0.90).item())
+                stats["conflict_score_max"] = float(torch.max(raw_conflicts).item())
+                conflict_counts = conflict_event_count[conflict_indices].float()
+                stats["conflict_event_count_p50"] = float(torch.quantile(conflict_counts, 0.50).item())
+                stats["conflict_event_count_p90"] = float(torch.quantile(conflict_counts, 0.90).item())
+                if conflict_select_count > 0:
+                    _, conflict_topk = torch.topk(rank_scores, k=conflict_select_count, largest=True)
+                    conflict_selected_indices = conflict_indices[conflict_topk]
+                    conflict_selected_mask[conflict_selected_indices] = True
+                    selected_radii = radii2d[conflict_selected_indices]
+                    stats["conflict_selected"] = int(conflict_select_count)
+                    stats["conflict_selected_radius_p50"] = float(torch.quantile(selected_radii, 0.50).item())
+                    stats["conflict_selected_radius_p90"] = float(torch.quantile(selected_radii, 0.90).item())
+                    specialize_enabled = bool(getattr(self, "field_mvstruct_conflict_specialize", False)) and (not self._mvstruct_conflict_source_is_position())
+                    directional_enabled = bool(getattr(self, "field_mvstruct_conflict_directional_split", False)) and self._mvstruct_conflict_source_is_position()
+                    if directional_enabled and self._mvstruct_conflict_cov_accum is not None and conflict_select_count > 0:
+                        selected_cov = self._mvstruct_conflict_cov_accum[conflict_selected_indices].float()
+                        selected_cov = torch.nan_to_num(selected_cov, nan=0.0, posinf=0.0, neginf=0.0)
+                        selected_cov = 0.5 * (selected_cov + selected_cov.transpose(1, 2))
+                        eigvals, eigvecs = torch.linalg.eigh(selected_cov)
+                        eigvals_pos = torch.clamp(eigvals, min=0.0)
+                        largest = eigvals_pos[:, -1]
+                        trace = torch.sum(eigvals_pos, dim=1)
+                        axis_ratio = largest / (trace + 1e-12)
+                        axis_counts = self._mvstruct_conflict_cov_event_count.squeeze(1)[conflict_selected_indices].float()
+                        stats["axis_ratio_p50"] = float(torch.quantile(axis_ratio, 0.50).item())
+                        stats["axis_ratio_p90"] = float(torch.quantile(axis_ratio, 0.90).item())
+                        stats["axis_event_count_p50"] = float(torch.quantile(axis_counts, 0.50).item())
+                        stats["axis_event_count_p90"] = float(torch.quantile(axis_counts, 0.90).item())
+                        directional_ready = (
+                            (axis_counts >= float(getattr(self, "field_mvstruct_directional_min_events", 3)))
+                            & (axis_ratio >= float(getattr(self, "field_mvstruct_directional_min_axis_ratio", 0.5)))
+                            & (trace > float(getattr(self, "field_mvstruct_directional_min_trace", 1e-6)))
+                            & torch.isfinite(axis_ratio)
+                        )
+                        stats["directional_eligible"] = int(torch.count_nonzero(directional_ready).item())
+                        if torch.count_nonzero(directional_ready) > 0:
+                            directional_selected_indices = conflict_selected_indices[directional_ready]
+                            directional_position_axes = eigvecs[:, :, -1][directional_ready]
+                            directional_selected_mask[directional_selected_indices] = True
+                            stats["directional_selected"] = int(directional_selected_indices.numel())
+                            parent_scales = self.get_scaling[directional_selected_indices]
+                            parent_rotations = build_rotation(self._rotation[directional_selected_indices])
+                            local_axes = torch.bmm(
+                                parent_rotations.transpose(1, 2),
+                                directional_position_axes.to(device=parent_scales.device, dtype=parent_scales.dtype).unsqueeze(-1),
+                            ).squeeze(-1)
+                            sigma_q = torch.sqrt(torch.sum((local_axes * parent_scales) ** 2, dim=1).clamp_min(1e-12))
+                            stats["directional_sigma_p50"] = float(torch.quantile(sigma_q, 0.50).item())
+                            stats["directional_sigma_p90"] = float(torch.quantile(sigma_q, 0.90).item())
+                            parent_radii = selected_radii[directional_ready]
+                            child_radii = parent_radii / (0.8 * 2)
+                            stats["parent_radius_p50"] = float(torch.quantile(parent_radii, 0.50).item())
+                            stats["parent_radius_p90"] = float(torch.quantile(parent_radii, 0.90).item())
+                            stats["estimated_child_radius_p50"] = float(torch.quantile(child_radii, 0.50).item())
+                            stats["estimated_child_radius_p90"] = float(torch.quantile(child_radii, 0.90).item())
+                        stats["directional_fallback"] = int(stats["conflict_selected"] - stats["directional_selected"])
+                    if specialize_enabled and self._mvstruct_conflict_cov_accum is not None and conflict_select_count > 0:
+                        selected_cov = self._mvstruct_conflict_cov_accum[conflict_selected_indices].float()
+                        selected_cov = torch.nan_to_num(selected_cov, nan=0.0, posinf=0.0, neginf=0.0)
+                        selected_cov = 0.5 * (selected_cov + selected_cov.transpose(1, 2))
+                        eigvals, eigvecs = torch.linalg.eigh(selected_cov)
+                        eigvals_pos = torch.clamp(eigvals, min=0.0)
+                        largest = eigvals_pos[:, -1]
+                        trace = torch.sum(eigvals_pos, dim=1)
+                        axis_ratio = largest / (trace + 1e-12)
+                        axis_counts = self._mvstruct_conflict_cov_event_count.squeeze(1)[conflict_selected_indices].float()
+                        stats["axis_ratio_p50"] = float(torch.quantile(axis_ratio, 0.50).item())
+                        stats["axis_ratio_p90"] = float(torch.quantile(axis_ratio, 0.90).item())
+                        stats["axis_event_count_p50"] = float(torch.quantile(axis_counts, 0.50).item())
+                        stats["axis_event_count_p90"] = float(torch.quantile(axis_counts, 0.90).item())
+                        specialize_ready = (
+                            (axis_counts >= float(getattr(self, "field_mvstruct_specialize_min_events", 3)))
+                            & (axis_ratio >= float(getattr(self, "field_mvstruct_specialize_axis_ratio", 0.5)))
+                            & (selected_radii >= float(getattr(self, "field_mvstruct_specialize_min_radius", 32.0)))
+                            & torch.isfinite(axis_ratio)
+                            & (trace > 1e-12)
+                        )
+                        stats["specialize_eligible"] = int(torch.count_nonzero(specialize_ready).item())
+                        if torch.count_nonzero(specialize_ready) > 0:
+                            specialize_selected_indices = conflict_selected_indices[specialize_ready]
+                            specialize_feature_axes = eigvecs[:, :, -1][specialize_ready]
+                            specialize_selected_mask[specialize_selected_indices] = True
+                            stats["specialize_selected"] = int(specialize_selected_indices.numel())
+                            parent_radii = selected_radii[specialize_ready]
+                            scale_ratio_value = float(getattr(self, "field_mvstruct_specialize_scale_ratio", 0.5))
+                            child_radii = parent_radii * scale_ratio_value
+                            stats["parent_radius_p50"] = float(torch.quantile(parent_radii, 0.50).item())
+                            stats["parent_radius_p90"] = float(torch.quantile(parent_radii, 0.90).item())
+                            stats["estimated_child_radius_p50"] = float(torch.quantile(child_radii, 0.50).item())
+                            stats["estimated_child_radius_p90"] = float(torch.quantile(child_radii, 0.90).item())
+                            stats["feature_delta_norm"] = float(getattr(self, "field_mvstruct_specialize_feature_delta", 0.05))
+                            stats["child_offset_ratio"] = float(getattr(self, "field_mvstruct_specialize_offset_ratio", 0.5))
+                            stats["specialize_scale_ratio"] = scale_ratio_value
+                        stats["specialize_fallback"] = int(stats["conflict_selected"] - stats["specialize_selected"])
+            used_budget += int(stats["conflict_selected"])
+
+        candidate = candidate & torch.logical_not(oversize_selected_mask) & torch.logical_not(conflict_selected_mask)
+        candidate_indices = torch.nonzero(candidate, as_tuple=False).squeeze(1)
+        stats["eligible"] = int(candidate_indices.numel())
+        if (
+            candidate_indices.numel() == 0
+            and torch.count_nonzero(oversize_selected_mask) == 0
+            and torch.count_nonzero(conflict_selected_mask) == 0
+        ):
+            self.reset_mvstruct_window()
+            return stats
+
+        scale_max = torch.max(self.get_scaling, dim=1).values
+        normal_select_count = 0
+        normal_selected_mask = torch.zeros((self.get_xyz.shape[0],), device="cuda", dtype=torch.bool)
+        normal_budget = min(
+            max(event_budget - used_budget, 0),
+            max(remaining_budget - used_budget, 0),
+        )
+        if candidate_indices.numel() > 0:
+            candidate_scores = score.squeeze(1)[candidate_indices].float()
+            stats["score_p50"] = float(torch.quantile(candidate_scores, 0.50).item())
+            stats["score_p90"] = float(torch.quantile(candidate_scores, 0.90).item())
+            stats["score_p99"] = float(torch.quantile(candidate_scores, 0.99).item())
+            stats["score_max"] = float(torch.max(candidate_scores).item())
+            candidate_split = scale_max[candidate_indices] > self.percent_dense * scene_extent
+            stats["split_candidates"] = int(torch.count_nonzero(candidate_split).item())
+            stats["clone_candidates"] = int(candidate_indices.numel() - stats["split_candidates"])
+            normal_select_count = min(int(candidate_indices.numel()), int(normal_budget))
+            if normal_select_count > 0:
+                _, topk = torch.topk(candidate_scores, k=normal_select_count, largest=True)
+                selected_indices = candidate_indices[topk]
+                normal_selected_mask[selected_indices] = True
+
+        if (
+            normal_select_count <= 0
+            and torch.count_nonzero(oversize_selected_mask) == 0
+            and torch.count_nonzero(conflict_selected_mask) == 0
+        ):
+            self.reset_mvstruct_window()
+            return stats
+
+        stats["specialize_fallback"] = int(stats["conflict_selected"] - stats["specialize_selected"] - stats["directional_selected"])
+        stats["directional_fallback"] = int(stats["conflict_selected"] - stats["directional_selected"] - stats["specialize_selected"])
+
+        normal_split_mask = normal_selected_mask & (scale_max > self.percent_dense * scene_extent)
+        clone_mask = normal_selected_mask & torch.logical_not(normal_split_mask)
+        split_mask = normal_split_mask | oversize_selected_mask | conflict_selected_mask
+        selected_mask = clone_mask | split_mask
+        conflict_fallback_mask = conflict_selected_mask & torch.logical_not(specialize_selected_mask) & torch.logical_not(directional_selected_mask)
+
+        tensors = []
+        clone_tensors = self._mvstruct_make_child_tensors(clone_mask, split=False)
+        normal_split_tensors = self._mvstruct_make_child_tensors(normal_split_mask | oversize_selected_mask, split=True, children=2)
+        conflict_children = 2
+        conflict_split_tensors = self._mvstruct_make_child_tensors(conflict_fallback_mask, split=True, children=conflict_children)
+        directional_split_tensors = self._mvstruct_make_directional_position_child_tensors(
+            directional_selected_indices,
+            directional_position_axes,
+            offset_ratio=float(getattr(self, "field_mvstruct_directional_offset_ratio", 0.5)),
+        )
+        specialize_split_tensors = self._mvstruct_make_specialized_child_tensors(
+            specialize_selected_indices,
+            specialize_feature_axes,
+            feature_delta=float(getattr(self, "field_mvstruct_specialize_feature_delta", 0.05)),
+            offset_ratio=float(getattr(self, "field_mvstruct_specialize_offset_ratio", 0.5)),
+            scale_ratio=float(getattr(self, "field_mvstruct_specialize_scale_ratio", 0.5)),
+        )
+        if clone_tensors is not None:
+            tensors.append(clone_tensors)
+        if normal_split_tensors is not None:
+            tensors.append(normal_split_tensors)
+        if conflict_split_tensors is not None:
+            tensors.append(conflict_split_tensors)
+        if directional_split_tensors is not None:
+            tensors.append(directional_split_tensors)
+        if specialize_split_tensors is not None:
+            tensors.append(specialize_split_tensors)
+        if not tensors:
+            self.reset_mvstruct_window()
+            return stats
+
+        def cat_optional(items, idx):
+            vals = [item[idx] for item in items if item[idx] is not None]
+            if not vals:
+                return None
+            return torch.cat(vals, dim=0)
+
+        old_count = self.get_xyz.shape[0]
+        self.densification_postfix(
+            cat_optional(tensors, 0),
+            cat_optional(tensors, 1),
+            cat_optional(tensors, 2),
+            cat_optional(tensors, 3),
+            cat_optional(tensors, 4),
+            cat_optional(tensors, 5),
+            cat_optional(tensors, 6),
+            cat_optional(tensors, 7),
+            cat_optional(tensors, 8),
+            cat_optional(tensors, 9),
+            cat_optional(tensors, 10),
+            cat_optional(tensors, 11),
+            cat_optional(tensors, 12),
+            cat_optional(tensors, 13),
+            cat_optional(tensors, 14),
+            cat_optional(tensors, 15),
+            new_existence_parent_indices=cat_optional(tensors, 16),
+        )
+        if self._mvstruct_last_topology_iter is not None and self._mvstruct_last_topology_iter.shape[0] == self.get_xyz.shape[0]:
+            old_topology_iter = self._mvstruct_last_topology_iter[:old_count].clone()
+            old_topology_iter[selected_mask] = int(iteration)
+            self._mvstruct_last_topology_iter[:old_count] = old_topology_iter
+            if self.get_xyz.shape[0] > old_count:
+                self._mvstruct_last_topology_iter[old_count:] = int(iteration)
+        split_count = int(torch.count_nonzero(split_mask).item())
+        if split_count > 0:
+            prune_filter = torch.cat((split_mask, torch.zeros(self.get_xyz.shape[0] - old_count, device="cuda", dtype=torch.bool)))
+            self.prune_points(prune_filter)
+
+        clone_count = int(torch.count_nonzero(clone_mask).item())
+        conflict_split_count = int(torch.count_nonzero(conflict_selected_mask).item())
+        standard_split_count = split_count - conflict_split_count
+        stats["normal_selected"] = int(normal_select_count)
+        stats["selected"] = clone_count + split_count
+        stats["cloned"] = clone_count
+        stats["split_parents"] = split_count
+        stats["new_points"] = clone_count + 2 * standard_split_count + conflict_children * conflict_split_count
+        stats["net_points"] = int(self.get_xyz.shape[0] - old_count)
+        self._mvstruct_total_added += max(int(stats["net_points"]), 0)
+        stats["total_added"] = int(self._mvstruct_total_added)
+        self.reset_mvstruct_window()
+        return stats
 
 
 
@@ -5704,8 +9874,29 @@ class GaussianModel:
         scales = torch.clamp(scales, -10, 1.0)
         new_scaling = scales 
 
-
-        self.densification_postfix(new_xyz, new_features_dc, new_opacity, new_scaling, new_rotation, new_trbf_center, new_trbf_scale, new_motion, new_omega,new_featuret, new_static_level_logits, new_dynamic_level_logits, new_dynamic_level_time_coeff, new_ems_mask)
+        new_motion_time_anchor = torch.full(
+            (new_xyz.shape[0], 1),
+            float(viewpoint_cam.timestamp),
+            device=new_xyz.device,
+            dtype=new_xyz.dtype,
+        )
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_trbf_center,
+            new_trbf_scale,
+            new_motion,
+            new_omega,
+            new_featuret,
+            new_static_level_logits,
+            new_dynamic_level_logits,
+            new_dynamic_level_time_coeff,
+            new_ems_mask,
+            new_motion_time_anchor=new_motion_time_anchor,
+        )
         return new_xyz.shape[0]
 
     def suppress_background_explainers(self, region_mask, viewpoint_cam, bg_depth, iteration):
@@ -5782,6 +9973,59 @@ class GaussianModel:
             suppressed_pixels = torch.zeros_like(region_mask, dtype=torch.bool)
             suppressed_pixels[y_idx[selected_indices], x_idx[selected_indices]] = True
             return int(selected_indices.numel()), suppressed_pixels
+
+    def _background_time_centers(
+        self,
+        num_points,
+        dtype,
+        source_times=None,
+    ):
+        num_points = int(num_points)
+        if (
+            bool(getattr(self, "field_carrier_initialization", False))
+            and source_times is None
+        ):
+            raise ValueError(
+                "carrier_hybrid requires an explicit normalized source time "
+                "for every no-parent Gaussian addition"
+            )
+        single_expert = str(
+            getattr(self, "field_existence_single_expert", "none")
+        ).strip().lower()
+        if (
+            single_expert not in {"persistent", "interval", "transient"}
+            or source_times is None
+        ):
+            return torch.full(
+                (num_points, 1),
+                float(self.field_bg_prior_trbf_center),
+                device="cuda",
+                dtype=dtype,
+            )
+
+        source_times = torch.as_tensor(
+            source_times,
+            device="cuda",
+            dtype=dtype,
+        ).reshape(-1, 1)
+        if source_times.shape[0] == 1 and num_points != 1:
+            source_times = source_times.expand(num_points, 1)
+        if source_times.shape[0] != num_points:
+            raise ValueError(
+                "source_times must be scalar or have one entry per "
+                "new background Gaussian"
+            )
+        if not torch.all(torch.isfinite(source_times)):
+            raise ValueError(
+                "source_times contains a non-finite timestamp"
+            )
+        if torch.any(source_times < -1e-6) or torch.any(
+            source_times > 1.0 + 1e-6
+        ):
+            raise ValueError(
+                "source_times must use normalized timestamps in [0, 1]"
+            )
+        return source_times.clamp(0.0, 1.0).contiguous()
 
     def add_static_background_gaussians(self, pixel_indices, viewpoint_cam, depthmap, bg_image, iteration,
                                         numperay=1, depth_scale=1.02, depth_values=None, depth_scales=None):
@@ -5913,7 +10157,13 @@ class GaussianModel:
             else:
                 depth_scale_value = float("inf")
             new_depth_scale_tags.append(torch.full((selectnumpoints, 1), depth_scale_value, device="cuda", dtype=xyz.dtype))
-            new_trbf_center.append(torch.full((selectnumpoints, 1), float(self.field_bg_prior_trbf_center), device="cuda"))
+            new_trbf_center.append(
+                self._background_time_centers(
+                    selectnumpoints,
+                    xyz.dtype,
+                    source_times=float(viewpoint_cam.timestamp),
+                )
+            )
             new_trbf_scale.append(torch.full((selectnumpoints, 1), float(self.field_bg_prior_trbf_scale), device="cuda"))
             new_motion.append(torch.zeros((selectnumpoints, 9), device="cuda"))
             new_omega.append(torch.zeros((selectnumpoints, 4), device="cuda"))
@@ -5973,6 +10223,7 @@ class GaussianModel:
             new_ems_mask,
             new_bg_candidate_mask,
             new_bg_birth_iter,
+            new_motion_time_anchor=new_trbf_center,
         )
         return new_xyz.shape[0]
 
@@ -6001,7 +10252,14 @@ class GaussianModel:
             new_scaling = knn_scaling()
         return torch.clamp(new_scaling, -10, 1.0)
 
-    def add_static_background_gaussians_xyz(self, new_xyz, rgbs, iteration, depth_scale_tags=None):
+    def add_static_background_gaussians_xyz(
+        self,
+        new_xyz,
+        rgbs,
+        iteration,
+        depth_scale_tags=None,
+        source_times=None,
+    ):
         if new_xyz is None or new_xyz.numel() == 0:
             return 0
         new_xyz = new_xyz.to(device="cuda", dtype=self._xyz.dtype).contiguous()
@@ -6023,7 +10281,11 @@ class GaussianModel:
         new_rotation = torch.zeros((new_xyz.shape[0], 4), device="cuda", dtype=new_xyz.dtype)
         new_rotation[:, 0] = 1.0
         new_opacity = inverse_sigmoid(float(self.field_bg_prior_opacity) * torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=new_xyz.dtype))
-        new_trbf_center = torch.full((new_xyz.shape[0], 1), float(self.field_bg_prior_trbf_center), device="cuda", dtype=new_xyz.dtype)
+        new_trbf_center = self._background_time_centers(
+            new_xyz.shape[0],
+            new_xyz.dtype,
+            source_times=source_times,
+        )
         new_trbf_scale = torch.full((new_xyz.shape[0], 1), float(self.field_bg_prior_trbf_scale), device="cuda", dtype=new_xyz.dtype)
         new_motion = torch.zeros((new_xyz.shape[0], 9), device="cuda", dtype=new_xyz.dtype)
         new_omega = torch.zeros((new_xyz.shape[0], 4), device="cuda", dtype=new_xyz.dtype)
@@ -6068,6 +10330,7 @@ class GaussianModel:
             new_ems_mask,
             new_bg_candidate_mask,
             new_bg_birth_iter,
+            new_motion_time_anchor=new_trbf_center,
         )
         return new_xyz.shape[0]
 
@@ -6127,6 +10390,7 @@ class GaussianModel:
                         param.grad.zero_()
             modules = [
                 self.rgbdecoder,
+                self.carrier_motion_bank,
                 self.field_router if self.use_euler_field else None,
                 self.field_query_gate if self.use_euler_field else None,
                 self.field_decoder if self.use_euler_field else None,
@@ -6245,6 +10509,7 @@ class GaussianModel:
         new_dynamic_logits_parts = []
         new_dynamic_time_parts = []
         new_ems_parts = []
+        new_existence_parent_indices_parts = []
 
         clone_count = int(torch.count_nonzero(clone_mask).item())
         if clone_count > 0:
@@ -6267,6 +10532,9 @@ class GaussianModel:
                 new_ems_parts.append(self.maskforems[clone_mask])
             else:
                 new_ems_parts.append(torch.ones((clone_count, 1), device="cuda", dtype=torch.float32))
+            new_existence_parent_indices_parts.append(
+                torch.nonzero(clone_mask, as_tuple=False).squeeze(1)
+            )
 
         split_count = int(torch.count_nonzero(split_mask).item())
         if split_count > 0:
@@ -6305,6 +10573,9 @@ class GaussianModel:
                 new_ems_parts.append(parent_ems_mask.repeat(split_children, 1) * 0.75)
             else:
                 new_ems_parts.append(torch.ones((split_count * split_children, 1), device="cuda", dtype=torch.float32))
+            new_existence_parent_indices_parts.append(
+                torch.nonzero(split_mask, as_tuple=False).squeeze(1).repeat(split_children)
+            )
 
         if len(new_xyz_parts) == 0:
             return stats
@@ -6320,6 +10591,10 @@ class GaussianModel:
         new_omega = torch.cat(new_omega_parts, dim=0)
         new_featuret = torch.cat(new_featuret_parts, dim=0)
         new_ems_mask = torch.cat(new_ems_parts, dim=0)
+        new_existence_parent_indices = torch.cat(
+            new_existence_parent_indices_parts,
+            dim=0,
+        )
 
         if self.use_euler_field:
             new_static_level_logits = torch.cat(new_static_logits_parts, dim=0) if len(new_static_logits_parts) > 0 else None
@@ -6349,6 +10624,7 @@ class GaussianModel:
             new_ems_mask,
             new_bg_candidate_mask,
             new_bg_birth_iter,
+            new_existence_parent_indices=new_existence_parent_indices,
         )
 
         if split_count > 0 and not bool(getattr(self, "field_bg_prior_keep_split_parent", False)):
@@ -6412,59 +10688,7 @@ class GaussianModel:
 
 
     def prune_pointswithemsmask(self, mask):
-        valid_points_mask = ~mask
-        optimizable_tensors = self._prune_optimizer(valid_points_mask)
-
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
-        self._trbf_center = optimizable_tensors["trbf_center"]
-        self._trbf_scale = optimizable_tensors["trbf_scale"]
-        self._motion = optimizable_tensors["motion"]
-        self._omega = optimizable_tensors["omega"]
-        self._features_t = optimizable_tensors["f_t"]
-        if self.use_euler_field and "static_grid_logits" in optimizable_tensors:
-            self._static_level_logits = optimizable_tensors["static_grid_logits"]
-        if self.use_euler_field and "dynamic_grid_logits" in optimizable_tensors:
-            self._dynamic_level_logits = optimizable_tensors["dynamic_grid_logits"]
-        if self.use_euler_field and "dynamic_grid_time_coeff" in optimizable_tensors:
-            self._dynamic_level_time_coeff = optimizable_tensors["dynamic_grid_time_coeff"]
-        if self.use_euler_field and "static_route_logits" in optimizable_tensors:
-            self._static_route_logits = optimizable_tensors["static_route_logits"]
-
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
-        self.denom = self.denom[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
-        if self.omegamask is not None:
-            if self.omegamask.shape[0] == valid_points_mask.shape[0]:
-                self.omegamask = self.omegamask[valid_points_mask]
-            else:
-                self.omegamask = None
-
-        if self.maskforems is not None and self.maskforems.numel() > 0:
-            self.maskforems = self.maskforems[valid_points_mask] # we only remain valid mask from ems 
-        if self._dynamic_score_ema is not None and self._dynamic_score_ema.numel() > 0:
-            self._dynamic_score_ema = self._dynamic_score_ema[valid_points_mask]
-        if self._dynamic_active_mask is not None and self._dynamic_active_mask.numel() > 0:
-            self._dynamic_active_mask = self._dynamic_active_mask[valid_points_mask]
-        if self._responsibility_ema is not None and self._responsibility_ema.numel() > 0:
-            self._responsibility_ema = self._responsibility_ema[valid_points_mask]
-        if self._responsibility_time_center_ema is not None and self._responsibility_time_center_ema.numel() > 0:
-            self._responsibility_time_center_ema = self._responsibility_time_center_ema[valid_points_mask]
-        if self._slow_motion_score_ema is not None and self._slow_motion_score_ema.numel() > 0:
-            self._slow_motion_score_ema = self._slow_motion_score_ema[valid_points_mask]
-        if self._slow_motion_mask is not None and self._slow_motion_mask.numel() > 0:
-            self._slow_motion_mask = self._slow_motion_mask[valid_points_mask]
-        if self._fast_score_ema is not None and self._fast_score_ema.numel() > 0:
-            self._fast_score_ema = self._fast_score_ema[valid_points_mask]
-        if self._fast_active_mask is not None and self._fast_active_mask.numel() > 0:
-            self._fast_active_mask = self._fast_active_mask[valid_points_mask]
-        if self._static_support_ema is not None and self._static_support_ema.numel() > 0:
-            self._static_support_ema = self._static_support_ema[valid_points_mask]
-        if self._static_support_mask is not None and self._static_support_mask.numel() > 0:
-            self._static_support_mask = self._static_support_mask[valid_points_mask]
-        if self._visibility_persistence_ema is not None and self._visibility_persistence_ema.numel() > 0:
-            self._visibility_persistence_ema = self._visibility_persistence_ema[valid_points_mask]
+        # Keep one topology mutation path. In particular this guarantees that
+        # Carrier ids, roles and fixed motion anchors are pruned together with
+        # the ordinary Gaussian parameters.
+        return self.prune_points(mask)

@@ -10,8 +10,14 @@ DEFAULT_SCENES = ("coffee_martini", "cook_spinach")
 
 def get_model_path(args, scene, repeat_idx=None):
     scene_output = scene
+    if args.existence_single_expert != "none":
+        scene_output = f"{scene}-{args.existence_single_expert}"
     if repeat_idx is not None:
         scene_output = f"{scene}-re{repeat_idx}"
+        if args.existence_single_expert != "none":
+            scene_output = (
+                f"{scene}-{args.existence_single_expert}-re{repeat_idx}"
+            )
     return Path(args.output_root) / scene_output
 
 
@@ -32,11 +38,18 @@ def build_train_command(args, scene, repo_root, model_path):
     cmd.extend(str(iteration) for iteration in args.save_iterations)
     if args.iterations is not None:
         cmd.extend(["--iterations", str(args.iterations)])
+    if args.existence_single_expert != "none":
+        cmd.extend(
+            [
+                "--field_existence_single_expert",
+                args.existence_single_expert,
+            ]
+        )
     return cmd
 
 
 def build_test_command(args, scene, repo_root, model_path):
-    return [
+    cmd = [
         sys.executable,
         str(repo_root / "script" / "test_all_iterations.py"),
         "--iterations",
@@ -53,6 +66,14 @@ def build_test_command(args, scene, repo_root, model_path):
         "--source_path",
         str(Path(args.data_root) / scene / args.colmap_subdir),
     ]
+    if args.existence_single_expert != "none":
+        cmd.extend(
+            [
+                "--field_existence_single_expert",
+                args.existence_single_expert,
+            ]
+        )
+    return cmd
 
 
 def run_command(cmd, repo_root, dry_run):
@@ -114,6 +135,17 @@ def main():
         help="Checkpoint iterations to test after training.",
     )
     parser.add_argument("--valloader", default="colmapvalid", help="Validation loader passed to test_all_iterations.py.")
+    parser.add_argument(
+        "--existence_single_expert",
+        choices=("none", "persistent", "interval", "transient"),
+        default="none",
+        help=(
+            "Run a strict single-expert temporal-existence ablation. "
+            "Persistent, interval, and decoupled transient modes disable "
+            "existence MoE and write "
+            "to a mode-suffixed output directory."
+        ),
+    )
     parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
     parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")
     parser.add_argument("--continue_on_error", action="store_true", help="Continue with later stages after a failure.")
