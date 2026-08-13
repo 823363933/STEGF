@@ -17,6 +17,7 @@ from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 import torch 
 import os 
+import sys
 WARNED = False
 
 
@@ -234,16 +235,42 @@ def loadCamnogt(args, id, cam_info, resolution_scale):
 
 
 
-def cameraList_from_camInfosv2(cam_infos, resolution_scale, args, ss=False):
+def _report_camera_progress(current, total, progress_label):
+    if not progress_label:
+        return
+
+    total = int(total)
+    current = int(current)
+    interval = max(total // 10, 1)
+    if current == 1 or current == total or current % interval == 0:
+        message = (
+            f"[STEGF][Init][Cameras] {progress_label}: "
+            f"{current}/{total}"
+        )
+        sys.stderr.write("\r" + message)
+        if current == total:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
+def cameraList_from_camInfosv2(
+    cam_infos,
+    resolution_scale,
+    args,
+    ss=False,
+    progress_label=None,
+):
     camera_list = []
 
     if not ss: #
         for id, c in enumerate(cam_infos):
             camera_list.append(loadCamv2(args, id, c, resolution_scale))
+            _report_camera_progress(id + 1, len(cam_infos), progress_label)
     else:
         for id, c in enumerate(cam_infos):
             camera_list.append(loadCamv2ss(args, id, c, resolution_scale))
             print("id", id)
+            _report_camera_progress(id + 1, len(cam_infos), progress_label)
 
     return camera_list
 def cameraList_from_camInfosv2nogt(cam_infos, resolution_scale, args):
@@ -275,6 +302,5 @@ def camera_to_JSON(id, camera : Camera):
         'fx' : fov2focal(camera.FovX, camera.width)
     }
     return camera_entry
-
 
 
