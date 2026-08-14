@@ -191,11 +191,14 @@ def _print_compact_args_summary(args, title):
     print(f"[STEGF] {title}: " + ", ".join(run_items))
 
     carrier_enabled = _truthy(values.get("field_carrier_initialization", 0))
+    dense_enabled = _truthy(values.get("field_dense_initialization", 0))
     carrier_schema = str(values.get("field_carrier_initialization_schema", ""))
     if carrier_schema == "stegf_colmap_high_confidence_carrier_initialization_map_v1":
         init_mode = "carrier_noadd_v1"
     else:
         init_mode = "carrier_v2" if carrier_enabled else "colmap_points"
+    if dense_enabled:
+        init_mode = "colmap_points+frame0_dense"
     temporal_items = [
         f"init={init_mode}",
         f"existence={values.get('field_existence_single_expert', 'none')}",

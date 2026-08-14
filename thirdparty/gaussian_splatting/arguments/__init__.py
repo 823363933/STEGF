@@ -325,6 +325,10 @@ class ModelParams(ParamGroup):
         self.field_existence_moe = 0
         self.field_existence_single_expert = "none"
         self.field_motion_model = "polynomial"
+        self.field_dense_initialization = 0
+        self.field_dense_initialization_path = ""
+        self.field_dense_initialization_time = 0.0
+        self.field_dense_initialization_expected_points = 0
         self.field_carrier_initialization = 0
         self.field_carrier_initialization_path = ""
         self.field_carrier_initialization_schema = "stegf_colmap_carrier_initialization_map_v2"

@@ -679,6 +679,12 @@ class GaussianModel:
         self.field_existence_moe = False
         self.field_existence_single_expert = "none"
         self.field_motion_model = "polynomial"
+        self.field_dense_initialization = False
+        self.field_dense_initialization_path = ""
+        self.field_dense_initialization_time = 0.0
+        self.field_dense_initialization_expected_points = 0
+        self._dense_initialization_source_path = ""
+        self._dense_initialization_stats = {}
         self.field_carrier_initialization = False
         self.field_carrier_initialization_path = ""
         self.field_carrier_initialization_schema = ""
@@ -1920,6 +1926,22 @@ class GaussianModel:
         self.field_existence_single_expert = str(
             getattr(args, "field_existence_single_expert", "none")
         ).strip().lower()
+        self.field_dense_initialization = bool(
+            getattr(args, "field_dense_initialization", 0)
+        )
+        self.field_dense_initialization_path = str(
+            getattr(args, "field_dense_initialization_path", "")
+        ).strip()
+        self.field_dense_initialization_time = float(
+            getattr(args, "field_dense_initialization_time", 0.0)
+        )
+        self.field_dense_initialization_expected_points = max(
+            int(getattr(args, "field_dense_initialization_expected_points", 0)),
+            0,
+        )
+        self._dense_initialization_source_path = str(
+            getattr(args, "source_path", "")
+        )
         self.field_carrier_initialization = bool(
             getattr(args, "field_carrier_initialization", 0)
         )
@@ -4218,6 +4240,87 @@ class GaussianModel:
             )
         return os.path.normpath(os.path.abspath(raw_path))
 
+    def _resolve_dense_initialization_path(self):
+        raw_path = str(self.field_dense_initialization_path).strip()
+        if not raw_path:
+            raise ValueError(
+                "field_dense_initialization_path is required when "
+                "field_dense_initialization=1"
+            )
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.join(
+                os.path.abspath(self._dense_initialization_source_path),
+                raw_path,
+            )
+        return os.path.normpath(os.path.abspath(raw_path))
+
+    def _load_dense_initialization(self):
+        path = self._resolve_dense_initialization_path()
+        _init_status(f"Loading frame-0 dense initialization: {path}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Dense initialization point cloud not found: {path}"
+            )
+
+        vertices = PlyData.read(path)["vertex"]
+        property_names = set(vertices.data.dtype.names or ())
+        missing_xyz = sorted({"x", "y", "z"} - property_names)
+        if missing_xyz:
+            raise RuntimeError(
+                f"Dense initialization PLY is missing coordinates: {missing_xyz}"
+            )
+        if {"red", "green", "blue"}.issubset(property_names):
+            color_names = ("red", "green", "blue")
+        elif {"r", "g", "b"}.issubset(property_names):
+            color_names = ("r", "g", "b")
+        else:
+            raise RuntimeError(
+                "Dense initialization PLY must contain red/green/blue or r/g/b"
+            )
+
+        points = np.column_stack(
+            [vertices[name] for name in ("x", "y", "z")]
+        ).astype(np.float32, copy=False)
+        colors = np.column_stack(
+            [vertices[name] for name in color_names]
+        ).astype(np.float32, copy=False)
+        if colors.size and float(colors.max()) > 1.0:
+            colors = colors / 255.0
+
+        point_count = int(points.shape[0])
+        expected_count = int(self.field_dense_initialization_expected_points)
+        if point_count == 0:
+            raise RuntimeError("Dense initialization PLY contains no points")
+        if expected_count > 0 and point_count != expected_count:
+            raise RuntimeError(
+                "Dense initialization point count mismatch: expected {}, got {}"
+                .format(expected_count, point_count)
+            )
+        if not np.isfinite(points).all():
+            raise RuntimeError("Dense initialization PLY contains non-finite points")
+        if not np.isfinite(colors).all():
+            raise RuntimeError("Dense initialization PLY contains non-finite colors")
+        if float(colors.min()) < 0.0 or float(colors.max()) > 1.0:
+            raise RuntimeError(
+                "Dense initialization colors must be within [0, 1] after normalization"
+            )
+
+        times = np.full(
+            (point_count, 1),
+            self.field_dense_initialization_time,
+            dtype=np.float32,
+        )
+        self._dense_initialization_stats = {
+            "path": path,
+            "points": point_count,
+            "time": float(self.field_dense_initialization_time),
+        }
+        return (
+            np.ascontiguousarray(points),
+            np.ascontiguousarray(colors),
+            np.ascontiguousarray(times),
+        )
+
     @staticmethod
     def _require_npz_keys(table, table_name, keys):
         missing = [key for key in keys if key not in table.files]
@@ -4798,6 +4901,11 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
+        if self.field_dense_initialization and self.field_carrier_initialization:
+            raise ValueError(
+                "Dense initialization cannot be combined with Carrier "
+                "initialization because Carrier maps require the original point order"
+            )
         if self.field_carrier_initialization and int(self.preprocesspoints) != 0:
             raise ValueError(
                 "Carrier initialization requires preprocesspoints=0 so the "
@@ -4836,6 +4944,29 @@ class GaussianModel:
         raw_points = np.asarray(pcd.points)
         raw_colors = np.asarray(pcd.colors)
         raw_times = np.asarray(pcd.times)
+        if self.field_dense_initialization:
+            sparse_count = int(raw_points.shape[0])
+            dense_points, dense_colors, dense_times = (
+                self._load_dense_initialization()
+            )
+            raw_points = np.concatenate(
+                (raw_points, dense_points), axis=0
+            )
+            raw_colors = np.concatenate(
+                (raw_colors, dense_colors), axis=0
+            )
+            raw_times = np.concatenate(
+                (raw_times, dense_times), axis=0
+            )
+            _init_status(
+                "Fused sparse+dense initialization: sparse={}, dense={}, "
+                "total={}, dense_time={:.6g}".format(
+                    sparse_count,
+                    dense_points.shape[0],
+                    raw_points.shape[0],
+                    self.field_dense_initialization_time,
+                )
+            )
         _init_status(f"Computing point scales: points={raw_points.shape[0]}")
         raw_point_cloud = torch.from_numpy(raw_points).float().cuda()
         raw_dist2 = torch.clamp_min(distCUDA2(raw_point_cloud), 0.0000001)
@@ -5711,6 +5842,12 @@ class GaussianModel:
             "field_existence_coverage_weight": self.field_existence_coverage_weight,
             "field_existence_log_interval": self.field_existence_log_interval,
             "field_motion_model": self.field_motion_model,
+            "field_dense_initialization": int(self.field_dense_initialization),
+            "field_dense_initialization_path": self.field_dense_initialization_path,
+            "field_dense_initialization_resolved_path": self._dense_initialization_stats.get("path", ""),
+            "field_dense_initialization_time": self.field_dense_initialization_time,
+            "field_dense_initialization_expected_points": self.field_dense_initialization_expected_points,
+            "field_dense_initialization_points": self._dense_initialization_stats.get("points", 0),
             "field_carrier_initialization": int(self.field_carrier_initialization),
             "field_carrier_initialization_path": self.field_carrier_initialization_path,
             "field_carrier_initialization_resolved_path": self._carrier_initialization_stats.get("path", ""),

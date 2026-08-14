@@ -1,5 +1,5 @@
 {
-  "stegf_version": "S1.10.16-route-only-persistent",
+  "stegf_version": "S2.0.4",
   "resolution": 2,
   "model": "ours_full",
   "scaling_lr": 0.003,
@@ -132,6 +132,10 @@
   "field_init_depth_thresholds": "15,25,50",
   "field_init_point_projection_debug": 0,
   "field_init_point_projection_dot_radius": 1,
+  "field_dense_initialization": 1,
+  "field_dense_initialization_path": "../../coffee_martini_ed3dgs50_ready/points3D_downsample.ply",
+  "field_dense_initialization_time": 0.0,
+  "field_dense_initialization_expected_points": 97877,
   "field_bg_dense_add": 1,
   "field_bg_dense_add_iter": 9000,
   "field_bg_dense_add_time_indices": "0",
