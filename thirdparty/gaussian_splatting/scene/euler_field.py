@@ -498,6 +498,139 @@ class EulerVelocityField(nn.Module):
         return current_points, aux
 
 
+class SingleGridLinearVelocityField(nn.Module):
+    """A stationary shared velocity field backed by one dense feature grid.
+
+    The decoder receives only the trilinearly sampled grid feature.  It has no
+    direct position or time input, and the caller applies the decoded velocity
+    linearly in time.  Consequently this module cannot create temporal
+    curvature by itself; higher-order motion must come from a separate branch.
+    """
+
+    def __init__(
+        self,
+        bbox_min,
+        bbox_max,
+        resolution,
+        feature_dim=8,
+        hidden_dim=32,
+        max_normalized_speed=0.25,
+    ):
+        super().__init__()
+        resolved = EulerField._resolve_level_resolutions(
+            base_resolution=4,
+            num_levels=1,
+            level_resolutions=[resolution],
+        )
+        if len(resolved) != 1:
+            raise ValueError("SingleGridLinearVelocityField requires one grid")
+        self.resolution = tuple(int(value) for value in resolved[0])
+        self.feature_dim = max(int(feature_dim), 1)
+        self.hidden_dim = max(int(hidden_dim), 4)
+        self.max_normalized_speed = max(float(max_normalized_speed), 0.0)
+
+        bbox_min = torch.as_tensor(bbox_min, dtype=torch.float32).view(1, 3)
+        bbox_max = torch.as_tensor(bbox_max, dtype=torch.float32).view(1, 3)
+        bbox_span = torch.clamp(bbox_max - bbox_min, min=1e-6)
+        self.register_buffer("bbox_min", bbox_min)
+        self.register_buffer("bbox_max", bbox_max)
+        self.register_buffer("bbox_span", bbox_span)
+
+        res_x, res_y, res_z = self.resolution
+        self.feature_grid = nn.Parameter(
+            torch.empty(
+                1,
+                self.feature_dim,
+                res_z,
+                res_y,
+                res_x,
+            )
+        )
+        nn.init.normal_(self.feature_grid, mean=0.0, std=1e-3)
+        self.decoder = nn.Sequential(
+            nn.Linear(self.feature_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, 3, bias=False),
+        )
+        # Begin with an exact identity deformation.  The output layer learns
+        # first, after which gradients reach the decoder trunk and feature grid.
+        nn.init.zeros_(self.decoder[-1].weight)
+
+    def _normalize_points_unit(self, points):
+        return ((points - self.bbox_min) / self.bbox_span).clamp(0.0, 1.0)
+
+    def _sample_features(self, unit_points):
+        coords = (unit_points * 2.0 - 1.0).view(1, -1, 1, 1, 3)
+        sampled = F.grid_sample(
+            self.feature_grid,
+            coords,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        return (
+            sampled.squeeze(0)
+            .squeeze(-1)
+            .squeeze(-1)
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    def query_velocity(self, points, return_normalized=False):
+        unit_points = self._normalize_points_unit(points)
+        features = self._sample_features(unit_points)
+        normalized_velocity = self.max_normalized_speed * torch.tanh(
+            self.decoder(features)
+        )
+        if return_normalized:
+            return normalized_velocity
+        return normalized_velocity * self.bbox_span.to(
+            device=points.device,
+            dtype=points.dtype,
+        )
+
+    @torch.no_grad()
+    def occupancy_stats(self, points):
+        unit_points = self._normalize_points_unit(points)
+        resolution = torch.tensor(
+            self.resolution,
+            device=points.device,
+            dtype=points.dtype,
+        ).view(1, 3)
+        indices = torch.round(unit_points * (resolution - 1.0)).to(torch.long)
+        res_x, res_y, res_z = self.resolution
+        linear = (
+            (indices[:, 2] * res_y + indices[:, 1]) * res_x
+            + indices[:, 0]
+        )
+        _, counts = torch.unique(linear, return_counts=True)
+        total_cells = int(res_x * res_y * res_z)
+        if counts.numel() == 0:
+            return {
+                "total_cells": total_cells,
+                "occupied_cells": 0,
+                "occupied_fraction": 0.0,
+                "points_per_occupied_cell_mean": 0.0,
+                "points_per_occupied_cell_q50": 0.0,
+                "multi_point_cell_fraction": 0.0,
+            }
+        counts_float = counts.float()
+        return {
+            "total_cells": total_cells,
+            "occupied_cells": int(counts.numel()),
+            "occupied_fraction": float(counts.numel() / total_cells),
+            "points_per_occupied_cell_mean": float(counts_float.mean().item()),
+            "points_per_occupied_cell_q50": float(
+                torch.quantile(counts_float, 0.5).item()
+            ),
+            "multi_point_cell_fraction": float(
+                (counts > 1).float().mean().item()
+            ),
+        }
+
+
 class EulerResidualDecoder(nn.Module):
     def __init__(self, feature_dim, hidden_dim=32, output_dim=10):
         super().__init__()

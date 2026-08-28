@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -10,14 +11,21 @@ DEFAULT_SCENES = ("coffee_martini", "cook_spinach")
 
 def get_model_path(args, scene, repeat_idx=None):
     scene_output = scene
-    if args.existence_single_expert != "none":
+    couptest_mode = getattr(args, "active_couptest_mode", "none")
+    couptest_suffix = couptest_mode.replace("_", "-")
+    if couptest_mode != "none":
+        scene_output = f"{scene}-{couptest_suffix}"
+    elif args.existence_single_expert != "none":
         scene_output = f"{scene}-{args.existence_single_expert}"
     if repeat_idx is not None:
-        scene_output = f"{scene}-re{repeat_idx}"
-        if args.existence_single_expert != "none":
+        if couptest_mode != "none":
+            scene_output = f"{scene}-{couptest_suffix}-re{repeat_idx}"
+        elif args.existence_single_expert != "none":
             scene_output = (
                 f"{scene}-{args.existence_single_expert}-re{repeat_idx}"
             )
+        else:
+            scene_output = f"{scene}-re{repeat_idx}"
     return Path(args.output_root) / scene_output
 
 
@@ -45,6 +53,9 @@ def build_train_command(args, scene, repo_root, model_path):
                 args.existence_single_expert,
             ]
         )
+    couptest_mode = getattr(args, "active_couptest_mode", "none")
+    if couptest_mode != "none":
+        cmd.extend(["--field_couptest_mode", couptest_mode])
     return cmd
 
 
@@ -73,7 +84,36 @@ def build_test_command(args, scene, repo_root, model_path):
                 args.existence_single_expert,
             ]
         )
+    couptest_mode = getattr(args, "active_couptest_mode", "none")
+    if couptest_mode != "none":
+        cmd.extend(["--field_couptest_mode", couptest_mode])
     return cmd
+
+
+def get_couptest_modes(args, scene, repo_root):
+    if args.couptest_mode != "auto":
+        if args.couptest_mode == "both":
+            return ("uncoupled", "coupled")
+        if args.couptest_mode == "all":
+            return ("uncoupled", "coupled", "coupled_detached")
+        return (args.couptest_mode,)
+    config_path = repo_root / args.config_dir / f"{scene}.json"
+    with config_path.open("r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    version = str(config.get("stegf_version", ""))
+    configured_mode = str(config.get("field_couptest_mode", "none"))
+    if (
+        version == "S2.0.4-couptest-poly"
+        and configured_mode == "coupled_detached"
+    ):
+        return ("coupled_detached",)
+    if version in {
+        "S2.0.4-couptest",
+        "S2.0.4-couptest-poly",
+        "S2.0.4-couptest-grid",
+    }:
+        return ("uncoupled", "coupled")
+    return ("none",)
 
 
 def run_command(cmd, repo_root, dry_run):
@@ -146,6 +186,23 @@ def main():
             "to a mode-suffixed output directory."
         ),
     )
+    parser.add_argument(
+        "--couptest_mode",
+        choices=(
+            "auto",
+            "none",
+            "uncoupled",
+            "coupled",
+            "coupled_detached",
+            "both",
+            "all",
+        ),
+        default="auto",
+        help=(
+            "Select the S2.0.4 coupling ablation. Both runs the historical "
+            "pair; all also runs the detached-coupling control."
+        ),
+    )
     parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
     parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")
     parser.add_argument("--continue_on_error", action="store_true", help="Continue with later stages after a failure.")
@@ -166,28 +223,65 @@ def main():
 
     failures = []
     for scene in scenes:
-        for repeat_idx in range(1, args.re + 1):
-            repeat_suffix = None if args.re == 1 else repeat_idx
-            model_path = get_model_path(args, scene, repeat_suffix)
-            if args.re == 1:
-                print(f"\n[STEGF] ===== Scene: {scene} =====", flush=True)
-            else:
-                print(f"\n[STEGF] ===== Scene: {scene} | repeat {repeat_idx}/{args.re} =====", flush=True)
-                print(f"[STEGF] Repeat output: {model_path}", flush=True)
+        couptest_modes = get_couptest_modes(args, scene, repo_root)
+        for couptest_mode in couptest_modes:
+            args.active_couptest_mode = couptest_mode
+            for repeat_idx in range(1, args.re + 1):
+                repeat_suffix = None if args.re == 1 else repeat_idx
+                model_path = get_model_path(args, scene, repeat_suffix)
+                if args.re == 1:
+                    variant = (
+                        f" | couptest {couptest_mode}"
+                        if couptest_mode != "none"
+                        else ""
+                    )
+                    print(
+                        f"\n[STEGF] ===== Scene: {scene}{variant} =====",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"\n[STEGF] ===== Scene: {scene} | "
+                        f"couptest {couptest_mode} | repeat "
+                        f"{repeat_idx}/{args.re} =====",
+                        flush=True,
+                    )
+                    print(f"[STEGF] Repeat output: {model_path}", flush=True)
 
-            if not args.skip_train_stage:
-                code = run_command(build_train_command(args, scene, repo_root, model_path), repo_root, args.dry_run)
-                if code != 0:
-                    failures.append((f"{scene}-re{repeat_idx}" if args.re > 1 else scene, "train", code))
-                    if not args.continue_on_error:
-                        break
+                failure_label = model_path.name
+                if not args.skip_train_stage:
+                    code = run_command(
+                        build_train_command(
+                            args,
+                            scene,
+                            repo_root,
+                            model_path,
+                        ),
+                        repo_root,
+                        args.dry_run,
+                    )
+                    if code != 0:
+                        failures.append((failure_label, "train", code))
+                        if not args.continue_on_error:
+                            break
 
-            if not args.skip_test_stage:
-                code = run_command(build_test_command(args, scene, repo_root, model_path), repo_root, args.dry_run)
-                if code != 0:
-                    failures.append((f"{scene}-re{repeat_idx}" if args.re > 1 else scene, "test", code))
-                    if not args.continue_on_error:
-                        break
+                if not args.skip_test_stage:
+                    code = run_command(
+                        build_test_command(
+                            args,
+                            scene,
+                            repo_root,
+                            model_path,
+                        ),
+                        repo_root,
+                        args.dry_run,
+                    )
+                    if code != 0:
+                        failures.append((failure_label, "test", code))
+                        if not args.continue_on_error:
+                            break
+            if failures and not args.continue_on_error:
+                break
         if failures and not args.continue_on_error:
             break
 

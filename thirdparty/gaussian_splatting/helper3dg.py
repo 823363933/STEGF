@@ -83,11 +83,22 @@ def _normalize_motion_model(args):
         "shared": "h2",
         "shared_field": "h2",
         "h2_only": "h2",
+        "couptest_poly": "couptest_polynomial",
+        "polynomial_couptest": "couptest_polynomial",
+        "grid_couptest": "couptest_grid",
+        "couptest_shared_grid": "couptest_grid",
     }
     mode = aliases.get(mode, mode)
-    if mode not in {"polynomial", "h2", "carrier_hybrid"}:
+    if mode not in {
+        "polynomial",
+        "h2",
+        "carrier_hybrid",
+        "couptest_polynomial",
+        "couptest_grid",
+    }:
         raise ValueError(
-            "field_motion_model must be polynomial, h2, or carrier_hybrid, got {!r}".format(
+            "field_motion_model must be polynomial, h2, carrier_hybrid, "
+            "couptest_polynomial, or couptest_grid, got {!r}".format(
                 mode
             )
         )
@@ -100,7 +111,45 @@ def _normalize_motion_model(args):
             "field_carrier_initialization=1 requires "
             "field_motion_model=carrier_hybrid"
         )
-    if mode == "h2":
+    if mode in {"couptest_polynomial", "couptest_grid"}:
+        couptest_mode = str(
+            getattr(args, "field_couptest_mode", "none")
+        ).strip().lower()
+        if couptest_mode not in {
+            "uncoupled",
+            "coupled",
+            "coupled_detached",
+        }:
+            raise ValueError(
+                "{} motion requires field_couptest_mode="
+                "uncoupled, coupled, or coupled_detached, got {!r}".format(
+                    mode,
+                    couptest_mode,
+                )
+            )
+        if getattr(args, "field_existence_single_expert", "none") != "transient":
+            raise ValueError(
+                "{} motion requires "
+                "field_existence_single_expert=transient".format(mode)
+            )
+        if carrier_initialization:
+            raise ValueError(
+                "{} does not use Carrier initialization".format(mode)
+            )
+        if mode == "couptest_grid" and not _truthy(
+            getattr(args, "use_euler_field", 0)
+        ):
+            raise ValueError("couptest_grid requires use_euler_field=1")
+        existence_floor = float(
+            getattr(args, "field_couptest_initial_existence_floor", 0.95)
+        )
+        if not 0.0 < existence_floor < 1.0:
+            raise ValueError(
+                "field_couptest_initial_existence_floor must be within (0, 1)"
+            )
+        args.field_couptest_mode = couptest_mode
+        args.field_existence_moe = 0
+    elif mode == "h2":
         if not _truthy(getattr(args, "use_euler_field", 0)):
             raise ValueError("H2 motion requires use_euler_field=1")
         if getattr(args, "field_existence_single_expert", "none") != "transient":
@@ -204,6 +253,13 @@ def _print_compact_args_summary(args, title):
         f"existence={values.get('field_existence_single_expert', 'none')}",
         f"motion={values.get('field_motion_model', 'polynomial')}",
     ]
+    if (
+        str(values.get("field_motion_model", "")).lower()
+        in {"couptest_polynomial", "couptest_grid"}
+    ):
+        temporal_items.append(
+            f"coupling={values.get('field_couptest_mode', 'none')}"
+        )
     if carrier_enabled:
         temporal_items.append("extrapolation=endpoint_clamped")
     print("[STEGF] Spatiotemporal model: " + ", ".join(temporal_items))

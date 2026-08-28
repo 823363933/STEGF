@@ -31,6 +31,7 @@ from scene.euler_field import (
     EulerQueryFusionGate,
     EulerResidualDecoder,
     EulerVelocityField,
+    SingleGridLinearVelocityField,
 )
 
 
@@ -400,6 +401,7 @@ class GaussianModel:
         self.rgbdecoder = getcolormodel(rgbfuntion)
         self.euler_field = None
         self.h2_velocity_field = None
+        self.grid_motion_field = None
         self.carrier_motion_bank = None
         self.field_router = None
         self.field_query_gate = None
@@ -679,6 +681,22 @@ class GaussianModel:
         self.field_existence_moe = False
         self.field_existence_single_expert = "none"
         self.field_motion_model = "polynomial"
+        self.field_couptest_mode = "none"
+        self.field_couptest_initial_existence_floor = 0.95
+        self.field_couptest_log_interval = 500
+        self.field_couptest_stats_max_points = 65536
+        self.field_couptest_grid_resolution = "auto_finest"
+        self.field_couptest_grid_resolved_resolution = ""
+        self.field_couptest_grid_feature_dim = 8
+        self.field_couptest_grid_hidden_dim = 32
+        self.field_couptest_grid_max_normalized_speed = 0.25
+        self.field_couptest_grid_lr_init = 0.001
+        self.field_couptest_grid_lr_final = 0.0001
+        self.field_couptest_grid_lr_delay_mult = 1.0
+        self.field_couptest_grid_lr_max_steps = 30000
+        self.grid_motion_scheduler_args = None
+        self._couptest_full_width = 1.0
+        self._last_couptest_aux = {}
         self.field_dense_initialization = False
         self.field_dense_initialization_path = ""
         self.field_dense_initialization_time = 0.0
@@ -1972,16 +1990,107 @@ class GaussianModel:
             self.field_motion_model = "h2"
         elif self.field_motion_model in {"carrier", "carrier_bank", "carrier_moe"}:
             self.field_motion_model = "carrier_hybrid"
+        elif self.field_motion_model in {
+            "couptest_poly",
+            "polynomial_couptest",
+        }:
+            self.field_motion_model = "couptest_polynomial"
+        elif self.field_motion_model in {
+            "grid_couptest",
+            "couptest_shared_grid",
+        }:
+            self.field_motion_model = "couptest_grid"
         if self.field_motion_model not in {
             "polynomial",
             "h2",
             "carrier_hybrid",
+            "couptest_polynomial",
+            "couptest_grid",
         }:
             raise ValueError(
-                "field_motion_model must be polynomial, h2, or "
-                "carrier_hybrid, got "
+                "field_motion_model must be polynomial, h2, carrier_hybrid, "
+                "couptest_polynomial, or couptest_grid, got "
                 f"{self.field_motion_model!r}"
             )
+        self.field_couptest_mode = str(
+            getattr(args, "field_couptest_mode", "none")
+        ).strip().lower()
+        self.field_couptest_initial_existence_floor = float(
+            getattr(args, "field_couptest_initial_existence_floor", 0.95)
+        )
+        self.field_couptest_log_interval = max(
+            int(getattr(args, "field_couptest_log_interval", 500)), 1
+        )
+        self.field_couptest_stats_max_points = max(
+            int(getattr(args, "field_couptest_stats_max_points", 65536)), 1
+        )
+        self.field_couptest_grid_resolution = str(
+            getattr(args, "field_couptest_grid_resolution", "auto_finest")
+        ).strip()
+        self.field_couptest_grid_feature_dim = max(
+            int(getattr(args, "field_couptest_grid_feature_dim", 8)), 1
+        )
+        self.field_couptest_grid_hidden_dim = max(
+            int(getattr(args, "field_couptest_grid_hidden_dim", 32)), 4
+        )
+        self.field_couptest_grid_max_normalized_speed = max(
+            float(
+                getattr(
+                    args,
+                    "field_couptest_grid_max_normalized_speed",
+                    0.25,
+                )
+            ),
+            0.0,
+        )
+        self.field_couptest_grid_lr_init = max(
+            float(getattr(args, "field_couptest_grid_lr_init", 0.001)),
+            0.0,
+        )
+        self.field_couptest_grid_lr_final = max(
+            float(getattr(args, "field_couptest_grid_lr_final", 0.0001)),
+            0.0,
+        )
+        self.field_couptest_grid_lr_delay_mult = max(
+            float(
+                getattr(args, "field_couptest_grid_lr_delay_mult", 1.0)
+            ),
+            0.0,
+        )
+        self.field_couptest_grid_lr_max_steps = max(
+            int(getattr(args, "field_couptest_grid_lr_max_steps", 30000)),
+            1,
+        )
+        if self.field_motion_model in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            if self.field_couptest_mode not in {
+                "uncoupled",
+                "coupled",
+                "coupled_detached",
+            }:
+                raise ValueError(
+                    "{} requires field_couptest_mode=".format(
+                        self.field_motion_model
+                    )
+                    + "uncoupled, coupled, or coupled_detached"
+                )
+            if self.field_existence_single_expert != "transient":
+                raise ValueError(
+                    "{} requires transient temporal opacity".format(
+                        self.field_motion_model
+                    )
+                )
+            if not 0.0 < self.field_couptest_initial_existence_floor < 1.0:
+                raise ValueError(
+                    "field_couptest_initial_existence_floor must be within (0, 1)"
+                )
+            self._couptest_full_width = 1.0 / math.sqrt(
+                -math.log(self.field_couptest_initial_existence_floor)
+            )
+            if self.field_motion_model == "couptest_grid" and not self.use_euler_field:
+                raise ValueError("couptest_grid requires use_euler_field=1")
         self.field_h2_level_resolutions = str(
             getattr(
                 args,
@@ -2751,6 +2860,63 @@ class GaussianModel:
             )
         else:
             self.h2_velocity_field = None
+        if self.field_motion_model == "couptest_grid":
+            grid_resolution_spec = str(
+                self.field_couptest_grid_resolution
+            ).strip().lower()
+            if grid_resolution_spec in {
+                "auto",
+                "auto_finest",
+                "euler_finest",
+                "finest",
+            }:
+                if not level_resolutions:
+                    raise RuntimeError(
+                        "Cannot resolve the shared motion grid before the "
+                        "Euler grid resolutions are initialized"
+                    )
+                grid_resolution = tuple(level_resolutions[-1])
+                grid_resolution_source = "auto_finest"
+            else:
+                grid_resolutions = self._parse_field_level_resolutions(
+                    self.field_couptest_grid_resolution
+                )
+                if grid_resolutions is None or len(grid_resolutions) != 1:
+                    raise ValueError(
+                        "field_couptest_grid_resolution must be auto_finest "
+                        "or define exactly one three-dimensional grid "
+                        "resolution"
+                    )
+                grid_resolution = grid_resolutions[0]
+                grid_resolution_source = "manual"
+            self.field_couptest_grid_resolved_resolution = (
+                self._format_field_level_resolutions([grid_resolution])
+            )
+            self.grid_motion_field = SingleGridLinearVelocityField(
+                bbox_min=bbox_min,
+                bbox_max=bbox_max,
+                resolution=grid_resolution,
+                feature_dim=self.field_couptest_grid_feature_dim,
+                hidden_dim=self.field_couptest_grid_hidden_dim,
+                max_normalized_speed=(
+                    self.field_couptest_grid_max_normalized_speed
+                ),
+            ).cuda()
+            print(
+                "[STEGF] Couptest shared linear grid: source={}, "
+                "resolution={}, bbox=expanded_euler, feature_dim={}, "
+                "decoder={}x{}, max_speed={}".format(
+                    grid_resolution_source,
+                    self.field_couptest_grid_resolved_resolution,
+                    self.field_couptest_grid_feature_dim,
+                    self.field_couptest_grid_hidden_dim,
+                    self.field_couptest_grid_hidden_dim,
+                    self.field_couptest_grid_max_normalized_speed,
+                )
+            )
+        else:
+            self.grid_motion_field = None
+            self.field_couptest_grid_resolved_resolution = ""
         router_input_dim = self.field_feature_dim + 2 * self.field_level_fourier_degree
         self.field_router = EulerLevelRouter(
             input_dim=router_input_dim,
@@ -3690,6 +3856,187 @@ class GaussianModel:
             )
         return weight * loss
 
+    def _couptest_motion_terms(self, timestamp, point_indices=None):
+        if self.field_motion_model not in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            raise RuntimeError("Couptest motion is not active")
+        if point_indices is None:
+            motion = self._motion
+            anchors = self._motion_time_anchor
+            log_width = self._trbf_scale
+            canonical_points = self._xyz.detach()
+        else:
+            motion = self._motion[point_indices]
+            anchors = self._motion_time_anchor[point_indices]
+            log_width = self._trbf_scale[point_indices]
+            canonical_points = self._xyz[point_indices].detach()
+        point_count = motion.shape[0]
+        if motion.shape != (point_count, 9):
+            raise RuntimeError("Polynomial coefficients are misaligned with Gaussians")
+        if anchors.shape != (point_count, 1):
+            raise RuntimeError("Couptest motion anchors are misaligned")
+        query_time = torch.as_tensor(
+            timestamp,
+            device=motion.device,
+            dtype=motion.dtype,
+        ).reshape(1, 1).expand(point_count, 1)
+        delta_time = query_time - anchors
+        if self.field_motion_model == "couptest_grid":
+            if self.grid_motion_field is None:
+                raise RuntimeError("Shared linear grid motion field is missing")
+            low_order_velocity = self.grid_motion_field.query_velocity(
+                canonical_points
+            )
+        else:
+            low_order_velocity = motion[:, 0:3]
+        linear_displacement = low_order_velocity * delta_time
+        quadratic_displacement = motion[:, 3:6] * delta_time.square()
+        cubic_displacement = motion[:, 6:9] * delta_time.pow(3)
+        raw_residual = quadratic_displacement + cubic_displacement
+        width_ratio = torch.exp(log_width) / float(self._couptest_full_width)
+        width_coupling = width_ratio.clamp(min=0.0, max=1.0)
+        if self.field_couptest_mode == "coupled":
+            residual_coefficient = width_coupling
+        elif self.field_couptest_mode == "coupled_detached":
+            residual_coefficient = width_coupling.detach()
+        else:
+            residual_coefficient = torch.ones_like(width_coupling)
+        effective_residual = residual_coefficient * raw_residual
+        return {
+            "linear": linear_displacement,
+            "low_order_velocity": low_order_velocity,
+            "quadratic": quadratic_displacement,
+            "cubic": cubic_displacement,
+            "raw_residual": raw_residual,
+            "effective_residual": effective_residual,
+            "offset": linear_displacement + effective_residual,
+            "width_ratio": width_ratio,
+            "width_coupling": width_coupling,
+            "residual_coefficient": residual_coefficient,
+        }
+
+    @staticmethod
+    def _couptest_quantiles(values):
+        flat = values.detach().reshape(-1).float()
+        if flat.numel() == 0:
+            return {"q10": 0.0, "q50": 0.0, "q90": 0.0}
+        quantiles = torch.quantile(flat, flat.new_tensor([0.1, 0.5, 0.9]))
+        return {
+            "q10": float(quantiles[0].item()),
+            "q50": float(quantiles[1].item()),
+            "q90": float(quantiles[2].item()),
+        }
+
+    @torch.no_grad()
+    def get_couptest_stats(self):
+        if self.field_motion_model not in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            return {}
+        point_count = int(self.get_xyz.shape[0])
+        if point_count == 0:
+            return {}
+        sample_count = min(point_count, self.field_couptest_stats_max_points)
+        if sample_count == point_count:
+            point_indices = torch.arange(point_count, device=self.get_xyz.device)
+        else:
+            point_indices = torch.linspace(
+                0,
+                point_count - 1,
+                steps=sample_count,
+                device=self.get_xyz.device,
+            ).round().to(dtype=torch.long)
+        width = torch.exp(self._trbf_scale[point_indices])
+        width_ratio = width / float(self._couptest_full_width)
+        width_coupling = width_ratio.clamp(min=0.0, max=1.0)
+        motion = self._motion[point_indices]
+        stats = {
+            "mode": self.field_couptest_mode,
+            "coupling_gradient": (
+                "joint"
+                if self.field_couptest_mode == "coupled"
+                else "detached"
+                if self.field_couptest_mode == "coupled_detached"
+                else "none"
+            ),
+            "motion_model": self.field_motion_model,
+            "points": point_count,
+            "sample_points": sample_count,
+            "full_width": float(self._couptest_full_width),
+            "width": self._couptest_quantiles(width),
+            "width_ratio": self._couptest_quantiles(width_ratio),
+            "width_coupling": self._couptest_quantiles(width_coupling),
+            "quadratic_coefficient_norm": self._couptest_quantiles(
+                torch.linalg.vector_norm(motion[:, 3:6], dim=1)
+            ),
+            "cubic_coefficient_norm": self._couptest_quantiles(
+                torch.linalg.vector_norm(motion[:, 6:9], dim=1)
+            ),
+        }
+        if self.field_motion_model == "couptest_grid":
+            if self.grid_motion_field is None:
+                raise RuntimeError("Shared linear grid motion field is missing")
+            shared_velocity = self.grid_motion_field.query_velocity(
+                self._xyz[point_indices].detach()
+            )
+            stats["shared_velocity_norm"] = self._couptest_quantiles(
+                torch.linalg.vector_norm(shared_velocity, dim=1)
+            )
+            stats["grid_resolution"] = list(
+                self.grid_motion_field.resolution
+            )
+            stats["grid_occupancy"] = (
+                self.grid_motion_field.occupancy_stats(self._xyz.detach())
+            )
+        group_masks = {
+            "short": width_ratio[:, 0] < 0.25,
+            "medium": (width_ratio[:, 0] >= 0.25)
+            & (width_ratio[:, 0] < 0.75),
+            "long": width_ratio[:, 0] >= 0.75,
+        }
+        stats["width_groups"] = {
+            name: float(mask.float().mean().item())
+            for name, mask in group_masks.items()
+        }
+        stats["times"] = {}
+        centers = self.get_trbfcenter[point_indices]
+        for label, sample_time in (("t0", 0.0), ("t05", 0.5), ("t1", 1.0)):
+            terms = self._couptest_motion_terms(sample_time, point_indices)
+            existence = torch.exp(-torch.square((sample_time - centers) / width))
+            linear_norm = torch.linalg.vector_norm(terms["linear"], dim=1)
+            quadratic_norm = torch.linalg.vector_norm(
+                terms["quadratic"], dim=1
+            )
+            cubic_norm = torch.linalg.vector_norm(terms["cubic"], dim=1)
+            raw_norm = torch.linalg.vector_norm(terms["raw_residual"], dim=1)
+            effective_norm = torch.linalg.vector_norm(
+                terms["effective_residual"],
+                dim=1,
+            )
+            time_stats = {
+                "existence": self._couptest_quantiles(existence),
+                "existence_mean": float(existence.mean().item()),
+                "linear_norm": self._couptest_quantiles(linear_norm),
+                "quadratic_norm": self._couptest_quantiles(quadratic_norm),
+                "cubic_norm": self._couptest_quantiles(cubic_norm),
+                "raw_residual_norm": self._couptest_quantiles(raw_norm),
+                "effective_residual_norm": self._couptest_quantiles(
+                    effective_norm
+                ),
+                "effective_residual_by_width": {},
+            }
+            for name, mask in group_masks.items():
+                time_stats["effective_residual_by_width"][name] = (
+                    float(effective_norm[mask].mean().item())
+                    if bool(torch.any(mask))
+                    else 0.0
+                )
+            stats["times"][label] = time_stats
+        return stats
+
     def _init_module_grad_cache(self):
         self.rgb_grd = {}
         if self.rgbdecoder is not None:
@@ -3705,6 +4052,18 @@ class GaussianModel:
         if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
             for name, param in self.h2_velocity_field.named_parameters():
                 self.h2_velocity_field_grd[name] = torch.zeros_like(
+                    param,
+                    requires_grad=False,
+                    device=param.device,
+                )
+
+        self.grid_motion_field_grd = {}
+        if (
+            self.field_motion_model == "couptest_grid"
+            and self.grid_motion_field is not None
+        ):
+            for name, param in self.grid_motion_field.named_parameters():
+                self.grid_motion_field_grd[name] = torch.zeros_like(
                     param,
                     requires_grad=False,
                     device=param.device,
@@ -3827,6 +4186,14 @@ class GaussianModel:
                     displacement.detach(), dim=1
                 ).max(),
             }
+        elif self.field_motion_model in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            couptest_terms = self._couptest_motion_terms(timestamp)
+            motion_query_offset = couptest_terms["offset"]
+            self._last_couptest_aux = {}
+            self._last_h2_aux = {}
         elif self.field_motion_model == "carrier_hybrid":
             legacy_offset = (
                 self._motion[:, 0:3] * tforpoly
@@ -4071,6 +4438,11 @@ class GaussianModel:
         opacity = self.opacity_activation(opacity_param) * existence_output
         if h2_means3D is not None:
             means3D = h2_means3D
+        elif self.field_motion_model in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            means3D = self.get_xyz + motion_query_offset
         elif self.field_motion_model == "carrier_hybrid":
             means3D = self.get_xyz + motion_query_offset
         else:
@@ -4837,6 +5209,39 @@ class GaussianModel:
         if self.field_existence_single_expert != "persistent":
             raise RuntimeError("Carrier topology requires Persistent-only existence")
 
+    def _assert_couptest_topology(self):
+        if self.field_motion_model not in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            return
+        count = int(self.get_xyz.shape[0])
+        if self._motion.shape != (count, 9):
+            raise RuntimeError("Polynomial coefficients are not aligned")
+        if self._motion_time_anchor.shape != (count, 1):
+            raise RuntimeError(
+                "Couptest motion anchors are not aligned with Gaussian topology"
+            )
+        if self.get_trbfcenter.shape != (count, 1):
+            raise RuntimeError("Couptest time centers are misaligned")
+        if not bool(torch.all(torch.isfinite(self._motion))):
+            raise RuntimeError("Polynomial coefficients contain a non-finite value")
+        if not bool(torch.all(torch.isfinite(self._trbf_scale))):
+            raise RuntimeError("Couptest log widths contain a non-finite value")
+        if not bool(
+            torch.allclose(
+                self._motion_time_anchor,
+                self.get_trbfcenter.detach(),
+                rtol=0.0,
+                atol=1e-6,
+            )
+        ):
+            raise RuntimeError(
+                "Couptest time centers changed relative to fixed motion anchors"
+            )
+        if self.field_existence_single_expert != "transient":
+            raise RuntimeError("Couptest requires transient temporal opacity")
+
     @torch.no_grad()
     def _carrier_motion_preflight(self):
         if not self.field_carrier_initialization:
@@ -5072,6 +5477,23 @@ class GaussianModel:
             nn.init.constant_(self._trbf_scale, self.trbfslinit) # too large ?
         else:
             nn.init.constant_(self._trbf_scale, 0) # too large ?
+        if self.field_motion_model in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            nn.init.constant_(
+                self._trbf_scale,
+                math.log(self._couptest_full_width),
+            )
+            _init_status(
+                "S2.0.4 couptest initialized: motion={}, mode={}, "
+                "width={:.6g}, existence_floor={:.3f}".format(
+                    self.field_motion_model,
+                    self.field_couptest_mode,
+                    self._couptest_full_width,
+                    self.field_couptest_initial_existence_floor,
+                )
+            )
 
         nn.init.constant_(self._features_t, 0)
         nn.init.constant_(self._omega, 0)
@@ -5080,6 +5502,7 @@ class GaussianModel:
             times=self.get_trbfcenter.detach(),
             active=False,
         )
+        self._assert_couptest_topology()
         self._carrier_motion_preflight()
 
 
@@ -5194,6 +5617,15 @@ class GaussianModel:
                         self.h2_velocity_field_grd[name] + param.grad.clone()
                     )
         if (
+            self.field_motion_model == "couptest_grid"
+            and self.grid_motion_field is not None
+        ):
+            for name, param in self.grid_motion_field.named_parameters():
+                if param.grad is not None:
+                    self.grid_motion_field_grd[name] = (
+                        self.grid_motion_field_grd[name] + param.grad.clone()
+                    )
+        if (
             self.field_motion_model == "carrier_hybrid"
             and self.carrier_motion_bank is not None
         ):
@@ -5273,6 +5705,8 @@ class GaussianModel:
             self.field_grd[name].zero_()
         for name in self.h2_velocity_field_grd.keys():
             self.h2_velocity_field_grd[name].zero_()
+        for name in self.grid_motion_field_grd.keys():
+            self.grid_motion_field_grd[name].zero_()
         for name in self.carrier_motion_bank_grd.keys():
             self.carrier_motion_bank_grd[name].zero_()
         for name in self.field_router_grd.keys():
@@ -5328,6 +5762,12 @@ class GaussianModel:
         if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
             for name, param in self.h2_velocity_field.named_parameters():
                 param.grad = self.h2_velocity_field_grd[name] * ratio
+        if (
+            self.field_motion_model == "couptest_grid"
+            and self.grid_motion_field is not None
+        ):
+            for name, param in self.grid_motion_field.named_parameters():
+                param.grad = self.grid_motion_field_grd[name] * ratio
         if (
             self.field_motion_model == "carrier_hybrid"
             and self.carrier_motion_bank is not None
@@ -5412,6 +5852,8 @@ class GaussianModel:
             self.euler_field.cuda()
             if self.h2_velocity_field is not None:
                 self.h2_velocity_field.cuda()
+            if self.grid_motion_field is not None:
+                self.grid_motion_field.cuda()
             self.field_router.cuda()
             self.field_query_gate.cuda()
             self.field_decoder.cuda()
@@ -5433,7 +5875,15 @@ class GaussianModel:
             {'params': [self._omega], 'lr': training_args.omega_lr, "name": "omega"},
             {
                 'params': [self._trbf_center],
-                'lr': 0.0 if self.field_motion_model == "carrier_hybrid" else training_args.trbfc_lr,
+                'lr': (
+                    0.0
+                    if self.field_motion_model in {
+                        "carrier_hybrid",
+                        "couptest_polynomial",
+                        "couptest_grid",
+                    }
+                    else training_args.trbfc_lr
+                ),
                 "name": "trbf_center",
             },
             {
@@ -5528,6 +5978,17 @@ class GaussianModel:
                         "name": "h2_velocity_field",
                     }
                 )
+            if (
+                self.field_motion_model == "couptest_grid"
+                and self.grid_motion_field is not None
+            ):
+                l.append(
+                    {
+                        'params': list(self.grid_motion_field.parameters()),
+                        'lr': self.field_couptest_grid_lr_init,
+                        "name": "grid_motion_field",
+                    }
+                )
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         for group in self.optimizer.param_groups:
@@ -5536,15 +5997,29 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        self.grid_motion_scheduler_args = None
+        if self.field_motion_model == "couptest_grid":
+            self.grid_motion_scheduler_args = get_expon_lr_func(
+                lr_init=self.field_couptest_grid_lr_init,
+                lr_final=self.field_couptest_grid_lr_final,
+                lr_delay_mult=self.field_couptest_grid_lr_delay_mult,
+                max_steps=self.field_couptest_grid_lr_max_steps,
+            )
         print("move decoder to cuda")
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
-    
+        xyz_lr = None
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                return lr
+                xyz_lr = lr
+            elif (
+                param_group["name"] == "grid_motion_field"
+                and self.grid_motion_scheduler_args is not None
+            ):
+                param_group['lr'] = self.grid_motion_scheduler_args(iteration)
+        return xyz_lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z','trbf_center', 'trbf_scale' ,'nx', 'ny', 'nz'] # 'trbf_center', 'trbf_scale' 
@@ -5842,6 +6317,20 @@ class GaussianModel:
             "field_existence_coverage_weight": self.field_existence_coverage_weight,
             "field_existence_log_interval": self.field_existence_log_interval,
             "field_motion_model": self.field_motion_model,
+            "field_couptest_mode": self.field_couptest_mode,
+            "field_couptest_initial_existence_floor": self.field_couptest_initial_existence_floor,
+            "field_couptest_full_width": self._couptest_full_width,
+            "field_couptest_log_interval": self.field_couptest_log_interval,
+            "field_couptest_stats_max_points": self.field_couptest_stats_max_points,
+            "field_couptest_grid_resolution": self.field_couptest_grid_resolution,
+            "field_couptest_grid_resolved_resolution": self.field_couptest_grid_resolved_resolution,
+            "field_couptest_grid_feature_dim": self.field_couptest_grid_feature_dim,
+            "field_couptest_grid_hidden_dim": self.field_couptest_grid_hidden_dim,
+            "field_couptest_grid_max_normalized_speed": self.field_couptest_grid_max_normalized_speed,
+            "field_couptest_grid_lr_init": self.field_couptest_grid_lr_init,
+            "field_couptest_grid_lr_final": self.field_couptest_grid_lr_final,
+            "field_couptest_grid_lr_delay_mult": self.field_couptest_grid_lr_delay_mult,
+            "field_couptest_grid_lr_max_steps": self.field_couptest_grid_lr_max_steps,
             "field_dense_initialization": int(self.field_dense_initialization),
             "field_dense_initialization_path": self.field_dense_initialization_path,
             "field_dense_initialization_resolved_path": self._dense_initialization_stats.get("path", ""),
@@ -6385,6 +6874,115 @@ class GaussianModel:
             self.field_motion_model = str(
                 config.get("field_motion_model", self.field_motion_model)
             ).strip().lower()
+            self.field_couptest_mode = str(
+                config.get("field_couptest_mode", self.field_couptest_mode)
+            ).strip().lower()
+            self.field_couptest_initial_existence_floor = float(
+                config.get(
+                    "field_couptest_initial_existence_floor",
+                    self.field_couptest_initial_existence_floor,
+                )
+            )
+            self.field_couptest_log_interval = max(
+                int(
+                    config.get(
+                        "field_couptest_log_interval",
+                        self.field_couptest_log_interval,
+                    )
+                ),
+                1,
+            )
+            self.field_couptest_stats_max_points = max(
+                int(
+                    config.get(
+                        "field_couptest_stats_max_points",
+                        self.field_couptest_stats_max_points,
+                    )
+                ),
+                1,
+            )
+            self.field_couptest_grid_resolution = str(
+                config.get(
+                    "field_couptest_grid_resolution",
+                    self.field_couptest_grid_resolution,
+                )
+            )
+            self.field_couptest_grid_feature_dim = max(
+                int(
+                    config.get(
+                        "field_couptest_grid_feature_dim",
+                        self.field_couptest_grid_feature_dim,
+                    )
+                ),
+                1,
+            )
+            self.field_couptest_grid_hidden_dim = max(
+                int(
+                    config.get(
+                        "field_couptest_grid_hidden_dim",
+                        self.field_couptest_grid_hidden_dim,
+                    )
+                ),
+                4,
+            )
+            self.field_couptest_grid_max_normalized_speed = max(
+                float(
+                    config.get(
+                        "field_couptest_grid_max_normalized_speed",
+                        self.field_couptest_grid_max_normalized_speed,
+                    )
+                ),
+                0.0,
+            )
+            self.field_couptest_grid_lr_init = max(
+                float(
+                    config.get(
+                        "field_couptest_grid_lr_init",
+                        self.field_couptest_grid_lr_init,
+                    )
+                ),
+                0.0,
+            )
+            self.field_couptest_grid_lr_final = max(
+                float(
+                    config.get(
+                        "field_couptest_grid_lr_final",
+                        self.field_couptest_grid_lr_final,
+                    )
+                ),
+                0.0,
+            )
+            self.field_couptest_grid_lr_delay_mult = max(
+                float(
+                    config.get(
+                        "field_couptest_grid_lr_delay_mult",
+                        self.field_couptest_grid_lr_delay_mult,
+                    )
+                ),
+                0.0,
+            )
+            self.field_couptest_grid_lr_max_steps = max(
+                int(
+                    config.get(
+                        "field_couptest_grid_lr_max_steps",
+                        self.field_couptest_grid_lr_max_steps,
+                    )
+                ),
+                1,
+            )
+            if self.field_motion_model in {
+                "couptest_polynomial",
+                "couptest_grid",
+            }:
+                if self.field_couptest_mode not in {
+                    "uncoupled",
+                    "coupled",
+                    "coupled_detached",
+                }:
+                    raise RuntimeError("Invalid couptest mode in checkpoint")
+                self._couptest_full_width = 1.0 / math.sqrt(
+                    -math.log(self.field_couptest_initial_existence_floor)
+                )
             self.field_carrier_initialization = bool(
                 config.get(
                     "field_carrier_initialization",
@@ -6963,6 +7561,8 @@ class GaussianModel:
         else:
             self._init_existence_parameters(self.get_xyz.shape[0], times=self.get_trbfcenter.detach())
 
+        self._assert_couptest_topology()
+
         if not self.use_euler_field:
             self._static_level_logits = torch.empty(0, device="cuda")
             self._dynamic_level_logits = torch.empty(0, device="cuda")
@@ -6985,6 +7585,10 @@ class GaussianModel:
                 self.field_motion_model == "h2"
                 and self.h2_velocity_field is None
             )
+            or (
+                self.field_motion_model == "couptest_grid"
+                and self.grid_motion_field is None
+            )
         ):
             self._build_euler_modules(bbox_min, bbox_max)
 
@@ -6997,6 +7601,14 @@ class GaussianModel:
             self._load_module_state_compatible(
                 self.h2_velocity_field,
                 payload["h2_velocity_field"],
+            )
+        if (
+            payload.get("grid_motion_field") is not None
+            and self.grid_motion_field is not None
+        ):
+            self._load_module_state_compatible(
+                self.grid_motion_field,
+                payload["grid_motion_field"],
             )
         if payload.get("field_router") is not None:
             self.field_router.load_state_dict(payload["field_router"])
@@ -7261,6 +7873,7 @@ class GaussianModel:
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
         self._assert_carrier_topology()
+        self._assert_couptest_topology()
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
@@ -7326,6 +7939,7 @@ class GaussianModel:
             "field_residual_gate": self._field_residual_gate.detach().cpu() if self.use_euler_field and self._field_residual_gate.numel() > 0 else None,
             "euler_field": self.euler_field.state_dict() if self.use_euler_field and self.euler_field is not None else None,
             "h2_velocity_field": self.h2_velocity_field.state_dict() if self.field_motion_model == "h2" and self.h2_velocity_field is not None else None,
+            "grid_motion_field": self.grid_motion_field.state_dict() if self.field_motion_model == "couptest_grid" and self.grid_motion_field is not None else None,
             "field_router": self.field_router.state_dict() if self.use_euler_field and self.field_router is not None else None,
             "field_query_gate": self.field_query_gate.state_dict() if self.use_euler_field and self.field_query_gate is not None else None,
             "field_decoder": self.field_decoder.state_dict() if self.use_euler_field and self.field_decoder is not None else None,
@@ -8261,6 +8875,7 @@ class GaussianModel:
                 self._bg_birth_iter = torch.full((int(torch.count_nonzero(valid_points_mask).item()), 1), -1.0, device="cuda", dtype=torch.float32)
         self._mvstruct_on_prune(valid_points_mask)
         self._assert_carrier_topology()
+        self._assert_couptest_topology()
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -8286,6 +8901,35 @@ class GaussianModel:
 
     def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None, new_existence_logits=None, new_interval_center_raw=None, new_interval_log_half_width=None, new_motion_time_anchor=None, new_existence_parent_indices=None, new_carrier_id=None, new_initialization_role=None):
         old_count = self._xyz.shape[0]
+        new_count = int(new_xyz.shape[0])
+        if self.field_motion_model in {
+            "couptest_polynomial",
+            "couptest_grid",
+        }:
+            if new_existence_parent_indices is not None:
+                couptest_parent_indices = new_existence_parent_indices.to(
+                    device=self.get_xyz.device,
+                    dtype=torch.long,
+                ).reshape(-1)
+                if couptest_parent_indices.shape[0] != new_count:
+                    raise ValueError("Parent indices must match new Gaussians")
+                if torch.any(couptest_parent_indices < 0) or torch.any(
+                    couptest_parent_indices >= old_count
+                ):
+                    raise ValueError("Couptest parent index is out of range")
+                new_trbf_center = self._trbf_center[
+                    couptest_parent_indices
+                ].detach()
+                new_trbfscale = self._trbf_scale[
+                    couptest_parent_indices
+                ].detach()
+                new_motion = self._motion[couptest_parent_indices].detach()
+            else:
+                new_trbfscale = torch.full_like(
+                    new_trbfscale,
+                    math.log(self._couptest_full_width),
+                )
+                new_motion = torch.zeros_like(new_motion)
         if (
             int(new_xyz.shape[0]) > 0
             and self.field_carrier_initialization_schema
@@ -8653,6 +9297,7 @@ class GaussianModel:
             self._bg_birth_iter = torch.cat((old_bg_birth, new_bg_birth_iter), dim=0)
         self._mvstruct_on_points_added(old_count, new_xyz.shape[0])
         self._assert_carrier_topology()
+        self._assert_couptest_topology()
 
     
 

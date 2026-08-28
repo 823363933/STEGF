@@ -4383,9 +4383,16 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         return selected
 
     existence_stats_path = os.path.join(scene.model_path, "existence_moe_stats.jsonl")
+    couptest_stats_path = os.path.join(scene.model_path, "couptest_stats.jsonl")
     if first_iter <= 1:
         with open(existence_stats_path, "w", encoding="utf-8"):
             pass
+        if (
+            getattr(gaussians, "field_motion_model", "")
+            in {"couptest_polynomial", "couptest_grid"}
+        ):
+            with open(couptest_stats_path, "w", encoding="utf-8"):
+                pass
 
     for iteration in range(first_iter, opt.iterations + 1):
         if ems_main_enabled and iteration ==  opt.emsstart:
@@ -4824,6 +4831,44 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     final_existence_stats["iteration"] = int(iteration)
                     with open(existence_stats_path, "a", encoding="utf-8") as stats_file:
                         stats_file.write(json.dumps(final_existence_stats, sort_keys=True) + "\n")
+
+            couptest_log_interval = max(
+                int(getattr(gaussians, "field_couptest_log_interval", 500)),
+                1,
+            )
+            if (
+                getattr(gaussians, "field_motion_model", "")
+                in {"couptest_polynomial", "couptest_grid"}
+                and (
+                    iteration % couptest_log_interval == 0
+                    or iteration == opt.iterations
+                )
+            ):
+                couptest_stats = gaussians.get_couptest_stats()
+                if couptest_stats:
+                    couptest_stats["iteration"] = int(iteration)
+                    with open(
+                        couptest_stats_path,
+                        "a",
+                        encoding="utf-8",
+                    ) as stats_file:
+                        stats_file.write(
+                            json.dumps(couptest_stats, sort_keys=True) + "\n"
+                        )
+                    scene.recordpoints(
+                        iteration,
+                        "couptest_{}_wr50{:.3f}_short{:.3f}_medium{:.3f}_"
+                        "long{:.3f}_r05p90{:.6g}".format(
+                            couptest_stats["mode"],
+                            couptest_stats["width_ratio"]["q50"],
+                            couptest_stats["width_groups"]["short"],
+                            couptest_stats["width_groups"]["medium"],
+                            couptest_stats["width_groups"]["long"],
+                            couptest_stats["times"]["t05"][
+                                "effective_residual_norm"
+                            ]["q90"],
+                        ),
+                    )
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
