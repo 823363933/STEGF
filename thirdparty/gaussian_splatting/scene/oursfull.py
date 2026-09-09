@@ -683,8 +683,6 @@ class GaussianModel:
         self.field_motion_model = "polynomial"
         self.field_couptest_mode = "none"
         self.field_couptest_initial_existence_floor = 0.95
-        self.field_couptest_log_interval = 500
-        self.field_couptest_stats_max_points = 65536
         self.field_couptest_grid_resolution = "auto_finest"
         self.field_couptest_grid_resolved_resolution = ""
         self.field_couptest_grid_feature_dim = 8
@@ -944,6 +942,9 @@ class GaussianModel:
         self.field_static_app_head_grd = {}
 
     def _init_ems_mask(self, num_points, values=None):
+        if self.field_disable_legacy_aux:
+            self.maskforems = torch.empty((0, 1), device="cuda")
+            return
         if values is None:
             values = torch.zeros((num_points, 1), device="cuda", dtype=torch.float32)
         else:
@@ -965,6 +966,20 @@ class GaussianModel:
         static_mask_values=None,
         visibility_values=None,
     ):
+        if self.field_disable_legacy_aux:
+            empty = torch.empty((0, 1), device="cuda")
+            self._dynamic_score_ema = empty
+            self._dynamic_active_mask = empty
+            self._responsibility_ema = empty
+            self._responsibility_time_center_ema = empty
+            self._slow_motion_score_ema = empty
+            self._slow_motion_mask = empty
+            self._fast_score_ema = empty
+            self._fast_active_mask = empty
+            self._static_support_ema = empty
+            self._static_support_mask = empty
+            self._visibility_persistence_ema = empty
+            return
         if score_values is None:
             score_values = torch.zeros((num_points, 1), device="cuda", dtype=torch.float32)
         else:
@@ -1020,6 +1035,44 @@ class GaussianModel:
         self._static_support_ema = static_score_values
         self._static_support_mask = static_mask_values
         self._visibility_persistence_ema = visibility_values
+
+    def _append_legacy_point_state(self, num_points, ems_values=None):
+        if self.field_disable_legacy_aux:
+            return
+        if ems_values is None:
+            ems_values = torch.zeros(
+                (num_points, 1), device="cuda", dtype=torch.float32
+            )
+        if self.maskforems is None or self.maskforems.numel() == 0:
+            self.maskforems = ems_values
+        else:
+            self.maskforems = torch.cat((self.maskforems, ems_values), dim=0)
+
+        def append_zeros(values, fill=0.0):
+            new_values = torch.full(
+                (num_points, 1), fill, device="cuda", dtype=torch.float32
+            )
+            if values is None or values.numel() == 0:
+                return new_values
+            return torch.cat((values, new_values), dim=0)
+
+        self._dynamic_score_ema = append_zeros(self._dynamic_score_ema)
+        self._dynamic_active_mask = append_zeros(self._dynamic_active_mask)
+        self._responsibility_ema = append_zeros(self._responsibility_ema)
+        self._responsibility_time_center_ema = append_zeros(
+            self._responsibility_time_center_ema, fill=-1.0
+        )
+        self._slow_motion_score_ema = append_zeros(
+            self._slow_motion_score_ema
+        )
+        self._slow_motion_mask = append_zeros(self._slow_motion_mask)
+        self._fast_score_ema = append_zeros(self._fast_score_ema)
+        self._fast_active_mask = append_zeros(self._fast_active_mask)
+        self._static_support_ema = append_zeros(self._static_support_ema)
+        self._static_support_mask = append_zeros(self._static_support_mask)
+        self._visibility_persistence_ema = append_zeros(
+            self._visibility_persistence_ema
+        )
 
     def _normalize_score_component(self, values):
         if values.numel() == 0:
@@ -1532,7 +1585,7 @@ class GaussianModel:
         parent_omega = self._omega[selected_mask]
         parent_feature_t = self._features_t[selected_mask]
         parent_static_logits = self._static_level_logits[selected_mask] if self.use_euler_field else None
-        parent_dynamic_logits = self._dynamic_level_logits[selected_mask] if self.use_euler_field else None
+        parent_dynamic_logits = self._dynamic_level_logits[selected_mask] if self.use_euler_field and self._dynamic_level_logits.numel() > 0 else None
         parent_dynamic_time = self._dynamic_level_time_coeff[selected_mask] if self.use_euler_field and self._dynamic_level_time_coeff.numel() > 0 else None
         parent_ems_mask = self.maskforems[selected_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None
         parent_dynamic_score = self._dynamic_score_ema[selected_mask] if self._dynamic_score_ema is not None and self._dynamic_score_ema.numel() > 0 else None
@@ -2017,12 +2070,6 @@ class GaussianModel:
         ).strip().lower()
         self.field_couptest_initial_existence_floor = float(
             getattr(args, "field_couptest_initial_existence_floor", 0.95)
-        )
-        self.field_couptest_log_interval = max(
-            int(getattr(args, "field_couptest_log_interval", 500)), 1
-        )
-        self.field_couptest_stats_max_points = max(
-            int(getattr(args, "field_couptest_stats_max_points", 65536)), 1
         )
         self.field_couptest_grid_resolution = str(
             getattr(args, "field_couptest_grid_resolution", "auto_finest")
@@ -2917,37 +2964,88 @@ class GaussianModel:
         else:
             self.grid_motion_field = None
             self.field_couptest_grid_resolved_resolution = ""
-        router_input_dim = self.field_feature_dim + 2 * self.field_level_fourier_degree
-        self.field_router = EulerLevelRouter(
+        # Build in the historical order so removing inactive modules does not
+        # shift the random initialization of the retained static appearance
+        # branch. Inactive objects are released immediately after this method.
+        router_input_dim = (
+            self.field_feature_dim + 2 * self.field_level_fourier_degree
+        )
+        field_router = EulerLevelRouter(
             input_dim=router_input_dim,
             hidden_dim=self.field_decoder_hidden,
             num_levels=self.field_num_levels,
         ).cuda()
-        gate_input_dim = self.field_feature_dim * 3 + 2 * self.field_level_fourier_degree + 2
-        self.field_query_gate = EulerQueryFusionGate(
+        gate_input_dim = (
+            self.field_feature_dim * 3
+            + 2 * self.field_level_fourier_degree
+            + 2
+        )
+        field_query_gate = EulerQueryFusionGate(
             input_dim=gate_input_dim,
             hidden_dim=self.field_decoder_hidden,
             bias_init=self.field_query_gate_bias,
             motion_scale_init=self.field_query_motion_scale,
         ).cuda()
-        self.field_decoder = EulerResidualDecoder(
+        field_decoder = EulerResidualDecoder(
             feature_dim=self.field_feature_dim,
             hidden_dim=self.field_decoder_hidden,
         ).cuda()
-        self.field_temporal_opacity_head = nn.Linear(self.field_feature_dim, 1, bias=False).cuda()
-        nn.init.normal_(self.field_temporal_opacity_head.weight, mean=0.0, std=1e-3)
-        self.field_static_view_mapper = nn.Sequential(
-            nn.Linear(self.field_feature_dim + 3, self.field_decoder_hidden, bias=False),
-            nn.ReLU(),
-            nn.Linear(self.field_decoder_hidden, self.field_feature_dim, bias=False),
+        field_temporal_opacity_head = nn.Linear(
+            self.field_feature_dim, 1, bias=False
         ).cuda()
-        nn.init.normal_(self.field_static_view_mapper[-1].weight, mean=0.0, std=1e-3)
-        self.field_static_app_head = nn.Sequential(
-            nn.Linear(self.field_feature_dim, self.field_decoder_hidden, bias=False),
+        nn.init.normal_(
+            field_temporal_opacity_head.weight, mean=0.0, std=1e-3
+        )
+        field_static_view_mapper = nn.Sequential(
+            nn.Linear(
+                self.field_feature_dim + 3,
+                self.field_decoder_hidden,
+                bias=False,
+            ),
+            nn.ReLU(),
+            nn.Linear(
+                self.field_decoder_hidden,
+                self.field_feature_dim,
+                bias=False,
+            ),
+        ).cuda()
+        nn.init.normal_(
+            field_static_view_mapper[-1].weight, mean=0.0, std=1e-3
+        )
+        field_static_app_head = nn.Sequential(
+            nn.Linear(
+                self.field_feature_dim,
+                self.field_decoder_hidden,
+                bias=False,
+            ),
             nn.ReLU(),
             nn.Linear(self.field_decoder_hidden, 6, bias=False),
         ).cuda()
-        nn.init.normal_(self.field_static_app_head[-1].weight, mean=0.0, std=1e-3)
+        nn.init.normal_(field_static_app_head[-1].weight, mean=0.0, std=1e-3)
+
+        if self.field_disable_dynamic_grid:
+            self.field_router = None
+            self.field_query_gate = None
+            self.field_temporal_opacity_head = None
+        else:
+            self.field_router = field_router
+            self.field_query_gate = field_query_gate
+            self.field_temporal_opacity_head = field_temporal_opacity_head
+        self.field_decoder = (
+            field_decoder
+            if self.field_v23_compat or not self.field_disable_dynamic_grid
+            else None
+        )
+        keep_static_appearance = (
+            not self.field_v23_compat
+            and self.field_static_app_scale > 0.0
+        )
+        self.field_static_view_mapper = (
+            field_static_view_mapper if keep_static_appearance else None
+        )
+        self.field_static_app_head = (
+            field_static_app_head if keep_static_appearance else None
+        )
         if self.field_static_radiance_branch:
             self._static_radiance_level_logits = nn.Parameter(
                 torch.zeros((self.field_num_levels,), device="cuda", dtype=torch.float32).requires_grad_(True)
@@ -2966,7 +3064,7 @@ class GaussianModel:
         self._static_level_logits = nn.Parameter(values.requires_grad_(True))
 
     def _init_dynamic_level_logits(self, num_points, values=None):
-        if not self.use_euler_field:
+        if not self.use_euler_field or self.field_disable_dynamic_grid:
             self._dynamic_level_logits = torch.empty(0, device="cuda")
             return
         if values is None:
@@ -2976,7 +3074,11 @@ class GaussianModel:
         self._dynamic_level_logits = nn.Parameter(values.requires_grad_(True))
 
     def _init_dynamic_level_time_coeff(self, num_points, values=None):
-        if not self.use_euler_field or self.field_level_fourier_degree <= 0:
+        if (
+            not self.use_euler_field
+            or self.field_disable_dynamic_grid
+            or self.field_level_fourier_degree <= 0
+        ):
             self._dynamic_level_time_coeff = torch.empty(0, device="cuda")
             return
         coeff_dim = 2 * self.field_level_fourier_degree
@@ -3002,7 +3104,14 @@ class GaussianModel:
         self._static_route_logits = nn.Parameter(values.requires_grad_(True))
 
     def _init_field_residual_gate(self, values=None):
-        if not self.use_euler_field:
+        if (
+            not self.use_euler_field
+            or (
+                self.field_disable_dynamic_grid
+                and not self.field_static_use_global_gate
+                and not self.field_v23_compat
+            )
+        ):
             self._field_residual_gate = torch.empty(0, device="cuda")
             return
         if values is None:
@@ -3917,126 +4026,6 @@ class GaussianModel:
             "residual_coefficient": residual_coefficient,
         }
 
-    @staticmethod
-    def _couptest_quantiles(values):
-        flat = values.detach().reshape(-1).float()
-        if flat.numel() == 0:
-            return {"q10": 0.0, "q50": 0.0, "q90": 0.0}
-        quantiles = torch.quantile(flat, flat.new_tensor([0.1, 0.5, 0.9]))
-        return {
-            "q10": float(quantiles[0].item()),
-            "q50": float(quantiles[1].item()),
-            "q90": float(quantiles[2].item()),
-        }
-
-    @torch.no_grad()
-    def get_couptest_stats(self):
-        if self.field_motion_model not in {
-            "couptest_polynomial",
-            "couptest_grid",
-        }:
-            return {}
-        point_count = int(self.get_xyz.shape[0])
-        if point_count == 0:
-            return {}
-        sample_count = min(point_count, self.field_couptest_stats_max_points)
-        if sample_count == point_count:
-            point_indices = torch.arange(point_count, device=self.get_xyz.device)
-        else:
-            point_indices = torch.linspace(
-                0,
-                point_count - 1,
-                steps=sample_count,
-                device=self.get_xyz.device,
-            ).round().to(dtype=torch.long)
-        width = torch.exp(self._trbf_scale[point_indices])
-        width_ratio = width / float(self._couptest_full_width)
-        width_coupling = width_ratio.clamp(min=0.0, max=1.0)
-        motion = self._motion[point_indices]
-        stats = {
-            "mode": self.field_couptest_mode,
-            "coupling_gradient": (
-                "joint"
-                if self.field_couptest_mode == "coupled"
-                else "detached"
-                if self.field_couptest_mode == "coupled_detached"
-                else "none"
-            ),
-            "motion_model": self.field_motion_model,
-            "points": point_count,
-            "sample_points": sample_count,
-            "full_width": float(self._couptest_full_width),
-            "width": self._couptest_quantiles(width),
-            "width_ratio": self._couptest_quantiles(width_ratio),
-            "width_coupling": self._couptest_quantiles(width_coupling),
-            "quadratic_coefficient_norm": self._couptest_quantiles(
-                torch.linalg.vector_norm(motion[:, 3:6], dim=1)
-            ),
-            "cubic_coefficient_norm": self._couptest_quantiles(
-                torch.linalg.vector_norm(motion[:, 6:9], dim=1)
-            ),
-        }
-        if self.field_motion_model == "couptest_grid":
-            if self.grid_motion_field is None:
-                raise RuntimeError("Shared linear grid motion field is missing")
-            shared_velocity = self.grid_motion_field.query_velocity(
-                self._xyz[point_indices].detach()
-            )
-            stats["shared_velocity_norm"] = self._couptest_quantiles(
-                torch.linalg.vector_norm(shared_velocity, dim=1)
-            )
-            stats["grid_resolution"] = list(
-                self.grid_motion_field.resolution
-            )
-            stats["grid_occupancy"] = (
-                self.grid_motion_field.occupancy_stats(self._xyz.detach())
-            )
-        group_masks = {
-            "short": width_ratio[:, 0] < 0.25,
-            "medium": (width_ratio[:, 0] >= 0.25)
-            & (width_ratio[:, 0] < 0.75),
-            "long": width_ratio[:, 0] >= 0.75,
-        }
-        stats["width_groups"] = {
-            name: float(mask.float().mean().item())
-            for name, mask in group_masks.items()
-        }
-        stats["times"] = {}
-        centers = self.get_trbfcenter[point_indices]
-        for label, sample_time in (("t0", 0.0), ("t05", 0.5), ("t1", 1.0)):
-            terms = self._couptest_motion_terms(sample_time, point_indices)
-            existence = torch.exp(-torch.square((sample_time - centers) / width))
-            linear_norm = torch.linalg.vector_norm(terms["linear"], dim=1)
-            quadratic_norm = torch.linalg.vector_norm(
-                terms["quadratic"], dim=1
-            )
-            cubic_norm = torch.linalg.vector_norm(terms["cubic"], dim=1)
-            raw_norm = torch.linalg.vector_norm(terms["raw_residual"], dim=1)
-            effective_norm = torch.linalg.vector_norm(
-                terms["effective_residual"],
-                dim=1,
-            )
-            time_stats = {
-                "existence": self._couptest_quantiles(existence),
-                "existence_mean": float(existence.mean().item()),
-                "linear_norm": self._couptest_quantiles(linear_norm),
-                "quadratic_norm": self._couptest_quantiles(quadratic_norm),
-                "cubic_norm": self._couptest_quantiles(cubic_norm),
-                "raw_residual_norm": self._couptest_quantiles(raw_norm),
-                "effective_residual_norm": self._couptest_quantiles(
-                    effective_norm
-                ),
-                "effective_residual_by_width": {},
-            }
-            for name, mask in group_masks.items():
-                time_stats["effective_residual_by_width"][name] = (
-                    float(effective_norm[mask].mean().item())
-                    if bool(torch.any(mask))
-                    else 0.0
-                )
-            stats["times"][label] = time_stats
-        return stats
-
     def _init_module_grad_cache(self):
         self.rgb_grd = {}
         if self.rgbdecoder is not None:
@@ -4113,7 +4102,6 @@ class GaussianModel:
                 self.content_exposure_grd[name] = torch.zeros_like(param, requires_grad=False, device=param.device)
 
     def compose_time_conditioned_attributes(self, timestamp, basicfunction, camera_center=None):
-        pointtimes = torch.ones((self.get_xyz.shape[0], 1), dtype=self.get_xyz.dtype, requires_grad=False, device="cuda")
         base_motion = self._motion
         motion = base_motion
         opacity_param = self._opacity
@@ -4121,7 +4109,7 @@ class GaussianModel:
         features_t = self._features_t
         app_residual = None
         static_warmup = 0.0
-        trbfdistanceoffset = timestamp * pointtimes - self.get_trbfcenter
+        trbfdistanceoffset = timestamp - self.get_trbfcenter
         if self.field_motion_model == "carrier_hybrid":
             if (
                 self.carrier_motion_bank is None
@@ -4130,7 +4118,7 @@ class GaussianModel:
             ):
                 raise RuntimeError("carrier_hybrid topology is not initialized")
             tforpoly = (
-                timestamp * pointtimes - self._motion_time_anchor
+                timestamp - self._motion_time_anchor
             ).detach()
         elif self.field_existence_single_expert == "transient":
             if (
@@ -4143,14 +4131,14 @@ class GaussianModel:
                     "per Gaussian"
                 )
             tforpoly = (
-                timestamp * pointtimes - self._motion_time_anchor
+                timestamp - self._motion_time_anchor
             ).detach()
         elif (
             self.field_existence_moe
             and self._existence_active
             and self._motion_time_anchor.numel() == self.get_xyz.shape[0]
         ):
-            tforpoly = (timestamp * pointtimes - self._motion_time_anchor).detach()
+            tforpoly = (timestamp - self._motion_time_anchor).detach()
         else:
             tforpoly = trbfdistanceoffset.detach()
 
@@ -4235,17 +4223,43 @@ class GaussianModel:
             )
             self._last_h2_aux = {}
 
-        if self.use_euler_field and self.euler_field is not None and self.field_decoder is not None:
-            canonical_points = self._xyz
-            motion_query_points = canonical_points + motion_query_offset
-            motion_strength, motion_acceleration, dynamic_weight, fast_weight = self._get_motion_state_weights(
-                motion_query_offset,
-                tforpoly,
-                timestamp=timestamp,
+        if (
+            self.use_euler_field
+            and self.euler_field is not None
+            and (
+                self.field_decoder is not None
+                or self.field_static_app_head is not None
             )
+        ):
+            canonical_points = self._xyz
+            needs_motion_state = (
+                self.field_v23_compat
+                or self.field_staged_training
+                or not self.field_disable_dynamic_grid
+            )
+            motion_query_points = None
+            if needs_motion_state:
+                motion_query_points = canonical_points + motion_query_offset
+            if needs_motion_state:
+                (
+                    motion_strength,
+                    motion_acceleration,
+                    dynamic_weight,
+                    fast_weight,
+                ) = self._get_motion_state_weights(
+                    motion_query_offset,
+                    tforpoly,
+                    timestamp=timestamp,
+                )
+            else:
+                motion_strength = None
+                motion_acceleration = None
+                dynamic_weight = None
+                fast_weight = None
             if self.field_query_detach:
                 canonical_points = canonical_points.detach()
-                motion_query_points = motion_query_points.detach()
+                if motion_query_points is not None:
+                    motion_query_points = motion_query_points.detach()
             stage = self.field_stage if self.field_staged_training else "fast_refine"
             if self.field_v23_compat:
                 static_feature = None
@@ -4314,7 +4328,13 @@ class GaussianModel:
             else:
                 static_warmup = self._get_static_residual_warmup()
                 static_feature = None
-                static_residual_motion = torch.zeros((self.get_xyz.shape[0], 1), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
+                static_residual_motion = None
+                if self.field_staged_training:
+                    static_residual_motion = torch.zeros(
+                        (self.get_xyz.shape[0], 1),
+                        device=self.get_xyz.device,
+                        dtype=self.get_xyz.dtype,
+                    )
                 if static_warmup > 0.0:
                     static_level_features = self.euler_field.query_static_level_features(
                         canonical_points,
@@ -4327,13 +4347,21 @@ class GaussianModel:
                     static_feature = self.euler_field.blend_level_features(static_level_features, static_level_logits)
 
                 dynamic_field_residual = None
-                static_route = torch.zeros((self.get_xyz.shape[0], 1), device=self.get_xyz.device, dtype=self.get_xyz.dtype)
-                dynamic_route = torch.zeros_like(static_route)
+                static_route = None
+                dynamic_route = None
+                gate_alpha = None
+                if needs_motion_state:
+                    static_route = torch.zeros(
+                        (self.get_xyz.shape[0], 1),
+                        device=self.get_xyz.device,
+                        dtype=self.get_xyz.dtype,
+                    )
+                    dynamic_route = torch.zeros_like(static_route)
+                    gate_alpha = torch.zeros_like(dynamic_weight)
                 app_residual = None
                 if static_feature is not None:
                     if self.field_static_app_head is not None and self.field_static_app_scale > 0.0:
                         app_residual = self.field_static_app_head(static_feature)
-                    gate_alpha = torch.zeros_like(dynamic_weight)
                     dynamic_residual = None
                     dynamic_feature = None
                     if stage == "fast_refine" and not self.field_disable_dynamic_grid:
@@ -4359,7 +4387,12 @@ class GaussianModel:
                             gate_alpha = torch.zeros_like(dynamic_weight)
                         dynamic_residual = self.field_decoder(dynamic_feature)
 
-                    static_route, dynamic_route = self._get_soft_route_weights(dynamic_weight, gate_alpha, stage)
+                    if needs_motion_state:
+                        static_route, dynamic_route = self._get_soft_route_weights(
+                            dynamic_weight,
+                            gate_alpha,
+                            stage,
+                        )
                     if dynamic_residual is not None and dynamic_feature is not None:
                         dynamic_field_residual = dynamic_route * dynamic_residual
                         temporal_opacity_delta = self.field_temporal_opacity_head(dynamic_feature)
@@ -4370,14 +4403,17 @@ class GaussianModel:
                             * temporal_opacity_delta
                         )
 
-                self._last_field_aux = {
-                    "motion_strength": motion_strength.detach(),
-                    "motion_acceleration": motion_acceleration.detach(),
-                    "static_residual_motion": static_residual_motion,
-                    "static_route": static_route.detach(),
-                    "dynamic_route": dynamic_route.detach(),
-                    "static_warmup": static_warmup,
-                }
+                if self.field_staged_training:
+                    self._last_field_aux = {
+                        "motion_strength": motion_strength.detach(),
+                        "motion_acceleration": motion_acceleration.detach(),
+                        "static_residual_motion": static_residual_motion,
+                        "static_route": static_route.detach(),
+                        "dynamic_route": dynamic_route.detach(),
+                        "static_warmup": static_warmup,
+                    }
+                else:
+                    self._last_field_aux = {}
                 if dynamic_field_residual is not None:
                     motion, opacity_param = self._apply_field_residual(motion, opacity_param, dynamic_field_residual)
 
@@ -5578,7 +5614,10 @@ class GaussianModel:
         self._scaling_grd += self._scaling.grad.clone()
         self._rotation_grd += self._rotation.grad.clone()
         self._opacity_grd += self._opacity.grad.clone()
-        if self._trbf_center.grad is not None:
+        if (
+            self._trbf_center.grad is not None
+            and self._trbf_center_grd is not None
+        ):
             self._trbf_center_grd += self._trbf_center.grad.clone()
         if self._trbf_scale.grad is not None:
             self._trbf_scale_grd += self._trbf_scale.grad.clone()
@@ -5672,7 +5711,11 @@ class GaussianModel:
         self._scaling_grd = torch.zeros_like(self._scaling, requires_grad=False)
         self._rotation_grd = torch.zeros_like(self._rotation, requires_grad=False)
         self._opacity_grd = torch.zeros_like(self._opacity, requires_grad=False)
-        self._trbf_center_grd = torch.zeros_like(self._trbf_center, requires_grad=False)
+        self._trbf_center_grd = None
+        if self._trbf_center.requires_grad:
+            self._trbf_center_grd = torch.zeros_like(
+                self._trbf_center, requires_grad=False
+            )
         self._trbf_scale_grd = torch.zeros_like(self._trbf_scale, requires_grad=False)
         self._motion_grd = torch.zeros_like(self._motion, requires_grad=False)
         self._omega_grd = torch.zeros_like(self._omega, requires_grad=False)
@@ -5732,7 +5775,8 @@ class GaussianModel:
         self._scaling.grad = self._scaling_grd * ratio
         self._rotation.grad = self._rotation_grd * ratio
         self._opacity.grad = self._opacity_grd * ratio
-        self._trbf_center.grad = self._trbf_center_grd * ratio
+        if self._trbf_center.requires_grad:
+            self._trbf_center.grad = self._trbf_center_grd * ratio
         self._trbf_scale.grad = self._trbf_scale_grd* ratio
         self._motion.grad = self._motion_grd * ratio
         self._omega.grad = self._omega_grd * ratio
@@ -5854,9 +5898,12 @@ class GaussianModel:
                 self.h2_velocity_field.cuda()
             if self.grid_motion_field is not None:
                 self.grid_motion_field.cuda()
-            self.field_router.cuda()
-            self.field_query_gate.cuda()
-            self.field_decoder.cuda()
+            if self.field_router is not None:
+                self.field_router.cuda()
+            if self.field_query_gate is not None:
+                self.field_query_gate.cuda()
+            if self.field_decoder is not None:
+                self.field_decoder.cuda()
             if self.field_temporal_opacity_head is not None:
                 self.field_temporal_opacity_head.cuda()
             if self.field_static_view_mapper is not None:
@@ -5865,6 +5912,16 @@ class GaussianModel:
                 self.field_static_app_head.cuda()
         self._init_module_grad_cache()
          # self._features_t
+        trbf_center_lr = (
+            0.0
+            if self.field_motion_model in {
+                "carrier_hybrid",
+                "couptest_polynomial",
+                "couptest_grid",
+            }
+            else training_args.trbfc_lr
+        )
+        self._trbf_center.requires_grad_(trbf_center_lr > 0.0)
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -5875,15 +5932,7 @@ class GaussianModel:
             {'params': [self._omega], 'lr': training_args.omega_lr, "name": "omega"},
             {
                 'params': [self._trbf_center],
-                'lr': (
-                    0.0
-                    if self.field_motion_model in {
-                        "carrier_hybrid",
-                        "couptest_polynomial",
-                        "couptest_grid",
-                    }
-                    else training_args.trbfc_lr
-                ),
+                'lr': trbf_center_lr,
                 "name": "trbf_center",
             },
             {
@@ -5954,22 +6003,32 @@ class GaussianModel:
             l.append({'params': [self._static_level_logits], 'lr': training_args.grid_logits_lr, "name": "static_grid_logits"})
             if self._static_radiance_level_logits.numel() > 0:
                 l.append({'params': [self._static_radiance_level_logits], 'lr': training_args.grid_logits_lr, "name": "static_radiance_level_logits"})
-            l.append({'params': [self._dynamic_level_logits], 'lr': training_args.grid_logits_lr, "name": "dynamic_grid_logits"})
+            if self._dynamic_level_logits.numel() > 0:
+                l.append({'params': [self._dynamic_level_logits], 'lr': training_args.grid_logits_lr, "name": "dynamic_grid_logits"})
             if self._dynamic_level_time_coeff.numel() > 0:
                 l.append({'params': [self._dynamic_level_time_coeff], 'lr': training_args.grid_logits_lr, "name": "dynamic_grid_time_coeff"})
             if self._static_route_logits.numel() > 0 and self.field_static_route_mode == "learned":
                 l.append({'params': [self._static_route_logits], 'lr': training_args.field_gate_lr, "name": "static_route_logits"})
             if self._field_residual_gate.numel() > 0:
                 l.append({'params': [self._field_residual_gate], 'lr': training_args.field_gate_lr, "name": "field_gate"})
-            l.extend([
-                {'params': list(self.euler_field.parameters()), 'lr': training_args.field_lr, "name": "field"},
-                {'params': list(self.field_router.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_router"},
-                {'params': list(self.field_query_gate.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_query_gate"},
-                {'params': list(self.field_decoder.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_decoder"},
-                {'params': list(self.field_temporal_opacity_head.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_temporal_opacity"},
-                {'params': list(self.field_static_view_mapper.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_static_view_mapper"},
-                {'params': list(self.field_static_app_head.parameters()), 'lr': training_args.field_decoder_lr, "name": "field_static_app"},
-            ])
+            l.append({'params': list(self.euler_field.parameters()), 'lr': training_args.field_lr, "name": "field"})
+            optional_modules = (
+                ("field_router", self.field_router),
+                ("field_query_gate", self.field_query_gate),
+                ("field_decoder", self.field_decoder),
+                ("field_temporal_opacity", self.field_temporal_opacity_head),
+                ("field_static_view_mapper", self.field_static_view_mapper),
+                ("field_static_app", self.field_static_app_head),
+            )
+            for name, module in optional_modules:
+                if module is not None:
+                    l.append(
+                        {
+                            'params': list(module.parameters()),
+                            'lr': training_args.field_decoder_lr,
+                            "name": name,
+                        }
+                    )
             if self.field_motion_model == "h2" and self.h2_velocity_field is not None:
                 l.append(
                     {
@@ -6320,8 +6379,6 @@ class GaussianModel:
             "field_couptest_mode": self.field_couptest_mode,
             "field_couptest_initial_existence_floor": self.field_couptest_initial_existence_floor,
             "field_couptest_full_width": self._couptest_full_width,
-            "field_couptest_log_interval": self.field_couptest_log_interval,
-            "field_couptest_stats_max_points": self.field_couptest_stats_max_points,
             "field_couptest_grid_resolution": self.field_couptest_grid_resolution,
             "field_couptest_grid_resolved_resolution": self.field_couptest_grid_resolved_resolution,
             "field_couptest_grid_feature_dim": self.field_couptest_grid_feature_dim,
@@ -6882,24 +6939,6 @@ class GaussianModel:
                     "field_couptest_initial_existence_floor",
                     self.field_couptest_initial_existence_floor,
                 )
-            )
-            self.field_couptest_log_interval = max(
-                int(
-                    config.get(
-                        "field_couptest_log_interval",
-                        self.field_couptest_log_interval,
-                    )
-                ),
-                1,
-            )
-            self.field_couptest_stats_max_points = max(
-                int(
-                    config.get(
-                        "field_couptest_stats_max_points",
-                        self.field_couptest_stats_max_points,
-                    )
-                ),
-                1,
             )
             self.field_couptest_grid_resolution = str(
                 config.get(
@@ -7575,12 +7614,24 @@ class GaussianModel:
 
         if (
             self.euler_field is None
-            or self.field_router is None
-            or self.field_query_gate is None
-            or self.field_decoder is None
-            or self.field_temporal_opacity_head is None
-            or self.field_static_view_mapper is None
-            or self.field_static_app_head is None
+            or (
+                not self.field_disable_dynamic_grid
+                and (
+                    self.field_router is None
+                    or self.field_query_gate is None
+                    or self.field_decoder is None
+                    or self.field_temporal_opacity_head is None
+                )
+            )
+            or (self.field_v23_compat and self.field_decoder is None)
+            or (
+                not self.field_v23_compat
+                and self.field_static_app_scale > 0.0
+                and (
+                    self.field_static_view_mapper is None
+                    or self.field_static_app_head is None
+                )
+            )
             or (
                 self.field_motion_model == "h2"
                 and self.h2_velocity_field is None
@@ -7610,13 +7661,13 @@ class GaussianModel:
                 self.grid_motion_field,
                 payload["grid_motion_field"],
             )
-        if payload.get("field_router") is not None:
+        if payload.get("field_router") is not None and self.field_router is not None:
             self.field_router.load_state_dict(payload["field_router"])
-        if payload.get("field_query_gate") is not None:
+        if payload.get("field_query_gate") is not None and self.field_query_gate is not None:
             self._load_module_state_compatible(self.field_query_gate, payload["field_query_gate"])
-        if payload.get("field_decoder") is not None:
+        if payload.get("field_decoder") is not None and self.field_decoder is not None:
             self._load_module_state_compatible(self.field_decoder, payload["field_decoder"])
-        if payload.get("field_temporal_opacity_head") is not None:
+        if payload.get("field_temporal_opacity_head") is not None and self.field_temporal_opacity_head is not None:
             self._load_module_state_compatible(self.field_temporal_opacity_head, payload["field_temporal_opacity_head"])
         if payload.get("field_static_view_mapper") is not None and self.field_static_view_mapper is not None:
             self._load_module_state_compatible(self.field_static_view_mapper, payload["field_static_view_mapper"])
@@ -7668,12 +7719,16 @@ class GaussianModel:
         else:
             static_radiance_logits = torch.empty(0, device="cuda")
 
-        if saved_dynamic_logits is not None:
+        if self.field_disable_dynamic_grid:
+            dynamic_logits = torch.empty((0,), device="cuda")
+        elif saved_dynamic_logits is not None:
             dynamic_logits = saved_dynamic_logits.to(device="cuda", dtype=torch.float32)
         else:
             dynamic_logits = torch.zeros((num_points, self.field_num_levels), device="cuda")
 
-        if saved_dynamic_time_coeff is not None:
+        if self.field_disable_dynamic_grid:
+            dynamic_time_coeff = torch.empty((0,), device="cuda")
+        elif saved_dynamic_time_coeff is not None:
             dynamic_time_coeff = saved_dynamic_time_coeff.to(device="cuda", dtype=torch.float32)
         else:
             coeff_dim = 2 * self.field_level_fourier_degree
@@ -7690,15 +7745,23 @@ class GaussianModel:
                 )
         else:
             static_route_logits = torch.empty(0, 1, device="cuda", dtype=torch.float32)
-        if saved_gate is not None:
-            gate = saved_gate.to(device="cuda", dtype=torch.float32)
+        needs_residual_gate = not (
+            self.field_disable_dynamic_grid
+            and not self.field_static_use_global_gate
+            and not self.field_v23_compat
+        )
+        if needs_residual_gate:
+            if saved_gate is not None:
+                gate = saved_gate.to(device="cuda", dtype=torch.float32)
+            else:
+                gate = torch.zeros((2,), device="cuda")
+            target_gate_dim = 2
+            if gate.shape[0] < target_gate_dim:
+                gate = torch.cat((gate, torch.zeros((target_gate_dim - gate.shape[0],), device="cuda", dtype=gate.dtype)), dim=0)
+            elif gate.shape[0] > target_gate_dim:
+                gate = gate[:target_gate_dim]
         else:
-            gate = torch.zeros((2,), device="cuda")
-        target_gate_dim = 2
-        if gate.shape[0] < target_gate_dim:
-            gate = torch.cat((gate, torch.zeros((target_gate_dim - gate.shape[0],), device="cuda", dtype=gate.dtype)), dim=0)
-        elif gate.shape[0] > target_gate_dim:
-            gate = gate[:target_gate_dim]
+            gate = torch.empty((0,), device="cuda")
 
         if append:
             if self._static_level_logits.numel() > 0:
@@ -7707,18 +7770,20 @@ class GaussianModel:
                 base_static_logits = torch.zeros((0, self.field_num_levels), device="cuda")
             static_logits = torch.cat((base_static_logits, static_logits), dim=0)
 
-            if self._dynamic_level_logits.numel() > 0:
-                base_dynamic_logits = self._dynamic_level_logits.detach()
-            else:
-                base_dynamic_logits = torch.zeros((0, self.field_num_levels), device="cuda")
-            dynamic_logits = torch.cat((base_dynamic_logits, dynamic_logits), dim=0)
+            if dynamic_logits.numel() > 0:
+                if self._dynamic_level_logits.numel() > 0:
+                    base_dynamic_logits = self._dynamic_level_logits.detach()
+                else:
+                    base_dynamic_logits = torch.zeros((0, self.field_num_levels), device="cuda")
+                dynamic_logits = torch.cat((base_dynamic_logits, dynamic_logits), dim=0)
 
-            if self._dynamic_level_time_coeff.numel() > 0:
-                base_time_coeff = self._dynamic_level_time_coeff.detach()
-            else:
-                coeff_dim = 2 * self.field_level_fourier_degree
-                base_time_coeff = torch.zeros((0, self.field_num_levels, coeff_dim), device="cuda")
-            dynamic_time_coeff = torch.cat((base_time_coeff, dynamic_time_coeff), dim=0)
+            if dynamic_time_coeff.numel() > 0:
+                if self._dynamic_level_time_coeff.numel() > 0:
+                    base_time_coeff = self._dynamic_level_time_coeff.detach()
+                else:
+                    coeff_dim = 2 * self.field_level_fourier_degree
+                    base_time_coeff = torch.zeros((0, self.field_num_levels, coeff_dim), device="cuda")
+                dynamic_time_coeff = torch.cat((base_time_coeff, dynamic_time_coeff), dim=0)
 
             if self._static_route_logits.numel() > 0 and static_route_logits.numel() > 0:
                 base_static_route_logits = self._static_route_logits.detach()
@@ -7734,13 +7799,26 @@ class GaussianModel:
             self._static_radiance_level_logits = nn.Parameter(static_radiance_logits.requires_grad_(True))
         else:
             self._static_radiance_level_logits = torch.empty(0, device="cuda")
-        self._dynamic_level_logits = nn.Parameter(dynamic_logits.requires_grad_(True))
-        self._dynamic_level_time_coeff = nn.Parameter(dynamic_time_coeff.requires_grad_(True))
+        if dynamic_logits.numel() > 0:
+            self._dynamic_level_logits = nn.Parameter(dynamic_logits.requires_grad_(True))
+        else:
+            self._dynamic_level_logits = torch.empty(0, device="cuda")
+        if dynamic_time_coeff.numel() > 0:
+            self._dynamic_level_time_coeff = nn.Parameter(dynamic_time_coeff.requires_grad_(True))
+        else:
+            self._dynamic_level_time_coeff = torch.empty(0, device="cuda")
         if static_route_logits.numel() > 0:
             self._static_route_logits = nn.Parameter(static_route_logits.requires_grad_(True))
         else:
             self._static_route_logits = torch.empty(0, device="cuda")
-        self._field_residual_gate = nn.Parameter(gate.requires_grad_(True))
+        if gate.numel() > 0:
+            self._field_residual_gate = nn.Parameter(gate.requires_grad_(True))
+        else:
+            self._field_residual_gate = torch.empty(0, device="cuda")
+        if self.field_disable_legacy_aux:
+            self._init_ems_mask(0)
+            self._init_dynamic_score_state(0)
+            return
         saved_ems_mask = payload.get("error_prior")
         if saved_ems_mask is None:
             saved_ems_mask = payload.get("ems_mask")
@@ -8753,12 +8831,20 @@ class GaussianModel:
                     stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                     del self.optimizer.state[group['params'][0]]
-                    group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                    requires_grad = group["params"][0].requires_grad
+                    group["params"][0] = nn.Parameter(
+                        group["params"][0][mask],
+                        requires_grad=requires_grad,
+                    )
                     self.optimizer.state[group['params'][0]] = stored_state
 
                     optimizable_tensors[group["name"]] = group["params"][0]
                 else:
-                    group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                    requires_grad = group["params"][0].requires_grad
+                    group["params"][0] = nn.Parameter(
+                        group["params"][0][mask],
+                        requires_grad=requires_grad,
+                    )
                     optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -8889,12 +8975,24 @@ class GaussianModel:
                     stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
                     del self.optimizer.state[group['params'][0]]
-                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    requires_grad = group["params"][0].requires_grad
+                    group["params"][0] = nn.Parameter(
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ),
+                        requires_grad=requires_grad,
+                    )
                     self.optimizer.state[group['params'][0]] = stored_state
 
                     optimizable_tensors[group["name"]] = group["params"][0]
                 else:
-                    group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                    requires_grad = group["params"][0].requires_grad
+                    group["params"][0] = nn.Parameter(
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ),
+                        requires_grad=requires_grad,
+                    )
                     optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -9220,67 +9318,9 @@ class GaussianModel:
         if self.omegamask is not None:
             new_omegamask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.bool)
             self.omegamask = torch.cat((self.omegamask, new_omegamask), dim=0)
-        if new_ems_mask is None:
-            new_ems_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        if self.maskforems is None or self.maskforems.numel() == 0:
-            self.maskforems = new_ems_mask
-        else:
-            self.maskforems = torch.cat((self.maskforems, new_ems_mask), dim=0)
-        new_dynamic_score = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_dynamic_active = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_responsibility = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_responsibility_time = torch.full((new_xyz.shape[0], 1), -1.0, device="cuda", dtype=torch.float32)
-        new_slow_score = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_slow_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_fast_score = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_fast_active = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_static_support_score = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_static_support_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        new_visibility = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
-        if self._dynamic_score_ema is None or self._dynamic_score_ema.numel() == 0:
-            self._dynamic_score_ema = new_dynamic_score
-        else:
-            self._dynamic_score_ema = torch.cat((self._dynamic_score_ema, new_dynamic_score), dim=0)
-        if self._dynamic_active_mask is None or self._dynamic_active_mask.numel() == 0:
-            self._dynamic_active_mask = new_dynamic_active
-        else:
-            self._dynamic_active_mask = torch.cat((self._dynamic_active_mask, new_dynamic_active), dim=0)
-        if self._responsibility_ema is None or self._responsibility_ema.numel() == 0:
-            self._responsibility_ema = new_responsibility
-        else:
-            self._responsibility_ema = torch.cat((self._responsibility_ema, new_responsibility), dim=0)
-        if self._responsibility_time_center_ema is None or self._responsibility_time_center_ema.numel() == 0:
-            self._responsibility_time_center_ema = new_responsibility_time
-        else:
-            self._responsibility_time_center_ema = torch.cat((self._responsibility_time_center_ema, new_responsibility_time), dim=0)
-        if self._slow_motion_score_ema is None or self._slow_motion_score_ema.numel() == 0:
-            self._slow_motion_score_ema = new_slow_score
-        else:
-            self._slow_motion_score_ema = torch.cat((self._slow_motion_score_ema, new_slow_score), dim=0)
-        if self._slow_motion_mask is None or self._slow_motion_mask.numel() == 0:
-            self._slow_motion_mask = new_slow_mask
-        else:
-            self._slow_motion_mask = torch.cat((self._slow_motion_mask, new_slow_mask), dim=0)
-        if self._fast_score_ema is None or self._fast_score_ema.numel() == 0:
-            self._fast_score_ema = new_fast_score
-        else:
-            self._fast_score_ema = torch.cat((self._fast_score_ema, new_fast_score), dim=0)
-        if self._fast_active_mask is None or self._fast_active_mask.numel() == 0:
-            self._fast_active_mask = new_fast_active
-        else:
-            self._fast_active_mask = torch.cat((self._fast_active_mask, new_fast_active), dim=0)
-        if self._static_support_ema is None or self._static_support_ema.numel() == 0:
-            self._static_support_ema = new_static_support_score
-        else:
-            self._static_support_ema = torch.cat((self._static_support_ema, new_static_support_score), dim=0)
-        if self._static_support_mask is None or self._static_support_mask.numel() == 0:
-            self._static_support_mask = new_static_support_mask
-        else:
-            self._static_support_mask = torch.cat((self._static_support_mask, new_static_support_mask), dim=0)
-        if self._visibility_persistence_ema is None or self._visibility_persistence_ema.numel() == 0:
-            self._visibility_persistence_ema = new_visibility
-        else:
-            self._visibility_persistence_ema = torch.cat((self._visibility_persistence_ema, new_visibility), dim=0)
+        self._append_legacy_point_state(
+            int(new_xyz.shape[0]), ems_values=new_ems_mask
+        )
         if new_bg_candidate_mask is None:
             new_bg_candidate_mask = torch.zeros((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
         if new_bg_birth_iter is None:
@@ -9336,7 +9376,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = self._static_level_logits[selected_pts_mask].repeat(N,1)
-            new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
@@ -9386,7 +9427,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = self._static_level_logits[selected_pts_mask].repeat(N,1)
-            new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
@@ -9434,7 +9476,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = self._static_level_logits[selected_pts_mask].repeat(N,1)
-            new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask].repeat(N,1)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask].repeat(N,1,1)
         new_ems_mask = parent_ems_mask.repeat(N,1) * 0.75 if parent_ems_mask is not None else None
@@ -9466,7 +9509,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = self._static_level_logits[selected_pts_mask]
-            new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask]
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask]
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask]
         new_ems_mask = self.maskforems[selected_pts_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None
@@ -9498,7 +9542,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = self._static_level_logits[selected_pts_mask]
-            new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask]
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = self._dynamic_level_logits[selected_pts_mask]
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = self._dynamic_level_time_coeff[selected_pts_mask]
         new_ems_mask = self.maskforems[selected_pts_mask] if self.maskforems is not None and self.maskforems.numel() > 0 else None
@@ -9912,7 +9957,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = repeat_fn(self._static_level_logits)
-            new_dynamic_level_logits = repeat_fn(self._dynamic_level_logits)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = repeat_fn(self._dynamic_level_logits)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = repeat_fn(self._dynamic_level_time_coeff)
 
@@ -10011,7 +10057,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = repeat_children(self._static_level_logits)
-            new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = repeat_children(self._dynamic_level_time_coeff)
 
@@ -10090,7 +10137,8 @@ class GaussianModel:
         new_dynamic_level_time_coeff = None
         if self.use_euler_field:
             new_static_level_logits = repeat_children(self._static_level_logits)
-            new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = repeat_children(self._dynamic_level_logits)
             if self._dynamic_level_time_coeff.numel() > 0:
                 new_dynamic_level_time_coeff = repeat_children(self._dynamic_level_time_coeff)
 
@@ -10618,8 +10666,9 @@ class GaussianModel:
             new_featuret.append(torch.zeros((selectnumpoints, 3), device="cuda"))
             if self.use_euler_field:
                 new_static_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
-                new_dynamic_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
-                if self.field_level_fourier_degree > 0:
+                if self._dynamic_level_logits.numel() > 0:
+                    new_dynamic_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
+                if self._dynamic_level_time_coeff.numel() > 0:
                     coeff_dim = 2 * self.field_level_fourier_degree
                     new_dynamic_level_time_coeff.append(torch.zeros((selectnumpoints, self.field_num_levels, coeff_dim), device="cuda"))
 
@@ -10636,7 +10685,11 @@ class GaussianModel:
         new_featuret = torch.cat(new_featuret, dim=0)
         if self.use_euler_field:
             new_static_level_logits = torch.cat(new_static_level_logits, dim=0)
-            new_dynamic_level_logits = torch.cat(new_dynamic_level_logits, dim=0)
+            new_dynamic_level_logits = (
+                torch.cat(new_dynamic_level_logits, dim=0)
+                if new_dynamic_level_logits
+                else None
+            )
             if len(new_dynamic_level_time_coeff) > 0:
                 new_dynamic_level_time_coeff = torch.cat(new_dynamic_level_time_coeff, dim=0)
             else:
@@ -10645,7 +10698,11 @@ class GaussianModel:
             new_static_level_logits = None
             new_dynamic_level_logits = None
             new_dynamic_level_time_coeff = None
-        new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_ems_mask = None
+        if not self.field_disable_legacy_aux:
+            new_ems_mask = torch.ones(
+                (new_xyz.shape[0], 1), device="cuda", dtype=torch.float32
+            )
 
          
 
@@ -10952,8 +11009,9 @@ class GaussianModel:
             new_featuret.append(torch.zeros((selectnumpoints, 3), device="cuda"))
             if self.use_euler_field:
                 new_static_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
-                new_dynamic_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
-                if self.field_level_fourier_degree > 0:
+                if self._dynamic_level_logits.numel() > 0:
+                    new_dynamic_level_logits.append(torch.zeros((selectnumpoints, self.field_num_levels), device="cuda"))
+                if self._dynamic_level_time_coeff.numel() > 0:
                     coeff_dim = 2 * self.field_level_fourier_degree
                     new_dynamic_level_time_coeff.append(torch.zeros((selectnumpoints, self.field_num_levels, coeff_dim), device="cuda"))
 
@@ -10972,7 +11030,11 @@ class GaussianModel:
 
         if self.use_euler_field:
             new_static_level_logits = torch.cat(new_static_level_logits, dim=0)
-            new_dynamic_level_logits = torch.cat(new_dynamic_level_logits, dim=0)
+            new_dynamic_level_logits = (
+                torch.cat(new_dynamic_level_logits, dim=0)
+                if new_dynamic_level_logits
+                else None
+            )
             if len(new_dynamic_level_time_coeff) > 0:
                 new_dynamic_level_time_coeff = torch.cat(new_dynamic_level_time_coeff, dim=0)
             else:
@@ -10984,7 +11046,11 @@ class GaussianModel:
 
         new_scaling = self._init_background_gaussian_scaling(new_xyz, new_depth_scale_tags)
 
-        new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_ems_mask = None
+        if not self.field_disable_legacy_aux:
+            new_ems_mask = torch.ones(
+                (new_xyz.shape[0], 1), device="cuda", dtype=torch.float32
+            )
         new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
         new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), float(iteration), device="cuda", dtype=torch.float32)
 
@@ -11075,8 +11141,11 @@ class GaussianModel:
 
         if self.use_euler_field:
             new_static_level_logits = torch.zeros((new_xyz.shape[0], self.field_num_levels), device="cuda", dtype=new_xyz.dtype)
-            new_dynamic_level_logits = torch.zeros((new_xyz.shape[0], self.field_num_levels), device="cuda", dtype=new_xyz.dtype)
-            if self.field_level_fourier_degree > 0:
+            if self._dynamic_level_logits.numel() > 0:
+                new_dynamic_level_logits = torch.zeros((new_xyz.shape[0], self.field_num_levels), device="cuda", dtype=new_xyz.dtype)
+            else:
+                new_dynamic_level_logits = None
+            if self._dynamic_level_time_coeff.numel() > 0:
                 coeff_dim = 2 * self.field_level_fourier_degree
                 new_dynamic_level_time_coeff = torch.zeros((new_xyz.shape[0], self.field_num_levels, coeff_dim), device="cuda", dtype=new_xyz.dtype)
             else:
@@ -11091,7 +11160,11 @@ class GaussianModel:
             new_depth_scale_tags,
         )
 
-        new_ems_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
+        new_ems_mask = None
+        if not self.field_disable_legacy_aux:
+            new_ems_mask = torch.ones(
+                (new_xyz.shape[0], 1), device="cuda", dtype=torch.float32
+            )
         new_bg_candidate_mask = torch.ones((new_xyz.shape[0], 1), device="cuda", dtype=torch.float32)
         new_bg_birth_iter = torch.full((new_xyz.shape[0], 1), float(iteration), device="cuda", dtype=torch.float32)
 
@@ -11307,7 +11380,8 @@ class GaussianModel:
             new_featuret_parts.append(self._features_t[clone_mask])
             if self.use_euler_field:
                 new_static_logits_parts.append(self._static_level_logits[clone_mask])
-                new_dynamic_logits_parts.append(self._dynamic_level_logits[clone_mask])
+                if self._dynamic_level_logits.numel() > 0:
+                    new_dynamic_logits_parts.append(self._dynamic_level_logits[clone_mask])
                 if self._dynamic_level_time_coeff.numel() > 0:
                     new_dynamic_time_parts.append(self._dynamic_level_time_coeff[clone_mask])
             if self.maskforems is not None and self.maskforems.numel() > 0 and self.maskforems.shape[0] == self.get_xyz.shape[0]:
@@ -11348,7 +11422,8 @@ class GaussianModel:
             new_featuret_parts.append(self._features_t[split_mask].repeat(split_children, 1))
             if self.use_euler_field:
                 new_static_logits_parts.append(self._static_level_logits[split_mask].repeat(split_children, 1))
-                new_dynamic_logits_parts.append(self._dynamic_level_logits[split_mask].repeat(split_children, 1))
+                if self._dynamic_level_logits.numel() > 0:
+                    new_dynamic_logits_parts.append(self._dynamic_level_logits[split_mask].repeat(split_children, 1))
                 if self._dynamic_level_time_coeff.numel() > 0:
                     new_dynamic_time_parts.append(self._dynamic_level_time_coeff[split_mask].repeat(split_children, 1, 1))
             if parent_ems_mask is not None:

@@ -1,13 +1,39 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-conda create -n stegf python=3.7.13 -y
-conda activate stegf
+STEGF_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$STEGF_REPO_ROOT"
 
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 -c pytorch -c conda-forge -y
+if ! command -v conda >/dev/null 2>&1; then
+  echo "[STEGF] conda was not found in PATH." >&2
+  exit 1
+fi
 
-pip install opencv-python tqdm natsort scipy kornia plyfile Pillow scikit-image
+STEGF_CONDA_BASE="$(conda info --base)"
+# shellcheck disable=SC1091
+source "$STEGF_CONDA_BASE/etc/profile.d/conda.sh"
 
-pip install thirdparty/gaussian_splatting/submodules/gaussian_rasterization_ch9
-pip install thirdparty/gaussian_splatting/submodules/simple-knn
-pip install -e thirdparty/mmcv -v
+if conda env list | awk '{print $1}' | grep -Fxq STEGF; then
+  echo "[STEGF] Updating existing Conda environment: STEGF"
+  conda env update --name STEGF --file script/environment.yml
+else
+  echo "[STEGF] Creating Conda environment: STEGF"
+  conda env create --file script/environment.yml
+fi
+
+conda activate STEGF
+
+python -m pip install thirdparty/gaussian_splatting/submodules/gaussian_rasterization_ch9
+python -m pip install thirdparty/gaussian_splatting/submodules/simple-knn
+python -m pip install -e thirdparty/mmcv -v
+
+python - <<'PY'
+import torch
+import torchvision
+from diff_gaussian_rasterization_ch9 import GaussianRasterizer
+from mmcv.ops import knn
+from simple_knn._C import distCUDA2
+
+print(f"[STEGF] Python environment ready: torch={torch.__version__}, torchvision={torchvision.__version__}, cuda={torch.version.cuda}")
+print("[STEGF] CUDA extensions imported successfully.")
+PY

@@ -188,8 +188,6 @@
   "field_motion_model": "couptest_polynomial",
   "field_couptest_mode": "coupled_detached",
   "field_couptest_initial_existence_floor": 0.95,
-  "field_couptest_log_interval": 500,
-  "field_couptest_stats_max_points": 65536,
   "field_existence_start": 9000,
   "field_existence_temperature_start": 1.0,
   "field_existence_temperature_end": 0.35,

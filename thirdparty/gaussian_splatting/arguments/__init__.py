@@ -327,8 +327,6 @@ class ModelParams(ParamGroup):
         self.field_motion_model = "polynomial"
         self.field_couptest_mode = "none"
         self.field_couptest_initial_existence_floor = 0.95
-        self.field_couptest_log_interval = 500
-        self.field_couptest_stats_max_points = 65536
         self.field_couptest_grid_resolution = "auto_finest"
         self.field_couptest_grid_feature_dim = 8
         self.field_couptest_grid_hidden_dim = 32

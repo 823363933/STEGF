@@ -306,6 +306,74 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     def observation_reliability_enabled():
         return bool(getattr(gaussians, "field_obs_reliability", 0))
 
+    def observation_reliability_needed(iteration):
+        if not observation_reliability_enabled():
+            return False
+        start_iter = int(
+            getattr(gaussians, "field_obs_reliability_start", 1500)
+        )
+        if int(iteration) < start_iter:
+            return False
+        until_iter = int(
+            getattr(gaussians, "field_obs_reliability_until", -1)
+        )
+        if until_iter < 0 or int(iteration) <= until_iter:
+            return True
+
+        # A reliability floor below one still changes the RGB loss after the
+        # EMA collection window. The remaining flags consume its binary mask.
+        if float(
+            getattr(gaussians, "field_obs_reliability_floor", 0.35)
+        ) < 1.0:
+            return True
+        return any(
+            bool(getattr(gaussians, name, 0))
+            for name in (
+                "field_bg_prior",
+                "field_obs_reset",
+                "field_obs_boost_unreliable_loss",
+                "field_bg_median_loss",
+                "field_freq_prior",
+                "field_bg_only_train",
+            )
+        ) or (
+            bool(getattr(gaussians, "field_depthpro_supervision", 0))
+            and bool(
+                getattr(
+                    gaussians,
+                    "field_depthpro_exclude_unreliable",
+                    1,
+                )
+            )
+        )
+
+    def temporal_motion_map_needed(iteration):
+        if observation_reliability_needed(iteration):
+            return True
+        if static_radiance_enabled(iteration):
+            return True
+        if bool(getattr(gaussians, "field_staged_training", 0)):
+            return True
+        if bool(getattr(gaussians, "field_layer_responsibility", 0)):
+            start_iter = int(
+                getattr(
+                    gaussians,
+                    "field_layer_responsibility_start",
+                    3000,
+                )
+            )
+            until_iter = int(
+                getattr(
+                    gaussians,
+                    "field_layer_responsibility_until",
+                    -1,
+                )
+            )
+            return int(iteration) >= start_iter and (
+                until_iter < 0 or int(iteration) <= until_iter
+            )
+        return False
+
     def build_background_priors():
         if not (bool(getattr(gaussians, "field_bg_prior", 0)) or observation_reliability_enabled()):
             return {}
@@ -4383,16 +4451,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         return selected
 
     existence_stats_path = os.path.join(scene.model_path, "existence_moe_stats.jsonl")
-    couptest_stats_path = os.path.join(scene.model_path, "couptest_stats.jsonl")
     if first_iter <= 1:
         with open(existence_stats_path, "w", encoding="utf-8"):
             pass
-        if (
-            getattr(gaussians, "field_motion_model", "")
-            in {"couptest_polynomial", "couptest_grid"}
-        ):
-            with open(couptest_stats_path, "w", encoding="utf-8"):
-                pass
 
     for iteration in range(first_iter, opt.iterations + 1):
         if ems_main_enabled and iteration ==  opt.emsstart:
@@ -4518,7 +4579,11 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             for i in range(current_batch):
                 viewpoint_cam = camindex[i]
                 gt_image = get_gt_image(viewpoint_cam)
-                temporal_motion_map = get_temporal_motion_map(timeindex, viewpoint_cam)
+                temporal_motion_map = None
+                if temporal_motion_map_needed(iteration):
+                    temporal_motion_map = get_temporal_motion_map(
+                        timeindex, viewpoint_cam
+                    )
                 static_radiance_mask = get_static_radiance_mask(
                     iteration,
                     viewpoint_cam,
@@ -4553,10 +4618,24 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     content_exposure_params = detach_content_exposure_params(
                         getattr(gaussians, "_last_content_exposure_params", None)
                     )
-                if hasattr(gaussians, "update_error_prior"):
+                if (
+                    hasattr(gaussians, "update_error_prior")
+                    and not getattr(
+                        gaussians, "field_disable_legacy_aux", False
+                    )
+                ):
                     gaussians.update_error_prior(visibility_filter, image, gt_image, viewpoint_cam, render_pkg["means3D"].detach())
 
-                reliability, unreliable_mask = get_observation_reliability(iteration, viewpoint_cam, image, gt_image, temporal_motion_map)
+                if temporal_motion_map is None:
+                    reliability, unreliable_mask = None, None
+                else:
+                    reliability, unreliable_mask = get_observation_reliability(
+                        iteration,
+                        viewpoint_cam,
+                        image,
+                        gt_image,
+                        temporal_motion_map,
+                    )
                 bg_prior_source_mode = str(getattr(gaussians, "field_bg_prior_source", "background")).lower()
                 if bool(getattr(gaussians, "field_bg_prior", 0)) and bg_prior_source_mode != "obs_reset":
                     bg_prior_contexts.append(
@@ -4686,7 +4765,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         feature_dc_grad=feature_dc_grad,
                         position_grad=position_grad,
                     )
-                if hasattr(gaussians, "update_dynamic_scores"):
+                if (
+                    hasattr(gaussians, "update_dynamic_scores")
+                    and getattr(gaussians, "field_staged_training", False)
+                ):
                     gaussians.update_dynamic_scores(
                         visibility_filter,
                         image,
@@ -4696,7 +4778,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         viewspace_point_tensor,
                         temporal_motion_map=temporal_motion_map,
                     )
-                if hasattr(gaussians, "boost_background_candidate_gradients"):
+                if (
+                    hasattr(gaussians, "boost_background_candidate_gradients")
+                    and getattr(
+                        gaussians,
+                        "field_bg_candidate_grad_boost",
+                        False,
+                    )
+                ):
                     gaussians.boost_background_candidate_gradients(iteration)
                 gaussians.cache_gradient()
                 gaussians.optimizer.zero_grad(set_to_none = True)# 
@@ -4831,44 +4920,6 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     final_existence_stats["iteration"] = int(iteration)
                     with open(existence_stats_path, "a", encoding="utf-8") as stats_file:
                         stats_file.write(json.dumps(final_existence_stats, sort_keys=True) + "\n")
-
-            couptest_log_interval = max(
-                int(getattr(gaussians, "field_couptest_log_interval", 500)),
-                1,
-            )
-            if (
-                getattr(gaussians, "field_motion_model", "")
-                in {"couptest_polynomial", "couptest_grid"}
-                and (
-                    iteration % couptest_log_interval == 0
-                    or iteration == opt.iterations
-                )
-            ):
-                couptest_stats = gaussians.get_couptest_stats()
-                if couptest_stats:
-                    couptest_stats["iteration"] = int(iteration)
-                    with open(
-                        couptest_stats_path,
-                        "a",
-                        encoding="utf-8",
-                    ) as stats_file:
-                        stats_file.write(
-                            json.dumps(couptest_stats, sort_keys=True) + "\n"
-                        )
-                    scene.recordpoints(
-                        iteration,
-                        "couptest_{}_wr50{:.3f}_short{:.3f}_medium{:.3f}_"
-                        "long{:.3f}_r05p90{:.6g}".format(
-                            couptest_stats["mode"],
-                            couptest_stats["width_ratio"]["q50"],
-                            couptest_stats["width_groups"]["short"],
-                            couptest_stats["width_groups"]["medium"],
-                            couptest_stats["width_groups"]["long"],
-                            couptest_stats["times"]["t05"][
-                                "effective_residual_norm"
-                            ]["q90"],
-                        ),
-                    )
 
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
