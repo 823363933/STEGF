@@ -35,10 +35,11 @@ bash script/setup.sh
 conda activate STEGF
 ```
 
-The setup script creates or updates the `STEGF` environment from
-`script/environment.yml`, builds the three local extensions, and verifies that
-they can be imported. The repository-provided environment definition uses
-Python 3.7.13, PyTorch 1.12.1, and CUDA Toolkit 11.6.
+The setup script creates or updates the Python 3.8 `STEGF` Conda environment,
+installs PyTorch 2.0.0, torchvision 0.15.0, and torchaudio 2.0.0 from the CUDA
+11.8 wheel index, builds the three local extensions, and verifies that they can
+be imported. A CUDA compiler compatible with this PyTorch build must be
+available as `nvcc` while the extensions are built.
 
 ## Required data
 
