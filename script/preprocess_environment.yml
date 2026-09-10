@@ -1,0 +1,18 @@
+name: STEGF-preprocess
+channels:
+  - conda-forge
+  # Do not append machine-specific channels from ~/.condarc. Old or flaky
+  # mirrors make the preprocessing environment non-reproducible.
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  # Keep one Conda-managed NumPy installation. Installing an older pip NumPy
+  # over COLMAP's newer Conda dependency can leave a mixed, ABI-broken package.
+  - numpy=1.23.5
+  # COLMAP 4.1.0 fixed empty PatchMatch output on Blackwell GPUs. Pin the
+  # maintenance release and require its CUDA build because dense MVS needs it.
+  - "colmap=4.1.1=*cuda*"
+  # The current conda-forge COLMAP CUDA package links this library without
+  # declaring it as a runtime dependency.
+  - "libopenimageio=3.1.*"

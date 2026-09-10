@@ -65,6 +65,19 @@ def write_band(path, depth_like, low_q=10.0, high_q=30.0):
     cv2.imwrite(str(path), band)
 
 
+def normalize_midas_resize_types(transform):
+    """Make legacy MiDaS resize dimensions acceptable to recent OpenCV."""
+    for operation in getattr(transform, "transforms", ()):
+        get_size = getattr(operation, "get_size", None)
+        if get_size is None:
+            continue
+
+        def get_python_int_size(width, height, original=get_size):
+            return tuple(int(value) for value in original(width, height))
+
+        operation.get_size = get_python_int_size
+
+
 @torch.no_grad()
 def infer_depth_like(device, model, transform, image_rgb):
     image = transform({"image": image_rgb})["image"]
@@ -83,18 +96,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="Precompute MiDaS dpt_beit_large_512 raw depth-like arrays for DyNeRF COLMAP time slices."
     )
-    parser.add_argument("--scene", default="coffee_martini")
-    parser.add_argument("--dataset_root", default="dataset")
+    parser.add_argument(
+        "--scene",
+        required=True,
+        help="Scene directory name under --datapath.",
+    )
+    parser.add_argument(
+        "--datapath",
+        "--dataset_root",
+        dest="dataset_root",
+        default="dataset",
+        help="Root containing the scene directory.",
+    )
     parser.add_argument(
         "--output_dir",
-        default="dataset/MiDaS-BEiT-pre/coffee_martini/midas_beit_large_512",
-        help="Directory that contains or will contain colmap_<time>/camXX/raw_depth_like.npy.",
+        default=None,
+        help=(
+            "Output directory containing "
+            "colmap_<time>/camXX/raw_depth_like.npy. Defaults to "
+            "<datapath>/<scene>/midas_beit_large_512."
+        ),
     )
-    parser.add_argument("--time_indices", default="12,25,37,49")
+    parser.add_argument("--time_indices", default="0")
     parser.add_argument(
         "--midas_repo",
         default=None,
-        help="Path to OriginalRepository/MiDaS. Defaults to ../OriginalRepository/MiDaS from STEGF root.",
+        help="MiDaS checkout. Defaults to <STEGF>/thirdparty/MiDaS.",
     )
     parser.add_argument("--model_weights", default=None)
     parser.add_argument("--model_type", default="dpt_beit_large_512")
@@ -104,11 +131,18 @@ def main():
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
-    workspace_root = repo_root.parent
     dataset_root = resolve_path(args.dataset_root, repo_root)
     scene_root = dataset_root / args.scene
-    output_dir = resolve_path(args.output_dir, repo_root)
-    midas_repo = Path(args.midas_repo) if args.midas_repo else workspace_root / "OriginalRepository" / "MiDaS"
+    output_dir = (
+        resolve_path(args.output_dir, repo_root)
+        if args.output_dir
+        else scene_root / "midas_beit_large_512"
+    )
+    midas_repo = (
+        Path(args.midas_repo)
+        if args.midas_repo
+        else repo_root / "thirdparty" / "MiDaS"
+    )
     midas_repo = resolve_path(midas_repo, repo_root)
 
     if not scene_root.exists():
@@ -162,7 +196,22 @@ def main():
     from midas.model_loader import load_model
 
     if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available. Use --device cpu or run on the GPU server.")
+        raise RuntimeError(
+            "CUDA requested but not available. Use --device cpu or run on "
+            "a CUDA host."
+        )
+    if args.device == "cuda":
+        capability = torch.cuda.get_device_capability()
+        required_arch = f"sm_{capability[0]}{capability[1]}"
+        supported_arches = set(torch.cuda.get_arch_list())
+        if required_arch not in supported_arches:
+            raise RuntimeError(
+                "The installed PyTorch does not support GPU architecture {} "
+                "({}). Rerun bash script/setup_preprocess.sh to install the "
+                "pinned Blackwell-compatible build.".format(
+                    required_arch, torch.cuda.get_device_name()
+                )
+            )
     device = torch.device(args.device)
     torch.backends.cudnn.enabled = True
     torch.backends.cudnn.benchmark = True
@@ -175,6 +224,7 @@ def main():
         height=None,
         square=False,
     )
+    normalize_midas_resize_types(transform)
     model.eval()
 
     manifest = {

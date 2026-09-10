@@ -19,9 +19,10 @@ __pycache__/
 .vscode/
 .idea/
 
-# Optional external/vendor directories not used by STEGF runtime
+# Optional external/vendor directories not required by the training runtime
 forthparty/
 thirdparty/sibr_core/
+thirdparty/MiDaS/
 
 # Local extension build products
 thirdparty/mmcv/build/

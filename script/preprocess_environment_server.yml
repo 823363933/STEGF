@@ -1,0 +1,17 @@
+name: STEGF-preprocess
+channels:
+  - conda-forge
+  # Ignore machine-specific channels configured in the server's ~/.condarc.
+  - nodefaults
+dependencies:
+  - python=3.8
+  - pip
+  # Keep NumPy compatible with OpenCV 4.8.1 and Open3D 0.17 while avoiding
+  # mixed Conda/pip NumPy installations.
+  - numpy=1.23.5
+  # Dense PatchMatch requires the CUDA build. COLMAP 4.1.1 also contains the
+  # fix for empty PatchMatch results on newer NVIDIA architectures.
+  - "colmap=4.1.1=*cuda*"
+  # The conda-forge COLMAP CUDA package links this runtime library without
+  # consistently declaring it as a dependency.
+  - "libopenimageio=3.1.*"
