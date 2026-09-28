@@ -412,6 +412,11 @@ class ModelParams(ParamGroup):
         self.field_mvstruct_specialize_feature_delta = 0.05
         self.field_mvstruct_specialize_offset_ratio = 0.5
         self.field_mvstruct_specialize_scale_ratio = 0.5
+        self.field_temporal_visibility_densify = 0
+        self.field_temporal_visibility_min_opacity = 0.05
+        self.field_temporal_adaptive_threshold = 0
+        self.field_temporal_adaptive_alpha = 0.8
+        self.field_temporal_adaptive_beta = 0.75
         self.field_layer_responsibility = 0
         self.field_layer_responsibility_start = 3000
         self.field_layer_responsibility_until = 18000

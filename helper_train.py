@@ -214,8 +214,9 @@ def controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filt
 
     elif densify == 3: # techni
         if iteration < opt.densify_until_iter :
-            gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-            gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            if not bool(getattr(gaussians, "field_temporal_visibility_densify", False)):
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
             if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                 if flag < opt.desicnt:

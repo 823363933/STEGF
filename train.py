@@ -227,6 +227,19 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     _init_status("4/5 Building optimizer and gradient caches")
     gaussians.training_setup(opt)
+    if bool(getattr(gaussians, "field_temporal_visibility_densify", False)) or bool(
+        getattr(gaussians, "field_temporal_adaptive_threshold", False)
+    ):
+        _init_status(
+            "Temporal-adaptive densification: VAD={}, opacity_min={:.3f}, "
+            "TAT={}, alpha={:.3f}, beta={:.3f}".format(
+                int(bool(getattr(gaussians, "field_temporal_visibility_densify", False))),
+                float(getattr(gaussians, "field_temporal_visibility_min_opacity", 0.05)),
+                int(bool(getattr(gaussians, "field_temporal_adaptive_threshold", False))),
+                float(getattr(gaussians, "field_temporal_adaptive_alpha", 0.8)),
+                float(getattr(gaussians, "field_temporal_adaptive_beta", 0.75)),
+            )
+        )
     
     numchannel = 9 
 
@@ -4454,6 +4467,16 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     if first_iter <= 1:
         with open(existence_stats_path, "w", encoding="utf-8"):
             pass
+    temporal_densify_stats_path = os.path.join(
+        scene.model_path,
+        "temporal_densify_stats.jsonl",
+    )
+    temporal_densify_enabled = bool(
+        getattr(gaussians, "field_temporal_visibility_densify", False)
+    ) or bool(getattr(gaussians, "field_temporal_adaptive_threshold", False))
+    if temporal_densify_enabled and first_iter <= 1:
+        with open(temporal_densify_stats_path, "w", encoding="utf-8"):
+            pass
 
     for iteration in range(first_iter, opt.iterations + 1):
         if ems_main_enabled and iteration ==  opt.emsstart:
@@ -4748,7 +4771,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     if viewpoint_cam.image_name not in lossdiect:
                         lossdiect[viewpoint_cam.image_name] = loss.item()
                         ssimdict[viewpoint_cam.image_name] = ssim(image.clone().detach(), gt_image.clone().detach()).item()
-                
+
                 retain_graph = (not hard_mvstruct_event) and i < (current_batch - 1)
                 loss.backward(retain_graph=retain_graph)
                 if mvstruct_event and hasattr(gaussians, "mvstruct_capture_view"):
@@ -4762,6 +4785,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         viewspace_point_tensor.grad.detach() if viewspace_point_tensor.grad is not None else None,
                         visibility_filter.detach(),
                         radii.detach(),
+                        point_opacity=render_pkg.get("opacity"),
                         feature_dc_grad=feature_dc_grad,
                         position_grad=position_grad,
                     )
@@ -4942,13 +4966,59 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 else:
                     bg_candidate_mask = gaussians.get_background_candidate_mask()
                     stats_filter = visibility_filter & bg_candidate_mask
+                if bool(getattr(gaussians, "field_temporal_visibility_densify", False)):
+                    point_opacity = render_pkg.get("opacity")
+                    if (
+                        torch.is_tensor(point_opacity)
+                        and point_opacity.shape[0] == stats_filter.shape[0]
+                    ):
+                        stats_filter = stats_filter & (
+                            point_opacity.detach().reshape(-1)
+                            > float(
+                                getattr(
+                                    gaussians,
+                                    "field_temporal_visibility_min_opacity",
+                                    0.05,
+                                )
+                            )
+                        )
                 if torch.count_nonzero(stats_filter) > 0:
                     gaussians.max_radii2D[stats_filter] = torch.max(gaussians.max_radii2D[stats_filter], radii[stats_filter])
                     if bool(getattr(gaussians, "field_highfreq_densify", 0)) and densify_point_gate is not None:
-                        gaussians.add_densification_stats_with_gate(viewspace_point_tensor, stats_filter, densify_point_gate)
+                        gaussians.add_densification_stats_with_gate(
+                            viewspace_point_tensor,
+                            stats_filter,
+                            densify_point_gate,
+                            point_opacity=render_pkg.get("opacity"),
+                        )
                     else:
-                        gaussians.add_densification_stats(viewspace_point_tensor, stats_filter)
+                        gaussians.add_densification_stats(
+                            viewspace_point_tensor,
+                            stats_filter,
+                            point_opacity=render_pkg.get("opacity"),
+                        )
+            control_flag_before = int(flag)
             flag = controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filter, radii, viewspace_point_tensor, flag,  traincamerawithdistance=None, maxbounds=maxbounds,minbounds=minbounds)
+            control_due = (
+                iteration > opt.densify_from_iter
+                and iteration < opt.densify_until_iter
+                and iteration % opt.densification_interval == 0
+            )
+            if (
+                temporal_densify_enabled
+                and control_due
+                and control_flag_before < opt.desicnt
+            ):
+                temporal_densify_record = dict(
+                    getattr(gaussians, "_last_temporal_densify_stats", {})
+                )
+                temporal_densify_record.update(
+                    {"iteration": int(iteration), "source": "legacy"}
+                )
+                with open(temporal_densify_stats_path, "a", encoding="utf-8") as stats_file:
+                    stats_file.write(
+                        json.dumps(temporal_densify_record, sort_keys=True) + "\n"
+                    )
             dense_added_post_control = run_dense_background_add(iteration)
             if dense_added_post_control > 0:
                 scene.recordpoints(iteration, "bg_dense_add_post_control_" + str(dense_added_post_control))
@@ -5231,6 +5301,16 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         scene.cameras_extent,
                     )
                     if isinstance(mvstruct_stats, dict) and int(mvstruct_stats.get("due", 0)) > 0:
+                        if temporal_densify_enabled:
+                            temporal_densify_record = dict(mvstruct_stats)
+                            temporal_densify_record.update(
+                                {"iteration": int(iteration), "source": "mvstruct"}
+                            )
+                            with open(temporal_densify_stats_path, "a", encoding="utf-8") as stats_file:
+                                stats_file.write(
+                                    json.dumps(temporal_densify_record, sort_keys=True)
+                                    + "\n"
+                                )
                         scene.recordpoints(
                             iteration,
                             (
@@ -5299,7 +5379,6 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                                 float(mvstruct_stats.get("score_max", 0.0)),
                             ),
                         )
-                
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
 

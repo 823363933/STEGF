@@ -25,7 +25,19 @@ thirdparty/sibr_core/
 thirdparty/MiDaS/
 
 # Local extension build products
+*.so
 thirdparty/mmcv/build/
 thirdparty/mmcv/mmcv.egg-info/
 thirdparty/gaussian_splatting/submodules/gaussian_rasterization_ch9/diff_gaussian_rasterization_ch9.egg-info/
 thirdparty/gaussian_splatting/submodules/simple-knn/*egg-info/
+
+# Local research history, references, and workstation helpers
+/.codex/
+/AGENTS.md
+/reference/
+/sync.sh
+/sync_to_windows.sh
+/sync_to_wsl.sh
+/script/re.md
+/docs/*
+!/docs/Static Grid Shared Evidence Training Plan.md

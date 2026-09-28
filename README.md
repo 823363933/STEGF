@@ -18,6 +18,9 @@ reproduction case, not a hard-coded model restriction.
   width, so motion loss does not directly change the lifetime width.
 - Appearance: static Euler-grid residual and trainable luma/white-balance
   exposure correction.
+- Scene-specific densification: configurations that benefited from VAD/TAT
+  use temporal-opacity-weighted gradient accumulation and a lifetime-aware
+  densification threshold; other scenes retain the standard final schedule.
 - Disabled final branches: dynamic Euler grid, staged routing, EMS guided
   sampling, temporal refinement, Carrier motion, spatiotemporal bubbles, and
   piecewise-velocity motion.
@@ -85,9 +88,9 @@ stage such as MiDaS remains.
 
 ## Dataset convention
 
-The final N3D runner uses a scene-independent layout. Let `<location>` be the
-data root passed with `--datapath`, and let `<scene>` be the scene name passed
-with `--scene`:
+The integrated runner supports N3D and Technicolor with the same
+scene-independent layout. Let `<location>` be the data root passed with
+`--datapath`, and let `<scene>` be the scene name passed with `--scene`:
 
 ```text
 <location>/
@@ -96,7 +99,8 @@ with `--scene`:
 │   ├── colmap_1/
 │   ├── ...
 │   ├── colmap_<duration-1>/
-│   ├── poses_bounds.npy
+│   ├── poses_bounds.npy                 # required by N3D only
+│   ├── cameras_parameters.txt           # Technicolor provenance
 │   ├── dense_points.ply                 # optional
 │   └── midas_beit_large_512/            # optional
 └── output/
@@ -109,13 +113,15 @@ remaining time slices as sibling `colmap_*` directories. Unless `--savepath`
 is provided explicitly, outputs are written to
 `<location>/output/<scene>`.
 
-The indispensable scene data is `poses_bounds.npy` and the complete sequence
-of `colmap_<time>` directories. `dense_points.ply` is required only when
+The complete sequence of `colmap_<time>` directories is indispensable.
+N3D additionally requires `poses_bounds.npy`. Technicolor camera calibration
+is converted into the COLMAP models during preprocessing, so training does
+not require `poses_bounds.npy`; the copied `cameras_parameters.txt` is kept
+for provenance. `dense_points.ply` is required only when
 `field_dense_initialization=1`. `midas_beit_large_512/` is required only when
 background point insertion and its MiDaS filter are both enabled. The generic
-`default.json` disables both optional mechanisms; the dedicated
-`coffee_martini.json` enables both for exact reproduction of the reference
-model.
+N3D `default.json` disables both optional mechanisms; dedicated scene
+configurations enable only the inputs prepared for that scene.
 
 ### One-command preprocessing from videos
 
@@ -133,6 +139,12 @@ The videos must be synchronized, and the rows of `poses_bounds.npy` must
 correspond to `cam*.mp4` after filename sorting. The script consumes existing
 LLFF/N3D camera calibration; it does not infer camera poses for uncalibrated
 videos.
+
+The repository includes scene configurations for all six public N3D scenes:
+`coffee_martini`, `cook_spinach`, `cut_roasted_beef`, `flame_salmon_1`,
+`flame_steak`, and `sear_steak`. They use 50 consecutive source frames at
+`resolution=2`. Unless `--source_start_frame` is provided, preprocessing
+starts from source frame 0.
 
 Prepare every artifact enabled by the resolved scene configuration with one
 command:
@@ -176,6 +188,27 @@ Completed `colmap_<time>` results are skipped. An interrupted hidden build
 workspace is replaced only when `--restart_incomplete` is supplied; an
 incomplete published `colmap_<time>` is never deleted automatically.
 
+### Technicolor preprocessing
+
+The Technicolor preprocessor consumes the official undistorted PNG sequence
+and `cameras_parameters.txt`, builds the same 50-slice COLMAP structure, and
+optionally reconstructs `dense_points.ply` according to the resolved scene
+configuration:
+
+```bash
+conda activate STEGF-preprocess
+python script/preprocess_tech_scene.py \
+  --scene Fabien \
+  --inputpath dataset/Tech \
+  --datapath dataset/Tech-pre
+```
+
+The public Technicolor configurations are `Birthday`, `Fabien`, `Painter`,
+`Theater`, and `Train`. Their official sequence offsets are applied
+automatically unless `--source_start_frame` is provided. The current final
+configurations enable frame-0 dense initialization and do not enable the N3D
+open-background MiDaS path.
+
 ### Per-time RGB images and sparse point clouds
 
 For a sequence with `duration=N`, the scene must contain `colmap_0` through
@@ -193,8 +226,8 @@ For a sequence with `duration=N`, the scene must contain `colmap_0` through
 
 Every time slice must contain the same camera image names. In addition,
 `colmap_0/sparse/0/` must contain `cameras.bin` and `images.bin`, whose image
-names must correspond to the PNG files. The scene-level `poses_bounds.npy` is
-also required.
+names must correspond to the PNG files. N3D scenes additionally require the
+scene-level `poses_bounds.npy`; Technicolor scenes do not.
 
 The loader concatenates `points3D.bin` from all time slices into
 `colmap_0/sparse/0/points3D_total<N>.ply`. This file is an optional generated
@@ -304,14 +337,14 @@ The complete reference layout is:
     └── coffee_martini/
 ```
 
-For configuration lookup, the runner first tries
+For N3D configuration lookup, the runner first tries
 `configs/n3d_ours/<scene>.json`. If it does not exist, it uses
 `configs/n3d_ours/default.json`, which contains the final model with a
 50-frame N3D schedule but disables dense initialization, background point
-insertion, and the MiDaS filter. Copy it to `<scene>.json` and enable only the
-optional mechanisms for which the scene has been preprocessed. A
-scene-specific configuration should also be added when duration, resolution,
-or other scene-dependent training settings differ from the defaults.
+insertion, and the MiDaS filter. Technicolor uses the dedicated
+`configs/tech_ours/<scene>.json` files and has no generic fallback. A
+scene-specific configuration should be added when duration, resolution, or
+other scene-dependent training settings differ from the defaults.
 
 For a new scene, the relevant optional switches are:
 
@@ -326,10 +359,20 @@ For a new scene, the relevant optional switches are:
 
 ## Train and test
 
-The complete standard workflow is:
+The runner defaults to the N3D profile, so the existing complete workflow is
+unchanged:
 
 ```bash
 python script/run_n3d_train_test.py --scene coffee_martini
+```
+
+Select the Technicolor profile explicitly. It resolves
+`configs/tech_ours/Fabien.json`, uses `technicolorvalid` for evaluation, reads
+`/root/autodl-tmp/Fabien/colmap_0`, and writes
+`/root/autodl-tmp/output/Fabien`:
+
+```bash
+python script/run_n3d_train_test.py --dataset tech --scene Fabien
 ```
 
 Another scene stored under the default data root can be started directly:
@@ -360,9 +403,9 @@ This reads `/data/n3d/cook_spinach/colmap_0` and writes
 `/data/stegf-output/cook_spinach`. The older names `--data_root` and
 `--output_root` remain accepted as aliases.
 
-It uses the standard 30,000-iteration training schedule, saves the final
-checkpoint, and evaluates it with the `colmapvalid` loader. The default output
-directory is:
+It uses the standard 30,000-iteration training schedule and saves and tests
+the final checkpoint. N3D evaluation uses `colmapvalid`; Technicolor uses
+`technicolorvalid`. The default N3D output directory is:
 
 ```text
 /root/autodl-tmp/output/coffee_martini
@@ -395,14 +438,43 @@ python script/test_all_iterations.py \
   --source_path /root/autodl-tmp/coffee_martini/colmap_0
 ```
 
+### Compact inference export
+
+The final static appearance grid is queried at canonical Gaussian positions.
+After training, its training-camera mean contribution can be baked into the
+per-Gaussian appearance features and the grid can be removed from the saved
+inference checkpoint:
+
+```bash
+python script/export_compact_model.py \
+  --quiet --eval \
+  --test_iteration 30000 \
+  --valloader colmapvalid \
+  --configpath configs/n3d_ours/coffee_martini.json \
+  --model_path /root/autodl-tmp/output/coffee_martini \
+  --source_path /root/autodl-tmp/coffee_martini/colmap_0
+```
+
+The source checkpoint is never modified. By default the exporter writes a
+separate model under `<model_path>/compact`, verifies frames 0, 25, and 49 in
+memory, saves `compact_config.json`, and prints the exact evaluation command.
+Use `--output_model_path` to choose another destination and `--overwrite` only
+when intentionally replacing an existing compact checkpoint at the same
+iteration. The compact artifact is an inference model; training should
+continue from the original checkpoint.
+
 ## Project layout
 
 - `train.py`: training entry point.
 - `test.py`: rendering and evaluation entry point.
-- `script/run_n3d_train_test.py`: standard final-model workflow.
+- `script/run_n3d_train_test.py`: integrated N3D/Technicolor final-model
+  workflow (`--dataset n3d|tech`).
 - `script/test_all_iterations.py`: checkpoint evaluation runner.
 - `script/preprocess_n3d_scene.py`: integrated N3D video-to-STEGF scene
   preprocessing.
+- `script/preprocess_tech_scene.py`: integrated Technicolor PNG-to-STEGF scene
+  preprocessing.
+- `script/export_compact_model.py`: static-grid-baked compact inference export.
 - `script/setup_preprocess.sh`: separate COLMAP/Open3D/MiDaS environment
   setup.
 - `script/precompute_midas_beit_depth_like.py`: standalone optional MiDaS
@@ -410,6 +482,7 @@ python script/test_all_iterations.py \
 - `configs/n3d_ours/default.json`: generic final-model defaults for N3D
   scenes without a dedicated configuration.
 - `configs/n3d_ours/coffee_martini.json`: final experiment configuration.
+- `configs/tech_ours`: final-model Technicolor scene configurations.
 - `thirdparty/gaussian_splatting`: Gaussian model, renderer, and CUDA
   rasterizer sources.
 - `helper_train.py`, `helper_model.py`: training and model utilities.

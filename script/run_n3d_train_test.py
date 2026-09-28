@@ -6,7 +6,24 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_SCENES = ("coffee_martini",)
+DATASET_PROFILES = {
+    "n3d": {
+        "label": "N3D",
+        "default_scenes": ("coffee_martini",),
+        "config_dir": "configs/n3d_ours",
+        "valloader": "colmapvalid",
+        "requires_poses_bounds": True,
+        "config_loader": None,
+    },
+    "tech": {
+        "label": "Technicolor",
+        "default_scenes": ("Fabien",),
+        "config_dir": "configs/tech_ours",
+        "valloader": "technicolorvalid",
+        "requires_poses_bounds": False,
+        "config_loader": "technicolor",
+    },
+}
 
 
 def get_model_path(args, scene, repeat_idx=None):
@@ -112,13 +129,29 @@ def parse_time_indices(value, duration):
     return sorted(set(indices or [0]))
 
 
-def validate_scene_data(scene, source_path, config, repo_root):
+def validate_scene_data(
+    scene,
+    source_path,
+    config,
+    repo_root,
+    dataset_profile,
+):
     missing = []
     scene_root = source_path.parent
     duration = int(config.get("duration", 50))
-    poses_path = scene_root / "poses_bounds.npy"
-    if not poses_path.is_file():
-        missing.append(str(poses_path))
+    if dataset_profile["requires_poses_bounds"]:
+        poses_path = scene_root / "poses_bounds.npy"
+        if not poses_path.is_file():
+            missing.append(str(poses_path))
+
+    expected_loader = dataset_profile["config_loader"]
+    if expected_loader is not None:
+        configured_loader = str(config.get("loader", "")).strip()
+        if configured_loader != expected_loader:
+            missing.append(
+                "{}: expected loader={!r}, got {!r}"
+                .format(scene, expected_loader, configured_loader)
+            )
     for time_index in range(duration):
         colmap_path = scene_root / f"colmap_{time_index}"
         image_path = colmap_path / "images"
@@ -200,7 +233,13 @@ def run_command(cmd, repo_root, dry_run):
     return subprocess.run(cmd, cwd=repo_root).returncode
 
 
-def validate_paths(args, scenes, repo_root, dry_run=False):
+def validate_paths(
+    args,
+    scenes,
+    repo_root,
+    dataset_profile,
+    dry_run=False,
+):
     missing = []
     for scene in scenes:
         source_path = Path(args.data_root) / scene / args.colmap_subdir
@@ -219,6 +258,7 @@ def validate_paths(args, scenes, repo_root, dry_run=False):
                         source_path,
                         get_scene_config(config_path),
                         repo_root,
+                        dataset_profile,
                     )
                 )
     if missing:
@@ -227,13 +267,27 @@ def validate_paths(args, scenes, repo_root, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train and test DyNeRF/N3D STEGF scenes with one command."
+        description=(
+            "Train and test N3D or Technicolor STEGF scenes with one command."
+        )
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=tuple(DATASET_PROFILES),
+        default="n3d",
+        help=(
+            "Dataset profile. Selects the default configuration directory, "
+            "validation loader, and required scene metadata (default: n3d)."
+        ),
     )
     parser.add_argument(
         "--scenes",
         nargs="+",
-        default=list(DEFAULT_SCENES),
-        help="Scene names to run sequentially.",
+        default=None,
+        help=(
+            "Scene names to run sequentially. Defaults to coffee_martini for "
+            "N3D and Fabien for Technicolor."
+        ),
     )
     parser.add_argument(
         "--scene",
@@ -259,7 +313,14 @@ def main():
             "<datapath>/output."
         ),
     )
-    parser.add_argument("--config_dir", default="configs/n3d_ours", help="Directory containing <scene>.json configs.")
+    parser.add_argument(
+        "--config_dir",
+        default=None,
+        help=(
+            "Directory containing <scene>.json configs. Defaults to the "
+            "directory selected by --dataset."
+        ),
+    )
     parser.add_argument("--colmap_subdir", default="colmap_0", help="Scene subdirectory used as --source_path.")
     parser.add_argument(
         "--iterations",
@@ -280,7 +341,14 @@ def main():
         default=[30000],
         help="Checkpoint iterations to test after training.",
     )
-    parser.add_argument("--valloader", default="colmapvalid", help="Validation loader passed to test_all_iterations.py.")
+    parser.add_argument(
+        "--valloader",
+        default=None,
+        help=(
+            "Validation loader passed to test_all_iterations.py. Defaults to "
+            "colmapvalid for N3D and technicolorvalid for Technicolor."
+        ),
+    )
     parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
     parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")
     parser.add_argument("--continue_on_error", action="store_true", help="Continue with later stages after a failure.")
@@ -296,8 +364,24 @@ def main():
         parser.error("--re must be >= 1")
 
     repo_root = Path(__file__).resolve().parents[1]
-    scenes = [args.scene] if args.scene else list(args.scenes)
-    validate_paths(args, scenes, repo_root, dry_run=args.dry_run)
+    dataset_profile = DATASET_PROFILES[args.dataset]
+    if args.config_dir is None:
+        args.config_dir = dataset_profile["config_dir"]
+    if args.valloader is None:
+        args.valloader = dataset_profile["valloader"]
+    if args.scene:
+        scenes = [args.scene]
+    elif args.scenes:
+        scenes = list(args.scenes)
+    else:
+        scenes = list(dataset_profile["default_scenes"])
+    validate_paths(
+        args,
+        scenes,
+        repo_root,
+        dataset_profile,
+        dry_run=args.dry_run,
+    )
 
     failures = []
     for scene in scenes:
@@ -322,12 +406,15 @@ def main():
                     else ""
                 )
                 print(
-                    f"\n[STEGF] ===== Scene: {scene}{variant} =====",
+                    f"\n[STEGF] ===== Dataset: "
+                    f"{dataset_profile['label']} | Scene: {scene}"
+                    f"{variant} =====",
                     flush=True,
                 )
             else:
                 print(
-                    f"\n[STEGF] ===== Scene: {scene} | "
+                    f"\n[STEGF] ===== Dataset: "
+                    f"{dataset_profile['label']} | Scene: {scene} | "
                     f"couptest {couptest_mode} | repeat "
                     f"{repeat_idx}/{args.re} =====",
                     flush=True,
@@ -335,6 +422,7 @@ def main():
                 print(f"[STEGF] Repeat output: {model_path}", flush=True)
 
             failure_label = model_path.name
+            train_succeeded = True
             if not args.skip_train_stage:
                 code = run_command(
                     build_train_command(
@@ -348,11 +436,11 @@ def main():
                     args.dry_run,
                 )
                 if code != 0:
+                    train_succeeded = False
                     failures.append((failure_label, "train", code))
                     if not args.continue_on_error:
                         break
-
-            if not args.skip_test_stage:
+            if not args.skip_test_stage and train_succeeded:
                 code = run_command(
                     build_test_command(
                         args,

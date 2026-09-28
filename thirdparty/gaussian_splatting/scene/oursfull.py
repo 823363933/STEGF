@@ -777,6 +777,11 @@ class GaussianModel:
         self.field_mvstruct_specialize_feature_delta = 0.05
         self.field_mvstruct_specialize_offset_ratio = 0.5
         self.field_mvstruct_specialize_scale_ratio = 0.5
+        self.field_temporal_visibility_densify = False
+        self.field_temporal_visibility_min_opacity = 0.05
+        self.field_temporal_adaptive_threshold = False
+        self.field_temporal_adaptive_alpha = 0.8
+        self.field_temporal_adaptive_beta = 0.75
         self.field_layer_responsibility = False
         self.field_layer_responsibility_start = 3000
         self.field_layer_responsibility_until = 18000
@@ -796,6 +801,7 @@ class GaussianModel:
         self.field_layer_debug_max_events = 4
         self._mvstruct_gradient_accum = None
         self._mvstruct_visibility_count = None
+        self._mvstruct_observation_count = None
         self._mvstruct_max_radii2D = None
         self._mvstruct_last_topology_iter = None
         self._mvstruct_conflict_accum = None
@@ -806,6 +812,7 @@ class GaussianModel:
         self._mvstruct_event_records = []
         self._mvstruct_budget_reference_points = 0
         self._mvstruct_total_added = 0
+        self._last_temporal_densify_stats = {}
         self.field_appearance_only_train = False
         self.field_appearance_only_start = 20000
         self.field_appearance_only_allow = "f_dc,f_t,decoder"
@@ -2287,6 +2294,20 @@ class GaussianModel:
         self.field_mvstruct_specialize_feature_delta = float(getattr(args, "field_mvstruct_specialize_feature_delta", 0.05))
         self.field_mvstruct_specialize_offset_ratio = float(getattr(args, "field_mvstruct_specialize_offset_ratio", 0.5))
         self.field_mvstruct_specialize_scale_ratio = float(getattr(args, "field_mvstruct_specialize_scale_ratio", 0.5))
+        self.field_temporal_visibility_densify = bool(getattr(args, "field_temporal_visibility_densify", 0))
+        self.field_temporal_visibility_min_opacity = max(
+            float(getattr(args, "field_temporal_visibility_min_opacity", 0.05)),
+            0.0,
+        )
+        self.field_temporal_adaptive_threshold = bool(getattr(args, "field_temporal_adaptive_threshold", 0))
+        self.field_temporal_adaptive_alpha = max(
+            float(getattr(args, "field_temporal_adaptive_alpha", 0.8)),
+            0.0,
+        )
+        self.field_temporal_adaptive_beta = min(
+            max(float(getattr(args, "field_temporal_adaptive_beta", 0.75)), 0.0),
+            1.0,
+        )
         self.field_layer_responsibility = bool(getattr(args, "field_layer_responsibility", 0))
         self.field_layer_responsibility_start = int(getattr(args, "field_layer_responsibility_start", 3000))
         self.field_layer_responsibility_until = int(getattr(args, "field_layer_responsibility_until", 18000))
@@ -3536,6 +3557,9 @@ class GaussianModel:
             if single_expert == "transient":
                 transient_center = self.get_trbfcenter.detach().squeeze(1)
                 motion_anchor = self._motion_time_anchor.detach().squeeze(1)
+                center_anchor_absdelta = torch.abs(
+                    transient_center - motion_anchor
+                )
                 stats.update(
                     {
                         "transient_center_p50": float(
@@ -3552,17 +3576,13 @@ class GaussianModel:
                         ),
                         "center_anchor_absdiff_p50": float(
                             torch.quantile(
-                                torch.abs(
-                                    transient_center - motion_anchor
-                                ),
+                                center_anchor_absdelta,
                                 0.50,
                             ).item()
                         ),
                         "center_anchor_absdiff_p90": float(
                             torch.quantile(
-                                torch.abs(
-                                    transient_center - motion_anchor
-                                ),
+                                center_anchor_absdelta,
                                 0.90,
                             ).item()
                         ),
@@ -5264,6 +5284,10 @@ class GaussianModel:
             raise RuntimeError("Polynomial coefficients contain a non-finite value")
         if not bool(torch.all(torch.isfinite(self._trbf_scale))):
             raise RuntimeError("Couptest log widths contain a non-finite value")
+        if not bool(torch.all(torch.isfinite(self.get_trbfcenter))):
+            raise RuntimeError("Couptest time centers contain a non-finite value")
+        if not bool(torch.all(torch.isfinite(self._motion_time_anchor))):
+            raise RuntimeError("Couptest motion anchors contain a non-finite value")
         if not bool(
             torch.allclose(
                 self._motion_time_anchor,
@@ -6451,6 +6475,11 @@ class GaussianModel:
             "field_mvstruct_specialize_feature_delta": self.field_mvstruct_specialize_feature_delta,
             "field_mvstruct_specialize_offset_ratio": self.field_mvstruct_specialize_offset_ratio,
             "field_mvstruct_specialize_scale_ratio": self.field_mvstruct_specialize_scale_ratio,
+            "field_temporal_visibility_densify": int(self.field_temporal_visibility_densify),
+            "field_temporal_visibility_min_opacity": self.field_temporal_visibility_min_opacity,
+            "field_temporal_adaptive_threshold": int(self.field_temporal_adaptive_threshold),
+            "field_temporal_adaptive_alpha": self.field_temporal_adaptive_alpha,
+            "field_temporal_adaptive_beta": self.field_temporal_adaptive_beta,
             "field_layer_responsibility": int(self.field_layer_responsibility),
             "field_layer_responsibility_start": self.field_layer_responsibility_start,
             "field_layer_responsibility_until": self.field_layer_responsibility_until,
@@ -6581,6 +6610,31 @@ class GaussianModel:
     def _load_aux_payload(self, path):
         ckpt = torch.load(path.replace(".ply", ".pt"), map_location="cpu")
         if isinstance(ckpt, dict) and "rgbdecoder" in ckpt:
+            compact_export = ckpt.get("compact_export")
+            if compact_export is not None:
+                if not isinstance(compact_export, dict):
+                    raise RuntimeError(
+                        "Compact checkpoint metadata must be a dictionary"
+                    )
+                compact_schema = compact_export.get("schema")
+                if compact_schema != "stegf_compact_static_grid_bake_v1":
+                    raise RuntimeError(
+                        "Unsupported compact checkpoint schema: "
+                        f"{compact_schema!r}"
+                    )
+                field_config = ckpt.get("field_config", {})
+                if bool(field_config.get("use_euler_field", True)):
+                    raise RuntimeError(
+                        "Compact static-grid-baked checkpoint must store "
+                        "use_euler_field=0"
+                    )
+                print(
+                    "[STEGF][Init][Gaussians] Loading compact static-grid-"
+                    "baked checkpoint: schema={}, training_cameras={}".format(
+                        compact_schema,
+                        compact_export.get("training_camera_centers", "unknown"),
+                    )
+                )
             if self.rgbdecoder is not None and ckpt.get("rgbdecoder") is not None:
                 self.rgbdecoder.load_state_dict(ckpt["rgbdecoder"])
             return ckpt
@@ -7174,6 +7228,11 @@ class GaussianModel:
             self.field_mvstruct_specialize_feature_delta = float(config.get("field_mvstruct_specialize_feature_delta", self.field_mvstruct_specialize_feature_delta))
             self.field_mvstruct_specialize_offset_ratio = float(config.get("field_mvstruct_specialize_offset_ratio", self.field_mvstruct_specialize_offset_ratio))
             self.field_mvstruct_specialize_scale_ratio = float(config.get("field_mvstruct_specialize_scale_ratio", self.field_mvstruct_specialize_scale_ratio))
+            self.field_temporal_visibility_densify = bool(config.get("field_temporal_visibility_densify", int(self.field_temporal_visibility_densify)))
+            self.field_temporal_visibility_min_opacity = max(float(config.get("field_temporal_visibility_min_opacity", self.field_temporal_visibility_min_opacity)), 0.0)
+            self.field_temporal_adaptive_threshold = bool(config.get("field_temporal_adaptive_threshold", int(self.field_temporal_adaptive_threshold)))
+            self.field_temporal_adaptive_alpha = max(float(config.get("field_temporal_adaptive_alpha", self.field_temporal_adaptive_alpha)), 0.0)
+            self.field_temporal_adaptive_beta = min(max(float(config.get("field_temporal_adaptive_beta", self.field_temporal_adaptive_beta)), 0.0), 1.0)
             self.field_layer_responsibility = bool(config.get("field_layer_responsibility", int(self.field_layer_responsibility)))
             self.field_layer_responsibility_start = int(config.get("field_layer_responsibility_start", self.field_layer_responsibility_start))
             self.field_layer_responsibility_until = int(config.get("field_layer_responsibility_until", self.field_layer_responsibility_until))
@@ -9576,13 +9635,46 @@ class GaussianModel:
 
     def densify_pruneclone(self, max_grad, min_opacity, extent, max_screen_size, splitN=1):
         grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
+        threshold_multiplier = self._temporal_densify_threshold_multiplier()
+        effective_grads = grads
+        if threshold_multiplier is not None:
+            effective_grads = grads / threshold_multiplier.reshape(-1, 1).clamp_min(1e-12)
+        if bool(getattr(self, "field_temporal_visibility_densify", False)) or bool(
+            getattr(self, "field_temporal_adaptive_threshold", False)
+        ):
+            width_ratio = self._temporal_densify_width_ratio()
+            candidate = effective_grads.squeeze(1) >= float(max_grad)
+            self._last_temporal_densify_stats = self._temporal_densify_selection_stats(
+                candidate,
+                width_ratio,
+                threshold_multiplier,
+            )
+            self._last_temporal_densify_stats.update(
+                {
+                    "source": "legacy",
+                    "visibility_weighted": int(bool(getattr(self, "field_temporal_visibility_densify", False))),
+                    "adaptive_threshold": int(bool(getattr(self, "field_temporal_adaptive_threshold", False))),
+                }
+            )
+            positive_weight = self.denom.detach().reshape(-1)
+            positive_weight = positive_weight[positive_weight > 0]
+            self._last_temporal_densify_stats["visibility_weight_p50"] = self._temporal_densify_quantile(positive_weight, 0.50)
+            self._last_temporal_densify_stats["visibility_weight_p90"] = self._temporal_densify_quantile(positive_weight, 0.90)
+            print(
+                "\n[STEGF][TAD] legacy candidates={candidate_count}, "
+                "width_p50={width_p50:.4f}, selected_width_p50={selected_width_p50:.4f}, "
+                "threshold_p50={threshold_multiplier_p50:.4f}".format(
+                    **self._last_temporal_densify_stats
+                ),
+                flush=True,
+            )
         
         print("befre clone", self._xyz.shape[0])
-        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_clone(effective_grads, max_grad, extent)
         print("after clone", self._xyz.shape[0])
 
-        self.densify_and_splitv2(grads, max_grad, extent, 2)
+        self.densify_and_splitv2(effective_grads, max_grad, extent, 2)
         print("after split", self._xyz.shape[0])
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -9614,15 +9706,104 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
+    def _temporal_densify_width_ratio(self):
+        if self._trbf_scale is None or self._trbf_scale.numel() == 0:
+            return None
+        full_width = max(float(getattr(self, "_couptest_full_width", 1.0)), 1e-8)
+        return (
+            torch.exp(self._trbf_scale.detach()).reshape(-1) / full_width
+        ).clamp(min=0.0, max=1.0)
+
+    def _temporal_densify_threshold_multiplier(self):
+        if not bool(getattr(self, "field_temporal_adaptive_threshold", False)):
+            return None
+        width_ratio = self._temporal_densify_width_ratio()
+        if width_ratio is None:
+            return None
+        alpha = max(float(getattr(self, "field_temporal_adaptive_alpha", 0.8)), 0.0)
+        beta = min(max(float(getattr(self, "field_temporal_adaptive_beta", 0.75)), 0.0), 1.0)
+        return beta + (1.0 - beta) * width_ratio.pow(alpha)
+
+    @staticmethod
+    def _temporal_densify_quantile(values, quantile):
+        if values is None or values.numel() == 0:
+            return 0.0
+        return float(torch.quantile(values.float(), float(quantile)).item())
+
+    def _temporal_densify_selection_stats(self, candidate, width_ratio, threshold_multiplier):
+        candidate = candidate.reshape(-1).to(dtype=torch.bool)
+        selected_width = width_ratio[candidate] if width_ratio is not None else None
+        selected_threshold = (
+            threshold_multiplier[candidate]
+            if threshold_multiplier is not None
+            else None
+        )
+        return {
+            "candidate_count": int(torch.count_nonzero(candidate).item()),
+            "width_p10": self._temporal_densify_quantile(width_ratio, 0.10),
+            "width_p50": self._temporal_densify_quantile(width_ratio, 0.50),
+            "width_p90": self._temporal_densify_quantile(width_ratio, 0.90),
+            "selected_width_p10": self._temporal_densify_quantile(selected_width, 0.10),
+            "selected_width_p50": self._temporal_densify_quantile(selected_width, 0.50),
+            "selected_width_p90": self._temporal_densify_quantile(selected_width, 0.90),
+            "threshold_multiplier_p10": self._temporal_densify_quantile(threshold_multiplier, 0.10),
+            "threshold_multiplier_p50": self._temporal_densify_quantile(threshold_multiplier, 0.50),
+            "threshold_multiplier_p90": self._temporal_densify_quantile(threshold_multiplier, 0.90),
+            "selected_threshold_multiplier_p50": self._temporal_densify_quantile(selected_threshold, 0.50),
+        }
+
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, point_opacity=None):
+        if bool(getattr(self, "field_temporal_visibility_densify", False)):
+            if point_opacity is None or point_opacity.shape[0] != self.get_xyz.shape[0]:
+                return False
+            opacity = point_opacity.detach().reshape(-1).to(
+                device=self.get_xyz.device,
+                dtype=torch.float32,
+            ).clamp(min=0.0, max=1.0)
+            valid = update_filter & (
+                opacity
+                > float(getattr(self, "field_temporal_visibility_min_opacity", 0.05))
+            )
+            if torch.count_nonzero(valid) == 0:
+                return False
+            grad = torch.norm(
+                viewspace_point_tensor.grad[valid, :2],
+                dim=-1,
+                keepdim=True,
+            )
+            weight = opacity[valid].reshape(-1, 1).to(dtype=grad.dtype)
+            self.xyz_gradient_accum[valid] += grad * weight
+            self.denom[valid] += weight
+            return True
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+        return True
 
-    def add_densification_stats_with_gate(self, viewspace_point_tensor, update_filter, point_gate):
+    def add_densification_stats_with_gate(self, viewspace_point_tensor, update_filter, point_gate, point_opacity=None):
+        if bool(getattr(self, "field_temporal_visibility_densify", False)):
+            if point_opacity is None or point_opacity.shape[0] != self.get_xyz.shape[0]:
+                return False
+            opacity = point_opacity.detach().reshape(-1).to(
+                device=self.get_xyz.device,
+                dtype=torch.float32,
+            ).clamp(min=0.0, max=1.0)
+            valid = update_filter & (
+                opacity
+                > float(getattr(self, "field_temporal_visibility_min_opacity", 0.05))
+            )
+            if torch.count_nonzero(valid) == 0:
+                return False
+            grad = torch.norm(viewspace_point_tensor.grad[valid, :2], dim=-1, keepdim=True)
+            gate = point_gate[valid].to(device=grad.device, dtype=grad.dtype).clamp(0.0, 1.0)
+            weight = opacity[valid].reshape(-1, 1).to(dtype=grad.dtype)
+            self.xyz_gradient_accum[valid] += grad * gate * weight
+            self.denom[valid] += weight
+            return True
         grad = torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
         gate = point_gate[update_filter].to(device=grad.device, dtype=grad.dtype).clamp(0.0, 1.0)
         self.xyz_gradient_accum[update_filter] += grad * gate
         self.denom[update_filter] += 1
+        return True
 
     def _mvstruct_feature_dim(self):
         if self._features_dc is None or self._features_dc.numel() == 0:
@@ -9638,9 +9819,17 @@ class GaussianModel:
 
     def _mvstruct_buffers_ready(self):
         conflict_dim = self._mvstruct_conflict_dim()
+        observation_count_ready = (
+            not bool(getattr(self, "field_temporal_visibility_densify", False))
+            or (
+                self._mvstruct_observation_count is not None
+                and self._mvstruct_observation_count.shape[0] == self.get_xyz.shape[0]
+            )
+        )
         return (
             self._mvstruct_gradient_accum is not None
             and self._mvstruct_visibility_count is not None
+            and observation_count_ready
             and self._mvstruct_max_radii2D is not None
             and self._mvstruct_last_topology_iter is not None
             and self._mvstruct_conflict_accum is not None
@@ -9665,6 +9854,11 @@ class GaussianModel:
         conflict_dim = self._mvstruct_conflict_dim()
         self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
         self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_observation_count = (
+            torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+            if bool(getattr(self, "field_temporal_visibility_densify", False))
+            else None
+        )
         self._mvstruct_max_radii2D = torch.zeros((n_points,), device=device, dtype=torch.float32)
         self._mvstruct_last_topology_iter = torch.zeros((n_points,), device=device, dtype=torch.int32)
         self._mvstruct_conflict_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
@@ -9685,6 +9879,11 @@ class GaussianModel:
         conflict_dim = self._mvstruct_conflict_dim()
         self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
         self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_observation_count = (
+            torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+            if bool(getattr(self, "field_temporal_visibility_densify", False))
+            else None
+        )
         self._mvstruct_max_radii2D = torch.zeros((n_points,), device=device, dtype=torch.float32)
         self._mvstruct_conflict_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
         self._mvstruct_conflict_event_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
@@ -9705,6 +9904,13 @@ class GaussianModel:
             self._mvstruct_gradient_accum.shape[0] == old_count
             and self._mvstruct_visibility_count is not None
             and self._mvstruct_visibility_count.shape[0] == old_count
+            and (
+                not bool(getattr(self, "field_temporal_visibility_densify", False))
+                or (
+                    self._mvstruct_observation_count is not None
+                    and self._mvstruct_observation_count.shape[0] == old_count
+                )
+            )
             and self._mvstruct_max_radii2D is not None
             and self._mvstruct_max_radii2D.shape[0] == old_count
             and self._mvstruct_last_topology_iter is not None
@@ -9727,6 +9933,11 @@ class GaussianModel:
                 (self._mvstruct_visibility_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
                 dim=0,
             )
+            if self._mvstruct_observation_count is not None:
+                self._mvstruct_observation_count = torch.cat(
+                    (self._mvstruct_observation_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
+                    dim=0,
+                )
             self._mvstruct_max_radii2D = torch.cat(
                 (self._mvstruct_max_radii2D, torch.zeros((new_count,), device=device, dtype=torch.float32)),
                 dim=0,
@@ -9762,6 +9973,13 @@ class GaussianModel:
             self._mvstruct_gradient_accum.shape[0] == valid_points_mask.shape[0]
             and self._mvstruct_visibility_count is not None
             and self._mvstruct_visibility_count.shape[0] == valid_points_mask.shape[0]
+            and (
+                not bool(getattr(self, "field_temporal_visibility_densify", False))
+                or (
+                    self._mvstruct_observation_count is not None
+                    and self._mvstruct_observation_count.shape[0] == valid_points_mask.shape[0]
+                )
+            )
             and self._mvstruct_max_radii2D is not None
             and self._mvstruct_max_radii2D.shape[0] == valid_points_mask.shape[0]
             and self._mvstruct_last_topology_iter is not None
@@ -9777,6 +9995,8 @@ class GaussianModel:
         ):
             self._mvstruct_gradient_accum = self._mvstruct_gradient_accum[valid_points_mask]
             self._mvstruct_visibility_count = self._mvstruct_visibility_count[valid_points_mask]
+            if self._mvstruct_observation_count is not None:
+                self._mvstruct_observation_count = self._mvstruct_observation_count[valid_points_mask]
             self._mvstruct_max_radii2D = self._mvstruct_max_radii2D[valid_points_mask]
             self._mvstruct_last_topology_iter = self._mvstruct_last_topology_iter[valid_points_mask]
             self._mvstruct_conflict_accum = self._mvstruct_conflict_accum[valid_points_mask]
@@ -9794,6 +10014,9 @@ class GaussianModel:
         n_points = self.get_xyz.shape[0]
         assert self._mvstruct_gradient_accum.shape[0] == n_points
         assert self._mvstruct_visibility_count.shape[0] == n_points
+        if bool(getattr(self, "field_temporal_visibility_densify", False)):
+            assert self._mvstruct_observation_count is not None
+            assert self._mvstruct_observation_count.shape[0] == n_points
         assert self._mvstruct_max_radii2D.shape[0] == n_points
         assert self._mvstruct_last_topology_iter.shape[0] == n_points
         assert self._mvstruct_conflict_accum.shape[0] == n_points
@@ -9806,7 +10029,8 @@ class GaussianModel:
             self.initialize_mvstruct_stats()
         self._mvstruct_event_records = []
 
-    def mvstruct_capture_view(self, viewspace_grad, visibility_filter, radii, feature_dc_grad=None, position_grad=None):
+
+    def mvstruct_capture_view(self, viewspace_grad, visibility_filter, radii, point_opacity=None, feature_dc_grad=None, position_grad=None):
         if not bool(getattr(self, "field_mvstruct", False)):
             return False
         if viewspace_grad is None or visibility_filter is None or radii is None:
@@ -9819,6 +10043,16 @@ class GaussianModel:
         grad_norm = torch.norm(viewspace_grad[:, :2].detach(), dim=-1, keepdim=True).to(device=self.get_xyz.device, dtype=torch.float32)
         visible = visibility_filter.detach().to(device=self.get_xyz.device, dtype=torch.bool)
         radii = radii.detach().to(device=self.get_xyz.device, dtype=torch.float32)
+        opacity = None
+        if (
+            bool(getattr(self, "field_temporal_visibility_densify", False))
+            and point_opacity is not None
+            and point_opacity.shape[0] == n_points
+        ):
+            opacity = point_opacity.detach().reshape(-1).to(
+                device=self.get_xyz.device,
+                dtype=torch.float32,
+            ).clamp(min=0.0, max=1.0)
         feature_grad = None
         if bool(getattr(self, "field_mvstruct_conflict_split", False)) and (not self._mvstruct_conflict_source_is_position()) and feature_dc_grad is not None:
             if feature_dc_grad.shape[0] == n_points:
@@ -9827,7 +10061,7 @@ class GaussianModel:
         if bool(getattr(self, "field_mvstruct_conflict_split", False)) and self._mvstruct_conflict_source_is_position() and position_grad is not None:
             if position_grad.shape[0] == n_points:
                 pos_grad = position_grad.detach().reshape(n_points, -1)[:, :3].to(device=self.get_xyz.device, dtype=torch.float32)
-        self._mvstruct_event_records.append((grad_norm, visible, radii, feature_grad, pos_grad))
+        self._mvstruct_event_records.append((grad_norm, visible, radii, opacity, feature_grad, pos_grad))
         return True
 
     def mvstruct_commit_event(self, min_event_views=3):
@@ -9837,7 +10071,7 @@ class GaussianModel:
             return stats
         n_points = self.get_xyz.shape[0]
         visible_count = torch.zeros((n_points,), device=self.get_xyz.device, dtype=torch.int32)
-        for _, visible, _, _, _ in self._mvstruct_event_records:
+        for _, visible, _, _, _, _ in self._mvstruct_event_records:
             if visible.shape[0] == n_points:
                 visible_count += visible.to(dtype=torch.int32)
         min_event_views = max(int(min_event_views), 1)
@@ -9858,20 +10092,37 @@ class GaussianModel:
             conflict_unit_sum = torch.zeros((n_points, conflict_dim), device=self.get_xyz.device, dtype=torch.float32)
             conflict_unit_outer_sum = torch.zeros((n_points, conflict_dim, conflict_dim), device=self.get_xyz.device, dtype=torch.float32)
         use_position_conflict = self._mvstruct_conflict_source_is_position()
-        for grad_norm, visible, radii, feature_grad, pos_grad in self._mvstruct_event_records:
+        visibility_weighted = bool(getattr(self, "field_temporal_visibility_densify", False))
+        min_temporal_opacity = float(getattr(self, "field_temporal_visibility_min_opacity", 0.05))
+        for grad_norm, visible, radii, point_opacity, feature_grad, pos_grad in self._mvstruct_event_records:
             if grad_norm.shape[0] != n_points or visible.shape[0] != n_points or radii.shape[0] != n_points:
                 continue
-            valid = visible & event_consistent
-            if torch.count_nonzero(valid) == 0:
+            spatial_valid = visible & event_consistent
+            if torch.count_nonzero(spatial_valid) == 0:
                 continue
-            self._mvstruct_gradient_accum[valid] += grad_norm[valid]
-            self._mvstruct_visibility_count[valid] += 1.0
-            self._mvstruct_max_radii2D[valid] = torch.max(self._mvstruct_max_radii2D[valid], radii[valid])
-            stats["observations"] += int(torch.count_nonzero(valid).item())
+            density_valid = spatial_valid
+            if visibility_weighted:
+                if point_opacity is None or point_opacity.shape[0] != n_points:
+                    continue
+                density_valid = spatial_valid & (point_opacity > min_temporal_opacity)
+            if torch.count_nonzero(density_valid) > 0:
+                if visibility_weighted:
+                    weight = point_opacity[density_valid].reshape(-1, 1)
+                    self._mvstruct_gradient_accum[density_valid] += grad_norm[density_valid] * weight
+                    self._mvstruct_visibility_count[density_valid] += weight
+                    self._mvstruct_observation_count[density_valid] += 1.0
+                else:
+                    self._mvstruct_gradient_accum[density_valid] += grad_norm[density_valid]
+                    self._mvstruct_visibility_count[density_valid] += 1.0
+                self._mvstruct_max_radii2D[density_valid] = torch.max(
+                    self._mvstruct_max_radii2D[density_valid],
+                    radii[density_valid],
+                )
+                stats["observations"] += int(torch.count_nonzero(density_valid).item())
             conflict_grad = pos_grad if use_position_conflict else feature_grad
             if conflict_enabled and conflict_grad is not None and conflict_grad.shape[0] == n_points:
                 conflict_norm = torch.norm(conflict_grad, dim=1, keepdim=True)
-                conflict_view_valid = valid & (conflict_norm.squeeze(1) > 1e-12)
+                conflict_view_valid = spatial_valid & (conflict_norm.squeeze(1) > 1e-12)
                 if torch.count_nonzero(conflict_view_valid) > 0:
                     conflict_grad_sum[conflict_view_valid] += conflict_grad[conflict_view_valid]
                     conflict_norm_sum[conflict_view_valid] += conflict_norm[conflict_view_valid]
@@ -10232,6 +10483,22 @@ class GaussianModel:
             "score_p90": 0.0,
             "score_p99": 0.0,
             "score_max": 0.0,
+            "visibility_weighted": int(bool(getattr(self, "field_temporal_visibility_densify", False))),
+            "adaptive_threshold": int(bool(getattr(self, "field_temporal_adaptive_threshold", False))),
+            "width_p10": 0.0,
+            "width_p50": 0.0,
+            "width_p90": 0.0,
+            "selected_width_p10": 0.0,
+            "selected_width_p50": 0.0,
+            "selected_width_p90": 0.0,
+            "threshold_multiplier_p10": 0.0,
+            "threshold_multiplier_p50": 0.0,
+            "threshold_multiplier_p90": 0.0,
+            "selected_threshold_multiplier_p50": 0.0,
+            "visibility_weight_p50": 0.0,
+            "visibility_weight_p90": 0.0,
+            "observation_count_p50": 0.0,
+            "observation_count_p90": 0.0,
         }
         if not bool(getattr(self, "field_mvstruct", False)) or not bool(getattr(self, "field_mvstruct_densify", False)):
             return stats
@@ -10255,20 +10522,60 @@ class GaussianModel:
         if self._mvstruct_budget_reference_points <= 0:
             self._mvstruct_budget_reference_points = int(self.get_xyz.shape[0])
 
-        denom = torch.clamp(self._mvstruct_visibility_count, min=1.0)
+        visibility_weighted = bool(getattr(self, "field_temporal_visibility_densify", False))
+        denom_floor = 1e-12 if visibility_weighted else 1.0
+        denom = torch.clamp(self._mvstruct_visibility_count, min=denom_floor)
         mean_grad = self._mvstruct_gradient_accum / denom
-        visibility_ratio = self._mvstruct_visibility_count / max(float(self._mvstruct_total_views), 1.0)
-        score = mean_grad * visibility_ratio
+        observation_count = (
+            self._mvstruct_observation_count
+            if visibility_weighted
+            else self._mvstruct_visibility_count
+        )
+        visibility_ratio = observation_count / max(float(self._mvstruct_total_views), 1.0)
+        positive_weight = self._mvstruct_visibility_count.squeeze(1)
+        positive_weight = positive_weight[positive_weight > 0]
+        positive_observations = observation_count.squeeze(1)
+        positive_observations = positive_observations[positive_observations > 0]
+        stats["visibility_weight_p50"] = self._temporal_densify_quantile(positive_weight, 0.50)
+        stats["visibility_weight_p90"] = self._temporal_densify_quantile(positive_weight, 0.90)
+        stats["observation_count_p50"] = self._temporal_densify_quantile(positive_observations, 0.50)
+        stats["observation_count_p90"] = self._temporal_densify_quantile(positive_observations, 0.90)
+        threshold_multiplier = self._temporal_densify_threshold_multiplier()
+        point_threshold = torch.full_like(
+            mean_grad.squeeze(1),
+            float(self.field_mvstruct_grad_threshold),
+        )
+        if threshold_multiplier is not None:
+            point_threshold = point_threshold * threshold_multiplier
+        if visibility_weighted:
+            score = mean_grad
+        else:
+            score = mean_grad * visibility_ratio
+        if threshold_multiplier is not None:
+            score = score / threshold_multiplier.reshape(-1, 1).clamp_min(1e-12)
         opacity = self.get_opacity
         observed_candidate = (
-            (self._mvstruct_visibility_count.squeeze(1) >= float(self.field_mvstruct_min_observations))
-            & (visibility_ratio.squeeze(1) >= float(self.field_mvstruct_min_visibility_ratio))
+            (observation_count.squeeze(1) >= float(self.field_mvstruct_min_observations))
             & (opacity.squeeze(1) >= float(self.field_mvstruct_min_opacity))
         )
+        if not visibility_weighted:
+            observed_candidate = observed_candidate & (
+                visibility_ratio.squeeze(1)
+                >= float(self.field_mvstruct_min_visibility_ratio)
+            )
         base_candidate = (
-            (mean_grad.squeeze(1) >= float(self.field_mvstruct_grad_threshold))
+            (mean_grad.squeeze(1) >= point_threshold)
             & observed_candidate
         )
+        width_ratio = self._temporal_densify_width_ratio()
+        if visibility_weighted or threshold_multiplier is not None:
+            stats.update(
+                self._temporal_densify_selection_stats(
+                    base_candidate,
+                    width_ratio,
+                    threshold_multiplier,
+                )
+            )
         cooldown = max(int(getattr(self, "field_mvstruct_cooldown", 0)), 0)
         if cooldown > 0:
             cooldown_ready = (iteration - self._mvstruct_last_topology_iter.to(device=self.get_xyz.device)) >= cooldown
@@ -10492,6 +10799,18 @@ class GaussianModel:
         split_mask = normal_split_mask | oversize_selected_mask | conflict_selected_mask
         selected_mask = clone_mask | split_mask
         conflict_fallback_mask = conflict_selected_mask & torch.logical_not(specialize_selected_mask) & torch.logical_not(directional_selected_mask)
+        if visibility_weighted or threshold_multiplier is not None:
+            selected_width = width_ratio[selected_mask] if width_ratio is not None else None
+            selected_threshold = (
+                threshold_multiplier[selected_mask]
+                if threshold_multiplier is not None
+                else None
+            )
+            stats["selected_width_p10"] = self._temporal_densify_quantile(selected_width, 0.10)
+            stats["selected_width_p50"] = self._temporal_densify_quantile(selected_width, 0.50)
+            stats["selected_width_p90"] = self._temporal_densify_quantile(selected_width, 0.90)
+            stats["selected_threshold_multiplier_p50"] = self._temporal_densify_quantile(selected_threshold, 0.50)
+            self._last_temporal_densify_stats = dict(stats)
 
         tensors = []
         clone_tensors = self._mvstruct_make_child_tensors(clone_mask, split=False)
