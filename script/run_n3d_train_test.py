@@ -38,7 +38,61 @@ def get_model_path(args, scene, repeat_idx=None):
     return output_root / scene_output
 
 
-def build_train_command(args, scene, repo_root, model_path, config_path):
+def get_source_path(args, scene):
+    return Path(args.data_root) / scene / args.colmap_subdir
+
+
+def resolve_final_iteration(args, config):
+    iteration = (
+        int(args.iterations)
+        if args.iterations is not None
+        else int(config.get("iterations", 30000))
+    )
+    if iteration < 1:
+        raise ValueError(f"Final training iteration must be positive, got {iteration}")
+    return iteration
+
+
+def resolve_save_iterations(args, final_iteration, test_iterations):
+    requested = list(args.save_iterations or []) + list(test_iterations)
+    return sorted(
+        {
+            int(iteration)
+            for iteration in requested
+            if 0 < int(iteration) <= int(final_iteration)
+        }
+        | {int(final_iteration)}
+    )
+
+
+def resolve_test_iterations(args, final_iteration):
+    if args.test_iterations is None:
+        return [int(final_iteration)]
+    iterations = sorted({int(iteration) for iteration in args.test_iterations})
+    invalid = [
+        iteration
+        for iteration in iterations
+        if iteration < 1 or iteration > int(final_iteration)
+    ]
+    if invalid:
+        raise ValueError(
+            "Test iterations must be within [1, {}], got {}".format(
+                int(final_iteration),
+                invalid,
+            )
+        )
+    return iterations
+
+
+def build_train_command(
+    args,
+    scene,
+    repo_root,
+    model_path,
+    config_path,
+    final_iteration,
+    test_iterations,
+):
     cmd = [
         sys.executable,
         str(repo_root / "train.py"),
@@ -49,21 +103,35 @@ def build_train_command(args, scene, repo_root, model_path, config_path):
         "--model_path",
         str(model_path),
         "--source_path",
-        str(Path(args.data_root) / scene / args.colmap_subdir),
+        str(get_source_path(args, scene)),
         "--save_iterations",
     ]
-    cmd.extend(str(iteration) for iteration in args.save_iterations)
+    cmd.extend(
+        str(iteration)
+        for iteration in resolve_save_iterations(
+            args,
+            final_iteration,
+            test_iterations,
+        )
+    )
     if args.iterations is not None:
         cmd.extend(["--iterations", str(args.iterations)])
     return cmd
 
 
-def build_test_command(args, scene, repo_root, model_path, config_path):
+def build_test_command(
+    args,
+    scene,
+    repo_root,
+    model_path,
+    config_path,
+    iterations,
+):
     cmd = [
         sys.executable,
         str(repo_root / "script" / "test_all_iterations.py"),
         "--iterations",
-        ",".join(str(iteration) for iteration in args.test_iterations),
+        ",".join(str(iteration) for iteration in iterations),
         "--quiet",
         "--eval",
         "--skip_train",
@@ -74,9 +142,63 @@ def build_test_command(args, scene, repo_root, model_path, config_path):
         "--model_path",
         str(model_path),
         "--source_path",
-        str(Path(args.data_root) / scene / args.colmap_subdir),
+        str(get_source_path(args, scene)),
     ]
     return cmd
+
+
+def build_compact_export_command(
+    args,
+    scene,
+    repo_root,
+    model_path,
+    config_path,
+    final_iteration,
+):
+    cmd = [
+        sys.executable,
+        str(repo_root / "script" / "export_compact_model.py"),
+        "--quiet",
+        "--eval",
+        "--test_iteration",
+        str(final_iteration),
+        "--valloader",
+        args.valloader,
+        "--configpath",
+        str(config_path),
+        "--model_path",
+        str(model_path),
+        "--source_path",
+        str(get_source_path(args, scene)),
+    ]
+    if args.compact_overwrite:
+        cmd.append("--overwrite")
+    return cmd
+
+
+def get_compact_model_path(model_path):
+    return Path(model_path) / "compact"
+
+
+def get_compact_config_path(model_path):
+    return get_compact_model_path(model_path) / "compact_config.json"
+
+
+def build_compact_test_command(
+    args,
+    scene,
+    repo_root,
+    model_path,
+    final_iteration,
+):
+    return build_test_command(
+        args,
+        scene,
+        repo_root,
+        get_compact_model_path(model_path),
+        get_compact_config_path(model_path),
+        [final_iteration],
+    )
 
 
 def resolve_scene_config(args, scene, repo_root):
@@ -268,7 +390,8 @@ def validate_paths(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Train and test N3D or Technicolor STEGF scenes with one command."
+            "Train, compact-export, and test N3D or Technicolor STEGF "
+            "scenes with one command."
         )
     )
     parser.add_argument(
@@ -331,15 +454,22 @@ def main():
         "--save_iterations",
         nargs="+",
         type=int,
-        default=[30000],
-        help="Checkpoint iterations to save during training.",
+        default=None,
+        help=(
+            "Checkpoint iterations to save during training. The resolved "
+            "final training iteration is always included."
+        ),
     )
     parser.add_argument(
         "--test_iterations",
         nargs="+",
         type=int,
-        default=[30000],
-        help="Checkpoint iterations to test after training.",
+        default=None,
+        help=(
+            "Full-model checkpoint iterations to test after training. "
+            "Defaults to the resolved final training iteration. The compact "
+            "model is tested only at the final iteration."
+        ),
     )
     parser.add_argument(
         "--valloader",
@@ -349,8 +479,47 @@ def main():
             "colmapvalid for N3D and technicolorvalid for Technicolor."
         ),
     )
-    parser.add_argument("--skip_train_stage", action="store_true", help="Only run testing.")
-    parser.add_argument("--skip_test_stage", action="store_true", help="Only run training.")
+    parser.add_argument(
+        "--skip_train_stage",
+        action="store_true",
+        help=(
+            "Skip train.py. Unless another compact option is used, export a "
+            "compact model from the existing final checkpoint, then test."
+        ),
+    )
+    parser.add_argument(
+        "--skip_test_stage",
+        action="store_true",
+        help=(
+            "Skip both full-model and compact-model testing. Compact export "
+            "still runs because it is part of final model construction."
+        ),
+    )
+    parser.add_argument(
+        "--skip_compact_stage",
+        action="store_true",
+        help=(
+            "Skip both compact export and compact-model testing. Use for "
+            "short training smoke tests or the legacy full-model-only flow."
+        ),
+    )
+    parser.add_argument(
+        "--skip_compact_export",
+        action="store_true",
+        help=(
+            "Reuse an existing <model_path>/compact artifact instead of "
+            "exporting it again. Compact testing still runs unless testing "
+            "is skipped."
+        ),
+    )
+    parser.add_argument(
+        "--compact_overwrite",
+        action="store_true",
+        help=(
+            "Allow compact export to replace an existing artifact at the "
+            "same final iteration."
+        ),
+    )
     parser.add_argument("--continue_on_error", action="store_true", help="Continue with later stages after a failure.")
     parser.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
     parser.add_argument(
@@ -362,6 +531,17 @@ def main():
     args = parser.parse_args()
     if args.re < 1:
         parser.error("--re must be >= 1")
+    if args.skip_compact_stage and args.skip_compact_export:
+        parser.error(
+            "--skip_compact_stage and --skip_compact_export are mutually "
+            "exclusive"
+        )
+    if args.compact_overwrite and (
+        args.skip_compact_stage or args.skip_compact_export
+    ):
+        parser.error(
+            "--compact_overwrite requires compact export to be enabled"
+        )
 
     repo_root = Path(__file__).resolve().parents[1]
     dataset_profile = DATASET_PROFILES[args.dataset]
@@ -396,6 +576,9 @@ def main():
             )
         couptest_mode = get_configured_couptest_mode(config_path)
         args.configured_couptest_mode = couptest_mode
+        scene_config = get_scene_config(config_path)
+        final_iteration = resolve_final_iteration(args, scene_config)
+        test_iterations = resolve_test_iterations(args, final_iteration)
         for repeat_idx in range(1, args.re + 1):
             repeat_suffix = None if args.re == 1 else repeat_idx
             model_path = get_model_path(args, scene, repeat_suffix)
@@ -420,6 +603,16 @@ def main():
                     flush=True,
                 )
                 print(f"[STEGF] Repeat output: {model_path}", flush=True)
+            print(
+                f"[STEGF] Final checkpoint: iteration {final_iteration}",
+                flush=True,
+            )
+            if not args.skip_compact_stage:
+                print(
+                    "[STEGF] Compact output: "
+                    f"{get_compact_model_path(model_path)}",
+                    flush=True,
+                )
 
             failure_label = model_path.name
             train_succeeded = True
@@ -431,6 +624,8 @@ def main():
                         repo_root,
                         model_path,
                         config_path,
+                        final_iteration,
+                        test_iterations,
                     ),
                     repo_root,
                     args.dry_run,
@@ -440,7 +635,41 @@ def main():
                     failures.append((failure_label, "train", code))
                     if not args.continue_on_error:
                         break
-            if not args.skip_test_stage and train_succeeded:
+            if not train_succeeded:
+                continue
+
+            compact_ready = False
+            if not args.skip_compact_stage:
+                if args.skip_compact_export:
+                    compact_ready = True
+                    print(
+                        "[STEGF] Reusing compact artifact: "
+                        f"{get_compact_model_path(model_path)}",
+                        flush=True,
+                    )
+                else:
+                    code = run_command(
+                        build_compact_export_command(
+                            args,
+                            scene,
+                            repo_root,
+                            model_path,
+                            config_path,
+                            final_iteration,
+                        ),
+                        repo_root,
+                        args.dry_run,
+                    )
+                    if code != 0:
+                        failures.append(
+                            (failure_label, "compact-export", code)
+                        )
+                        if not args.continue_on_error:
+                            break
+                    else:
+                        compact_ready = True
+
+            if not args.skip_test_stage:
                 code = run_command(
                     build_test_command(
                         args,
@@ -448,14 +677,33 @@ def main():
                         repo_root,
                         model_path,
                         config_path,
+                        test_iterations,
                     ),
                     repo_root,
                     args.dry_run,
                 )
                 if code != 0:
-                    failures.append((failure_label, "test", code))
+                    failures.append((failure_label, "full-test", code))
                     if not args.continue_on_error:
                         break
+                if not args.skip_compact_stage and compact_ready:
+                    code = run_command(
+                        build_compact_test_command(
+                            args,
+                            scene,
+                            repo_root,
+                            model_path,
+                            final_iteration,
+                        ),
+                        repo_root,
+                        args.dry_run,
+                    )
+                    if code != 0:
+                        failures.append(
+                            (failure_label, "compact-test", code)
+                        )
+                        if not args.continue_on_error:
+                            break
         if failures and not args.continue_on_error:
             break
 

@@ -357,10 +357,12 @@ For a new scene, the relevant optional switches are:
 - MiDaS-filtered background insertion: set both values to `1`; the integrated
   preprocessor then generates the required depth-like maps automatically.
 
-## Train and test
+## Train, compact-export, and test
 
-The runner defaults to the N3D profile, so the existing complete workflow is
-unchanged:
+The runner defaults to the N3D profile. A normal invocation now performs the
+complete final-model workflow: it trains the full model, exports the final
+static-grid-baked compact model, evaluates the requested full checkpoints,
+and evaluates the compact final checkpoint:
 
 ```bash
 python script/run_n3d_train_test.py --scene coffee_martini
@@ -403,12 +405,14 @@ This reads `/data/n3d/cook_spinach/colmap_0` and writes
 `/data/stegf-output/cook_spinach`. The older names `--data_root` and
 `--output_root` remain accepted as aliases.
 
-It uses the standard 30,000-iteration training schedule and saves and tests
-the final checkpoint. N3D evaluation uses `colmapvalid`; Technicolor uses
-`technicolorvalid`. The default N3D output directory is:
+It uses the standard 30,000-iteration training schedule. The resolved final
+iteration is always saved and compact-exported. N3D evaluation uses
+`colmapvalid`; Technicolor uses `technicolorvalid`. The default N3D outputs
+are:
 
 ```text
 /root/autodl-tmp/output/coffee_martini
+/root/autodl-tmp/output/coffee_martini/compact
 ```
 
 Validate paths and commands without launching training:
@@ -423,10 +427,35 @@ Run a short CUDA smoke test without evaluation:
 python script/run_n3d_train_test.py \
   --scene coffee_martini \
   --iterations 10 \
-  --skip_test_stage
+  --skip_test_stage \
+  --skip_compact_stage
 ```
 
-Evaluate an existing final checkpoint:
+Export and evaluate an existing full checkpoint without retraining:
+
+```bash
+python script/run_n3d_train_test.py \
+  --scene coffee_martini \
+  --skip_train_stage
+```
+
+Reuse and evaluate an existing compact artifact without retraining or
+re-exporting:
+
+```bash
+python script/run_n3d_train_test.py \
+  --scene coffee_martini \
+  --skip_train_stage \
+  --skip_compact_export
+```
+
+To run only the legacy full-model workflow, pass `--skip_compact_stage`.
+Use `--compact_overwrite` only when intentionally replacing an existing
+compact artifact at the same final iteration. `--skip_test_stage` skips both
+full and compact evaluation but still performs compact export, because export
+is part of final model construction.
+
+The underlying full-checkpoint evaluation command remains available:
 
 ```bash
 python script/test_all_iterations.py \
@@ -438,12 +467,13 @@ python script/test_all_iterations.py \
   --source_path /root/autodl-tmp/coffee_martini/colmap_0
 ```
 
-### Compact inference export
+### Manual compact inference export
 
-The final static appearance grid is queried at canonical Gaussian positions.
-After training, its training-camera mean contribution can be baked into the
-per-Gaussian appearance features and the grid can be removed from the saved
-inference checkpoint:
+The integrated runner performs this step by default. The exporter can also be
+called directly when custom output or verification settings are needed. The
+final static appearance grid is queried at canonical Gaussian positions; its
+training-camera mean contribution is baked into the per-Gaussian appearance
+features and the grid is removed from the saved inference checkpoint:
 
 ```bash
 python script/export_compact_model.py \
