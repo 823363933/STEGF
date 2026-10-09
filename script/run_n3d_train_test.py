@@ -23,6 +23,14 @@ DATASET_PROFILES = {
         "requires_poses_bounds": False,
         "config_loader": "technicolor",
     },
+    "immersive": {
+        "label": "Google Immersive",
+        "default_scenes": ("04_Truck",),
+        "config_dir": "configs/immersive_ours",
+        "valloader": "immersivevalidss",
+        "requires_poses_bounds": False,
+        "config_loader": "immersivess",
+    },
 }
 
 
@@ -274,6 +282,21 @@ def validate_scene_data(
                 "{}: expected loader={!r}, got {!r}"
                 .format(scene, expected_loader, configured_loader)
             )
+    if expected_loader == "immersivess":
+        models_path = scene_root / "models.json"
+        if not models_path.is_file():
+            missing.append(str(models_path))
+        mapper_paths = sorted(scene_root.glob("camera_*.npy"))
+        camera_dirs = sorted(
+            path for path in scene_root.glob("camera_*") if path.is_dir()
+        )
+        if not mapper_paths:
+            missing.append(f"{scene_root}/camera_*.npy")
+        if camera_dirs and len(mapper_paths) != len(camera_dirs):
+            missing.append(
+                "{}: fisheye mapper count {} does not match camera count {}"
+                .format(scene, len(mapper_paths), len(camera_dirs))
+            )
     for time_index in range(duration):
         colmap_path = scene_root / f"colmap_{time_index}"
         image_path = colmap_path / "images"
@@ -390,7 +413,8 @@ def validate_paths(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Train, compact-export, and test N3D or Technicolor STEGF "
+            "Train, compact-export, and test N3D, Technicolor, or Google "
+            "Immersive STEGF "
             "scenes with one command."
         )
     )
@@ -409,7 +433,7 @@ def main():
         default=None,
         help=(
             "Scene names to run sequentially. Defaults to coffee_martini for "
-            "N3D and Fabien for Technicolor."
+            "N3D, Fabien for Technicolor, and 04_Truck for Immersive."
         ),
     )
     parser.add_argument(
@@ -476,7 +500,8 @@ def main():
         default=None,
         help=(
             "Validation loader passed to test_all_iterations.py. Defaults to "
-            "colmapvalid for N3D and technicolorvalid for Technicolor."
+            "colmapvalid for N3D, technicolorvalid for Technicolor, and "
+            "immersivevalidss for Google Immersive."
         ),
     )
     parser.add_argument(

@@ -1,31 +1,82 @@
-# STEGF: Spatio-Temporal Euler-Gaussian Field
+# Shared Appearance Scaffold for Dynamic 3D Gaussian Splatting
 
-This repository contains the final STEGF research model. The selected version
-is `S2.0.4-couptest-poly` with `coupled_detached` motion-opacity coupling. The
-Neural 3D Video `coffee_martini` scene is the reference configuration and
-reproduction case, not a hard-coded model restriction.
+English | [简体中文](README_zh-CN.md)
 
-## Final model
+## Abstract
 
-- Representation: dynamic 3D Gaussian primitives with a static multilevel
-  Euler appearance field.
-- Initialization: all-time COLMAP sparse points plus a frame-0 dense point
-  cloud.
-- Existence: transient Gaussian time kernels initialized to cover nearly the
-  full sequence.
-- Motion: per-Gaussian linear, quadratic, and cubic coefficients. The
-  quadratic and cubic displacement is scaled by the detached normalized time
-  width, so motion loss does not directly change the lifetime width.
-- Appearance: static Euler-grid residual and trainable luma/white-balance
-  exposure correction.
-- Scene-specific densification: configurations that benefited from VAD/TAT
+Dynamic 3D Gaussian splatting reconstructs both temporally stable scene
+content and time-varying dynamic detail. An appearance representation carried
+only by individual Gaussian primitives, however, has no explicit spatial
+sharing structure. Stable evidence from repeated observations is therefore
+distributed across separate primitives and may not be learned sufficiently.
+At the same time, independently parameterized motion and temporal-opacity
+functions provide no optimization mechanism that adapts motion complexity to
+temporal support, making short-lived local changes and long-term complex
+motion difficult to coordinate.
+
+We build a multiresolution feature grid over the Gaussian representation and
+use it as a shared appearance scaffold. The constant term of each positional
+function defines its canonical Gaussian position. Features queried at that
+canonical position allow repeated observations of different primitives to
+update a shared set of spatial parameters, while per-Gaussian features retain
+local appearance differences. A detached coupling coefficient further scales
+the higher-order motion terms according to each Gaussian's temporal support,
+coordinating motion expressiveness with temporal visibility without allowing
+motion gradients to enlarge the lifetime directly.
+
+The framework makes stable evidence easier to reuse while leaving
+time-varying residuals to the Gaussian appearance, motion, and lifetime
+parameters. After training, the scaffold contribution can be baked into the
+canonical Gaussian features. The feature grid and its query computation are
+then removed from the inference model, reducing checkpoint size and rendering
+cost while preserving reconstruction quality.
+
+> **Code-name compatibility.** The repository path, Conda environments,
+> configuration namespace, serialized metadata, and `[STEGF]` log prefix keep
+> the legacy `STEGF` identifier so that existing experiments remain
+> reproducible. The method name used by this README is **Shared Appearance
+> Scaffold for Dynamic 3D Gaussian Splatting**.
+
+## Method overview
+
+The maintained research implementation is `S2.0.4-couptest-poly` with
+`coupled_detached` motion-opacity coupling. Its active design is:
+
+- **Gaussian scene representation.** Dynamic 3D Gaussian primitives retain
+  their own geometry, local appearance features, motion coefficients, and
+  temporal-opacity kernels.
+- **Shared appearance scaffold.** A fixed-coordinate multiresolution feature
+  grid is queried at canonical Gaussian positions. It shares stable,
+  repeatedly observed appearance evidence across primitives. Here “static”
+  describes the grid coordinates, not a hard semantic classification of
+  physical objects.
+- **Local appearance residual.** Per-Gaussian features remain active so that
+  details that cannot be explained consistently by the shared scaffold are
+  still representable.
+- **Motion-lifetime coupling.** Each Gaussian has linear, quadratic, and cubic
+  motion coefficients. The quadratic and cubic displacement is scaled by the
+  detached normalized temporal width: short-support primitives approach
+  linear motion, whereas wide-support primitives retain higher-order motion.
+- **Initialization and topology.** The official scene configurations combine
+  all-time COLMAP sparse points with a frame-0 dense point cloud, followed by
+  the scene's ordinary and multiview-structured densification schedules.
+- **Photometric support.** The shared scaffold is complemented by trainable
+  luma/white-balance exposure correction and depth-aware scale
+  regularization.
+- **Compact inference export.** After training, the training-camera mean
+  scaffold contribution is baked into the canonical per-Gaussian appearance
+  features. Training-only grid and routing parameters are omitted from the
+  compact checkpoint.
+- **Scene-specific VAD/TAT.** Only scene configurations with verified gains
   use temporal-opacity-weighted gradient accumulation and a lifetime-aware
-  densification threshold; other scenes retain the standard final schedule.
-- Disabled final branches: dynamic Euler grid, staged routing, EMS guided
-  sampling, temporal refinement, Carrier motion, spatiotemporal bubbles, and
-  piecewise-velocity motion.
+  densification threshold. Other scenes keep the standard schedule.
 
-The main scene configuration is
+Abandoned research branches are disabled in the maintained configurations,
+including the dynamic Euler grid, staged routing, legacy EMS, temporal
+refinement, Carrier motion, spatiotemporal bubbles, and piecewise-velocity
+motion. The N3D `coffee_martini` scene remains the primary reference
+configuration and reproduction case, but it is not a hard-coded model
+restriction. Its configuration is
 `configs/n3d_ours/coffee_martini.json`.
 
 ## Environment
@@ -81,15 +132,15 @@ apt-get update
 apt-get install -y xvfb xauth
 ```
 
-When a COLMAP stage is still required and `DISPLAY` is unset,
-`preprocess_n3d_scene.py` automatically restarts itself under `xvfb-run -a`.
-It does not use Xvfb when COLMAP outputs are already complete and only a later
-stage such as MiDaS remains.
+When a COLMAP stage is still required and `DISPLAY` is unset, the integrated
+N3D, Technicolor, and Immersive preprocessors automatically restart themselves
+under `xvfb-run -a`. They do not use Xvfb when COLMAP outputs are already
+complete and only a later stage such as MiDaS remains.
 
 ## Dataset convention
 
-The integrated runner supports N3D and Technicolor with the same
-scene-independent layout. Let `<location>` be the data root passed with
+The integrated runner supports N3D, Technicolor, and Google Immersive with the
+same scene-independent layout. Let `<location>` be the data root passed with
 `--datapath`, and let `<scene>` be the scene name passed with `--scene`:
 
 ```text
@@ -122,6 +173,28 @@ for provenance. `dense_points.ply` is required only when
 background point insertion and its MiDaS filter are both enabled. The generic
 N3D `default.json` disables both optional mechanisms; dedicated scene
 configurations enable only the inputs prepared for that scene.
+
+Immersive scenes add the original fisheye supervision frames and one fixed
+sampling grid per calibrated camera to the same scene directory:
+
+```text
+<location>/<scene>/
+├── models.json
+├── camera_0001/
+│   ├── 0.png
+│   ├── ...
+│   └── <duration-1>.png
+├── camera_0001.npy
+├── ...
+└── colmap_<time>/
+```
+
+The `colmap_<time>/images` files are wide-pinhole images used for calibrated
+triangulation and Gaussian rasterization. The `camera_*/<time>.png` files stay
+in the original fisheye domain and are the actual RGB supervision. The NPY
+file maps the pinhole render back into that fisheye domain through a fixed
+`grid_sample` lookup. It is therefore required even when optional dense and
+MiDaS stages are disabled.
 
 ### One-command preprocessing from videos
 
@@ -208,6 +281,38 @@ The public Technicolor configurations are `Birthday`, `Fabien`, `Painter`,
 automatically unless `--source_start_frame` is provided. The current final
 configurations enable frame-0 dense initialization and do not enable the N3D
 open-background MiDaS path.
+
+### Google Immersive preprocessing
+
+Extract an official Immersive ZIP under `dataset/Immersive`, then prepare a
+scene with:
+
+```bash
+conda activate STEGF-preprocess
+python script/preprocess_immersive_scene.py \
+  --scene 04_Truck \
+  --inputpath dataset/Immersive \
+  --datapath dataset/Immersive-pre
+```
+
+The seven supported canonical scene names are `01_Welder`, `02_Flames`,
+`04_Truck`, `09_Alexa`, `10_Alexa`, `11_Alexa`, and `12_Cave`. The script also
+accepts the three official long Alexa directory names and publishes them under
+their canonical short names by default. It reads camera poses, intrinsics, and
+fisheye coefficients from `models.json`, decodes only the requested source
+frames, and ignores any MP4 that has no calibration record.
+
+By default the first 50 frames are prepared. The intermediate pinhole focal
+multiplier matches the STGS full-model path (`0.35` for `02_Flames`, `0.36`
+for the other scenes) and can be overridden with `--focal_scale`. Completed
+distorted frames, sampling grids, and `colmap_<time>` outputs are reused on a
+later invocation. As with the other preprocessors, `--dense auto` and
+`--midas auto` follow `configs/immersive_ours/<scene>.json` when an Immersive
+configuration exists. The seven official scene configurations enable frame-0
+dense initialization and leave the N3D-specific MiDaS background-insertion
+path disabled. The generic `default.json` keeps both optional stages off for
+an unconfigured custom scene. Either artifact-generation decision can be
+overridden with `--dense on|off` or `--midas on|off`.
 
 ### Per-time RGB images and sparse point clouds
 
@@ -377,6 +482,25 @@ Select the Technicolor profile explicitly. It resolves
 python script/run_n3d_train_test.py --dataset tech --scene Fabien
 ```
 
+Google Immersive uses the same final-model training, compact export, and test
+pipeline. Its profile selects the calibrated fisheye renderer and
+`immersivevalidss` validation loader. If the prepared scenes are stored under
+`/root/autodl-tmp/Immersive`, run for example:
+
+```bash
+python script/run_n3d_train_test.py \
+  --dataset immersive \
+  --scene 04_Truck \
+  --datapath /root/autodl-tmp/Immersive \
+  --savepath /root/autodl-tmp/output/Immersive
+```
+
+The runner validates all 50 COLMAP slices, `models.json`, every calibrated
+camera sampling grid, and optional dense initialization before launching the
+experiment. The fisheye mapping participates in both full-model evaluation and
+compact-model verification; the learned shared-appearance representation uses
+the same coupled-detached final model as the other datasets.
+
 Another scene stored under the default data root can be started directly:
 
 ```bash
@@ -497,13 +621,16 @@ continue from the original checkpoint.
 
 - `train.py`: training entry point.
 - `test.py`: rendering and evaluation entry point.
-- `script/run_n3d_train_test.py`: integrated N3D/Technicolor final-model
-  workflow (`--dataset n3d|tech`).
+- `script/run_n3d_train_test.py`: integrated
+  N3D/Technicolor/Immersive final-model workflow
+  (`--dataset n3d|tech|immersive`).
 - `script/test_all_iterations.py`: checkpoint evaluation runner.
-- `script/preprocess_n3d_scene.py`: integrated N3D video-to-STEGF scene
+- `script/preprocess_n3d_scene.py`: integrated N3D video-to-model-ready scene
   preprocessing.
-- `script/preprocess_tech_scene.py`: integrated Technicolor PNG-to-STEGF scene
-  preprocessing.
+- `script/preprocess_tech_scene.py`: integrated Technicolor PNG-to-model-ready
+  scene preprocessing.
+- `script/preprocess_immersive_scene.py`: calibrated Immersive fisheye-video
+  preprocessing with pinhole COLMAP slices and distorted-domain supervision.
 - `script/export_compact_model.py`: static-grid-baked compact inference export.
 - `script/setup_preprocess.sh`: separate COLMAP/Open3D/MiDaS environment
   setup.
@@ -513,6 +640,8 @@ continue from the original checkpoint.
   scenes without a dedicated configuration.
 - `configs/n3d_ours/coffee_martini.json`: final experiment configuration.
 - `configs/tech_ours`: final-model Technicolor scene configurations.
+- `configs/immersive_ours`: final-model Google Immersive scene
+  configurations.
 - `thirdparty/gaussian_splatting`: Gaussian model, renderer, and CUDA
   rasterizer sources.
 - `helper_train.py`, `helper_model.py`: training and model utilities.
@@ -521,9 +650,10 @@ continue from the original checkpoint.
 
 This project is based on the official STGS implementation. The integrated
 data pipeline also follows the N3D sparse preprocessing of
-SpacetimeGaussians, the frame-0 dense reconstruction/downsampling procedure of
-E-D3DGS, and the `dpt_beit_large_512` model from MiDaS; their upstream license
-terms continue to apply.
+SpacetimeGaussians, its calibrated fisheye treatment for Google Immersive, the
+frame-0 dense reconstruction/downsampling procedure of E-D3DGS, and the
+`dpt_beit_large_512` model from MiDaS; their upstream license terms continue
+to apply.
 
 ```bibtex
 @inproceedings{li2024stgs,

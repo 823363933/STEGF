@@ -347,10 +347,17 @@ def _render_image(camera, gaussians, pipeline, background, render, settings, ras
     return image.clamp(0.0, 1.0)
 
 
-def _verify_bake(gaussians, test_views, pipeline, mean_delta, indices):
+def _verify_bake(
+    gaussians,
+    test_views,
+    pipeline,
+    mean_delta,
+    indices,
+    render_option="test_ours_full",
+):
     if not indices:
         return {"enabled": False, "frames": []}
-    render, settings, rasterizer = getrenderpip("test_ours_full")
+    render, settings, rasterizer = getrenderpip(render_option)
     background = torch.zeros((9,), dtype=torch.float32, device="cuda")
     if gaussians.ts is None:
         view = test_views[0]
@@ -638,12 +645,17 @@ def export_compact(args, dataset, pipeline):
         args.verify_indices,
         len(test_views),
     )
+    verification_renderer = {
+        "train_ours_full": "test_ours_full",
+        "train_ours_fullss": "test_ours_fullss",
+    }.get(str(args.rdpip), str(args.rdpip))
     verification = _verify_bake(
         gaussians,
         test_views,
         pipeline,
         mean_delta,
         verify_indices,
+        render_option=verification_renderer,
     )
     warning_threshold = float(args.verify_max_abs_warning)
     verification["max_abs_warning_threshold"] = warning_threshold

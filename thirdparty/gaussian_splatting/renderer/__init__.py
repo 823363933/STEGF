@@ -492,7 +492,7 @@ def train_ours_lite(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
             "depth": depth}
 
 
-def train_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
+def _legacy_train_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
     """
     Render the scene. 
     
@@ -683,7 +683,7 @@ def test_ours_fullss_fused(viewpoint_camera, pc : GaussianModel, pipe, bg_color 
 
 
 
-def test_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
+def _legacy_test_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
     """
     Render the scene. 
     
@@ -776,6 +776,132 @@ def test_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torc
             "rawrendered_image": rawrendered_image,
             "depth": depth,
             "duration":duration}
+
+
+def _immersive_warp(image, viewpoint_camera, mode="bicubic"):
+    """Map a wide-pinhole render into the half-resolution fisheye domain."""
+    mapper = getattr(viewpoint_camera, "fisheyemapper", None)
+    if mapper is None:
+        raise RuntimeError(
+            "Immersive rendering requires a fisheyemapper on every camera"
+        )
+    mapper = mapper.to(device=image.device, dtype=image.dtype)
+    warped = F.grid_sample(
+        image.unsqueeze(0),
+        mapper,
+        mode=mode,
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    original = getattr(viewpoint_camera, "original_image", None)
+    if torch.is_tensor(original):
+        target_size = tuple(int(value) for value in original.shape[-2:])
+    else:
+        target_size = (
+            int(0.5 * viewpoint_camera.image_height),
+            int(0.5 * viewpoint_camera.image_width),
+        )
+    if warped.shape[-2:] != target_size:
+        interpolate_mode = "bicubic" if mode == "bicubic" else "bilinear"
+        warped = F.interpolate(
+            warped,
+            size=target_size,
+            mode=interpolate_mode,
+            align_corners=True,
+        )
+    return warped.squeeze(0)
+
+
+def train_ours_fullss(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    basicfunction=None,
+    GRsetting=None,
+    GRzer=None,
+    time_conditioned=None,
+    static_radiance_mask=None,
+    iteration=None,
+    render_point_mask=None,
+):
+    """Final STEGF renderer followed by calibrated Immersive fisheye warp."""
+    if static_radiance_mask is not None:
+        raise RuntimeError(
+            "The optional static far-segment branch is not defined in the "
+            "Immersive fisheye supervision domain"
+        )
+    package = train_ours_full(
+        viewpoint_camera,
+        pc,
+        pipe,
+        bg_color,
+        scaling_modifier=scaling_modifier,
+        override_color=override_color,
+        basicfunction=basicfunction,
+        GRsetting=GRsetting,
+        GRzer=GRzer,
+        time_conditioned=time_conditioned,
+        static_radiance_mask=None,
+        iteration=iteration,
+        render_point_mask=render_point_mask,
+    )
+    raw_render = package["render"]
+    package["rawrendered_image"] = raw_render.unsqueeze(0)
+    package["render"] = _immersive_warp(
+        raw_render, viewpoint_camera, mode="bicubic"
+    )
+    if torch.is_tensor(package.get("depth")):
+        package["rawdepth"] = package["depth"]
+        package["depth"] = _immersive_warp(
+            package["depth"], viewpoint_camera, mode="bilinear"
+        )
+    return package
+
+
+def test_ours_fullss(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    basicfunction=None,
+    GRsetting=None,
+    GRzer=None,
+):
+    """Inference counterpart of :func:`train_ours_fullss`."""
+    package = test_ours_full(
+        viewpoint_camera,
+        pc,
+        pipe,
+        bg_color,
+        scaling_modifier=scaling_modifier,
+        override_color=override_color,
+        basicfunction=basicfunction,
+        GRsetting=GRsetting,
+        GRzer=GRzer,
+    )
+    raw_render = package["render"]
+    raw_depth = package.get("depth")
+    torch.cuda.synchronize()
+    warp_start = time.time()
+    package["rawrendered_image"] = raw_render.unsqueeze(0)
+    package["render"] = _immersive_warp(
+        raw_render, viewpoint_camera, mode="bicubic"
+    )
+    if torch.is_tensor(raw_depth):
+        package["rawdepth"] = raw_depth
+        package["depth"] = _immersive_warp(
+            raw_depth, viewpoint_camera, mode="bilinear"
+        )
+    torch.cuda.synchronize()
+    package["duration"] = float(package.get("duration", 0.0)) + (
+        time.time() - warp_start
+    )
+    return package
 
 
 

@@ -62,6 +62,16 @@ def getrenderpip(option="train_ours_full"):
         from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings 
         from diff_gaussian_rasterization_ch9 import GaussianRasterizer  
         return test_ours_full, GaussianRasterizationSettings, GaussianRasterizer
+    elif option == "train_ours_fullss":
+        from thirdparty.gaussian_splatting.renderer import train_ours_fullss
+        from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings
+        from diff_gaussian_rasterization_ch9 import GaussianRasterizer
+        return train_ours_fullss, GaussianRasterizationSettings, GaussianRasterizer
+    elif option == "test_ours_fullss":
+        from thirdparty.gaussian_splatting.renderer import test_ours_fullss
+        from diff_gaussian_rasterization_ch9 import GaussianRasterizationSettings
+        from diff_gaussian_rasterization_ch9 import GaussianRasterizer
+        return test_ours_fullss, GaussianRasterizationSettings, GaussianRasterizer
     else:
         raise NotImplementedError("Render {} is not included in the trimmed STEGF runtime".format(option))
     
@@ -239,6 +249,111 @@ def controlgaussians(opt, gaussians, densify, iteration, scene,  visibility_filt
             if iteration == 10000: 
                 removeminmax(gaussians, maxbounds, minbounds)
         return flag
+
+    elif densify in (4, 6, 7, 8): # Google Immersive
+        if iteration < opt.densify_until_iter:
+            if densify == 4:
+                if (not disable_global_omega_split) and iteration == 8001:
+                    omegamask = gaussians.zero_omegabymotion()
+                    gaussians.omegamask = omegamask
+                    scene.recordpoints(
+                        iteration,
+                        "seperate omega" + str(torch.sum(omegamask).item()),
+                    )
+                elif (
+                    (not disable_global_omega_split)
+                    and iteration > 8001
+                    and gaussians.omegamask is not None
+                ):
+                    freezweightsbymasknounsqueeze(
+                        gaussians, ["_omega"], gaussians.omegamask
+                    )
+                    rotationmask = torch.logical_not(gaussians.omegamask)
+                    freezweightsbymasknounsqueeze(
+                        gaussians, ["_rotation"], rotationmask
+                    )
+
+            densify_due = (
+                iteration > opt.densify_from_iter
+                and iteration % opt.densification_interval == 0
+            )
+            if densify_due:
+                if flag < opt.desicnt:
+                    scene.recordpoints(iteration, "before densify")
+                    size_threshold = (
+                        20 if iteration > opt.opacity_reset_interval else None
+                    )
+                    if densify == 4:
+                        gaussians.densify_prunecloneim(
+                            opt.densify_grad_threshold,
+                            opt.opthr,
+                            scene.cameras_extent,
+                            size_threshold,
+                        )
+                    else:
+                        gaussians.densify_prunecloneimgeneral(
+                            opt.densify_grad_threshold,
+                            opt.opthr,
+                            scene.cameras_extent,
+                            size_threshold,
+                        )
+                    flag += 1
+                    scene.recordpoints(iteration, "after densify")
+                else:
+                    should_prune = (
+                        (densify == 4 and iteration < 5000)
+                        or (densify == 6 and iteration < 9000)
+                        or densify in (7, 8)
+                    )
+                    reset_interval = max(int(opt.opacity_reset_interval), 1)
+                    last_reset = (int(iteration) // reset_interval) * reset_interval
+                    if densify == 4:
+                        should_prune = should_prune and (
+                            iteration > 500 + last_reset and last_reset > 1000
+                        )
+                    if should_prune:
+                        prune_mask = (
+                            gaussians.get_opacity < opt.opthr
+                        ).squeeze()
+                        if opt.prunebysize:
+                            big_points_vs = gaussians.max_radii2D > 20
+                            big_points_ws = (
+                                gaussians.get_scaling.max(dim=1).values
+                                > 0.1 * scene.cameras_extent
+                            )
+                            prune_mask = torch.logical_or(
+                                torch.logical_or(
+                                    prune_mask, big_points_vs
+                                ),
+                                big_points_ws,
+                            )
+                        if hasattr(
+                            gaussians,
+                            "protect_background_candidates_from_prune",
+                        ):
+                            prune_mask = (
+                                gaussians.protect_background_candidates_from_prune(
+                                    prune_mask, iteration
+                                )
+                            )
+                        gaussians.prune_points(prune_mask)
+                        torch.cuda.empty_cache()
+                        scene.recordpoints(iteration, "addionally prune_mask")
+
+            reset_due = iteration % opt.opacity_reset_interval == 0
+            if reset_due and (densify != 4 or iteration < 4000):
+                gaussians.reset_opacity()
+
+        if densify == 8 and iteration == 10000:
+            removeminmax(gaussians, maxbounds, minbounds)
+            scene.recordpoints(iteration, "remove outside initialization bounds")
+        return flag
+
+    raise NotImplementedError(
+        "Densification mode {} is not included in the STEGF runtime".format(
+            densify
+        )
+    )
     
 
 def logicalorlist(listoftensor):

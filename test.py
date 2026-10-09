@@ -274,8 +274,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict[scene_dir][iteration] = {}
 
 
-    if rdpip == "train_ours_full":
-        render, GRsetting, GRzer = getrenderpip("test_ours_full")
+    test_renderer = {
+        "train_ours_full": "test_ours_full",
+        "train_ours_fullss": "test_ours_fullss",
+    }.get(rdpip, rdpip)
+    if test_renderer != rdpip:
+        render, GRsetting, GRzer = getrenderpip(test_renderer)
     else:
         render, GRsetting, GRzer = getrenderpip(rdpip) 
 
@@ -397,8 +401,12 @@ def render_setnogt(model_path, name, iteration, views, gaussians, pipeline, back
         if gaussians.field_decoder is not None:
             gaussians.field_decoder.cuda()
             gaussians.field_decoder.eval()
-    if rdpip == "train_ours_full" and getattr(gaussians, "use_euler_field", False):
-        render, GRsetting, GRzer = getrenderpip("test_ours_full")
+    test_renderer = {
+        "train_ours_full": "test_ours_full",
+        "train_ours_fullss": "test_ours_fullss",
+    }.get(rdpip, rdpip)
+    if test_renderer != rdpip:
+        render, GRsetting, GRzer = getrenderpip(test_renderer)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 

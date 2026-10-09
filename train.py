@@ -4327,24 +4327,21 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         print("[STEGF] field_init_depth_only=1, stop after initial depth debug.")
         return
 
-    with torch.no_grad():
-        timeindex = 0 # 0 to 49
-        viewpointset = traincamdict[timeindex]
-        for viewpoint_cam in viewpointset:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background,  override_color=None,  basicfunction=rbfbasefunction, GRsetting=GRsetting, GRzer=GRzer)
-            
-            _, depthH, depthW = render_pkg["depth"].shape
-            borderH = int(depthH/2)
-            borderW = int(depthW/2)
+    if ems_main_enabled:
+        with torch.no_grad():
+            timeindex = 0 # 0 to 49
+            viewpointset = traincamdict[timeindex]
+            for viewpoint_cam in viewpointset:
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background,  override_color=None,  basicfunction=rbfbasefunction, GRsetting=GRsetting, GRzer=GRzer)
 
-            midh =  int(viewpoint_cam.image_height/2)
-            midw =  int(viewpoint_cam.image_width/2)
-            
-            depth = render_pkg["depth"]
-            slectemask = depth != 15.0 
-
-            validdepthdict[viewpoint_cam.image_name] = torch.median(depth[slectemask]).item()   
-            depthdict[viewpoint_cam.image_name] = torch.amax(depth[slectemask]).item() 
+                depth = render_pkg["depth"]
+                slectemask = depth != 15.0
+                validdepthdict[viewpoint_cam.image_name] = torch.median(
+                    depth[slectemask]
+                ).item()
+                depthdict[viewpoint_cam.image_name] = torch.amax(
+                    depth[slectemask]
+                ).item()
     
     if densify == 1 or  densify == 2: 
         zmask = gaussians._xyz[:,2] < 4.5  
