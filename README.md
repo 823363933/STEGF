@@ -25,11 +25,14 @@ checkpoint, and log names for compatibility.
 
 ## 4D reconstruction example
 
-![N3D cut_roasted_beef 4D reconstruction](assets/cut_roasted_beef_4d.gif)
+![N3D cut_roasted_beef: playback, paused-time view changes, and moving-view playback](assets/cut_roasted_beef_interactive_4d.gif)
 
-The camera moves through the reconstructed scene while time advances across
-the sequence. This example is rendered from the compact model after the shared
-appearance scaffold has been baked into the Gaussian features.
+The demo shows fixed-view playback, camera movement with time paused, and
+playback with a moving camera. The 300-frame sequence uses six independent
+50-frame models trained for 30,000 steps each with all camera views, solely
+for this showcase rather than held-out evaluation. It is a pre-rendered
+demonstration, not a real-time viewer; no extra color calibration or blending
+between segments is applied.
 
 ### Highlights
 
