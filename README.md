@@ -21,13 +21,12 @@ needs the grid or its query computation.
 
 ## Reconstruction examples
 
-| N3D · cut_roasted_beef (RTX 4080 SUPER) | Google Immersive · 02_Flames (RTX 5070 Ti) |
-| :---: | :---: |
-| ![cut_roasted_beef: fixed-view playback, paused-time camera movement, and moving-view playback](assets/cut_roasted_beef_interactive_4d.gif) | ![02_Flames: normal-speed playback, 0.2× slow motion, and horizontal camera pans with a return to the starting pose](assets/02_flames_interactive_4d.gif) |
-
-Left: fixed-view playback, camera movement with time paused, and playback with
-a moving camera. Right: looping playback of a 50-frame scene, combining 0.2×
-slow motion with horizontal camera pans before returning to the starting pose.
+<table>
+  <tr>
+    <td width="50%"><img src="assets/cut_roasted_beef_interactive_4d.gif" alt="cut_roasted_beef" width="480" height="380"></td>
+    <td width="50%"><img src="assets/02_flames_interactive_4d.gif" alt="02_Flames" width="480" height="380"></td>
+  </tr>
+</table>
 
 ## Installation
 

@@ -10,11 +10,12 @@
 
 ## 重建示例
 
-| N3D · cut_roasted_beef（RTX 4080 SUPER） | Google Immersive · 02_Flames（RTX 5070 Ti） |
-| :---: | :---: |
-| ![cut_roasted_beef：固定视角播放、暂停时间运镜、边播放边运镜](assets/cut_roasted_beef_interactive_4d.gif) | ![02_Flames：原速播放、0.2 倍速慢放、水平左右运镜并返回](assets/02_flames_interactive_4d.gif) |
-
-左：固定视角播放、暂停时间并移动视角，以及移动视角并继续播放。右：循环播放 50 帧场景，结合 0.2 倍速慢放与水平左右运镜，最后回到起始位姿。
+<table>
+  <tr>
+    <td width="50%"><img src="assets/cut_roasted_beef_interactive_4d.gif" alt="cut_roasted_beef" width="480" height="380"></td>
+    <td width="50%"><img src="assets/02_flames_interactive_4d.gif" alt="02_Flames" width="480" height="380"></td>
+  </tr>
+</table>
 
 ## 环境配置
 
