@@ -185,3 +185,12 @@ We thank the maintainers of these open-source projects:
 [STGS](https://github.com/oppo-us-research/SpacetimeGaussians),
 [E-D3DGS](https://github.com/JeongminB/E-D3DGS),
 [MiDaS](https://github.com/isl-org/MIDAS).
+
+## License
+
+Original code contributions by **STEGF contributors** are licensed under MIT;
+see [LICENSE](LICENSE). Upstream code and modifications to it retain their
+applicable licenses, including the Gaussian Splatting non-commercial research
+and evaluation restrictions. See [third-party notices](THIRD_PARTY_NOTICES.md)
+for attribution and component-specific terms. Datasets, pretrained weights,
+and dataset-derived demonstration media retain their respective terms.

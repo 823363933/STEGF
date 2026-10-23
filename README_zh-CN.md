@@ -160,3 +160,7 @@ python script/run_n3d_train_test.py \
 [STGS](https://github.com/oppo-us-research/SpacetimeGaussians)
 [E-D3DGS](https://github.com/JeongminB/E-D3DGS)
 [MiDaS](https://github.com/isl-org/MIDAS)
+
+## 许可证
+
+**STEGF contributors** 新增的原创代码采用 MIT 许可证，详见 [LICENSE](LICENSE)。上游代码及其修改继续遵守各自的许可证，包括 Gaussian Splatting 的非商业研究和评估用途限制。来源、归属及组件许可详见[第三方许可说明](THIRD_PARTY_NOTICES.md)。数据集、预训练权重和基于数据集生成的展示媒体继续适用各自的授权条件。

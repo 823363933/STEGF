@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) 2023 OPPO
+Copyright (c) 2026 STEGF contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,3 +25,34 @@ SOFTWARE.
 
 Additional Use Limitation
 SpacetimeGaussians is subject to the use limitation of Gaussian-Splatting, please refer to Gaussian-Splatting License (./thirdparty/gaussian_splatting/LICENSE.md) for details.
+
+=============================================
+
+Scope of the MIT License
+
+The MIT terms above apply to the original source code contributed by STEGF
+contributors, except where a file or component is governed by another license.
+They also preserve the MIT grant for upstream portions already distributed
+under MIT, including the applicable SpacetimeGaussians code by OPPO.
+
+Third-party code and code derived from it remain subject to their applicable
+upstream licenses and copyright notices. In particular, the Gaussian-Splatting
+License continues to govern the Gaussian Splatting-derived model, renderer,
+utilities, rasterization extension, simple-KNN code, and modifications to those
+components. The MIT grant for original STEGF contributions does not remove or
+replace those terms, including their non-commercial research and evaluation
+use limitation. Commercial use of those components requires the applicable
+upstream licensors' prior and explicit consent.
+
+Other components, including MMCV, GLM, and LPIPS, retain their own licenses.
+Existing copyright notices, license texts, and component-specific terms must
+be preserved when redistributing the relevant code. The STEGF contributors
+copyright notice covers their original contributions only and does not claim
+ownership of upstream code.
+
+This source-code license does not grant rights to third-party datasets,
+pretrained weights, or dataset-derived demonstration media. Those materials
+remain subject to their respective rights and terms.
+
+See THIRD_PARTY_NOTICES.md and the license files and source headers referenced
+there for component-specific attribution and licensing information.
