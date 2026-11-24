@@ -69,6 +69,10 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        self.field_long_sequence_uint8_loading = 0
+        self.field_long_sequence_median_chunk_pixels = 32768
+        # Sparse initialization only; image supervision always keeps every frame.
+        self.field_sparse_initialization_stride = 1
         self.veryrify_llff = 0
         self.eval = False
         self.model = "gmodel" # 
@@ -127,6 +131,11 @@ class ModelParams(ParamGroup):
         self.field_static_motion_scale = 0.05
         self.field_static_opacity_scale = 0.02
         self.field_static_app_scale = 0.05
+        # Zero keeps legacy queries; positive values filter by the temporal kernel.
+        self.field_static_query_kernel_threshold = 0.0
+        from helper_narrow_birth import DEFAULTS as narrow_birth_defaults
+        for name, value in narrow_birth_defaults.items():
+            setattr(self, name, value)
         self.field_static_temporal_residual = 0
         self.field_static_temporal_frames = 50
         self.field_static_temporal_scale = 1.0
@@ -327,6 +336,10 @@ class ModelParams(ParamGroup):
         self.field_motion_model = "polynomial"
         self.field_couptest_mode = "none"
         self.field_couptest_initial_existence_floor = 0.95
+        self.field_couptest_initial_window_frames = 0.0
+        self.field_couptest_initialization_mode = "uniform"
+        self.field_couptest_initial_sparse_prefix_frames = 50
+        self.field_couptest_initial_sparse_prefix_scale = 1.0
         self.field_couptest_grid_resolution = "auto_finest"
         self.field_couptest_grid_feature_dim = 8
         self.field_couptest_grid_hidden_dim = 32
@@ -376,6 +389,8 @@ class ModelParams(ParamGroup):
         self.field_mvstruct_min_event_views = 3
         self.field_mvstruct_dssim_weight = 0.0
         self.field_mvstruct_densify = 0
+        self.field_mvstruct_unlimited = 0
+        self.field_mvstruct_time_sampling = "random"
         self.field_mvstruct_densify_start = 10500
         self.field_mvstruct_densify_until = 20000
         self.field_mvstruct_densify_interval = 500
@@ -413,6 +428,7 @@ class ModelParams(ParamGroup):
         self.field_mvstruct_specialize_offset_ratio = 0.5
         self.field_mvstruct_specialize_scale_ratio = 0.5
         self.field_temporal_visibility_densify = 0
+        self.field_densify_temporal_filter = 0
         self.field_temporal_visibility_min_opacity = 0.05
         self.field_temporal_adaptive_threshold = 0
         self.field_temporal_adaptive_alpha = 0.8
@@ -558,6 +574,9 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        # duration is registered by the train/test entry points, not this group.
+        duration = getattr(args, "duration", None)
+        g.duration = 50 if duration is None else int(duration)
         return g
 
 class PipelineParams(ParamGroup):
@@ -592,8 +611,32 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3_000
         self.opacity_reset_at = 10000
+        # Opt-in densify=2 override; explicit resets use field_global_reset_schedule.
+        self.field_disable_legacy_opacity_reset = 0
         self.densify_from_iter = 500
         self.densify_until_iter = 9000
+        self.field_n3d_control_time_scale = 1
+        self.field_n3d_quality_schedule = 0
+        self.field_n3d_reset_schedule = "6000,12000,18000,24000,30000,36000,42000,48000,54000"
+        self.field_n3d_reset_recovery = 400
+        self.field_n3d_prune_start = 600
+        self.field_n3d_prune_until = 90000
+        self.field_n3d_prune_interval = 200
+        self.field_n3d_late_prune_interval = 1000
+        self.field_n3d_bounds_prune_iter = 60000
+        # Opt-in refinement clocks; do not extend ordinary growth or resets.
+        self.field_late_prune = 0
+        self.field_late_prune_start = 9000
+        self.field_late_prune_until = 80000
+        self.field_late_prune_interval = 1000
+        self.field_late_prune_min_birth_age = 2000
+        self.field_tail_lr_decay = 0
+        self.field_tail_lr_start = 60000
+        self.field_tail_lr_until = 90000
+        self.field_tail_lr_final_factor = 0.1
+        self.field_mvstruct_refinement = 0
+        self.field_refinement_xyz_join = 10000
+        self.field_refinement_xyz_until = 80000
         self.densify_grad_threshold = 0.0002
         self.rgb_lr = 0.0001
         self.desicnt = 6

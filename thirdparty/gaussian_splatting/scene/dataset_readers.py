@@ -11,6 +11,7 @@
 
 import os
 import sys
+import struct
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -91,7 +92,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, near, far, startime=0, duration=50):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, near, far, startime=0, duration=50, defer_image_loading=False):
     cam_infos = []
 
     # pose in llff. pipeline by hypereel 
@@ -177,7 +178,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, near, far, 
             image_name = os.path.basename(image_path).split(".")[0]
             image_path = image_path.replace("colmap_"+str(startime), "colmap_{}".format(j), 1)
             assert os.path.exists(image_path), "Image {} does not exist!".format(image_path)
-            image = Image.open(image_path)
+            # Long sequences retain paths only. Decoding happens one image at
+            # a time during camera construction, avoiding thousands of open
+            # file handles and retained full-resolution PIL pixel buffers.
+            image = None if defer_image_loading else Image.open(image_path)
             if j == startime:
                 # cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height, near=near, far=far, timestamp=(j-startime)/duration, pose=hpposes[sortednamedict[os.path.basename(extr.name)]], hpdirecitons=hpdirecitons,cxr=0.0, cyr=0.0)
                 cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path, image_name=image_name, width=width, height=height, near=near, far=far, timestamp=(j-startime)/duration, pose=1, hpdirecitons=1,cxr=0.0, cyr=0.0)
@@ -777,7 +781,75 @@ def readColmapSceneInfoMv(path, images, eval, llffhold=8, multiview=False, durat
 
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, multiview=False, duration=50):
+def _read_colmap_sparse_initialization(path, starttime, duration, stride=1):
+    """Sample source points, not cameras; keep original normalized timestamps."""
+    try:
+        stride_int = int(stride)
+        valid = (not isinstance(stride, bool) and 1 <= stride_int <= int(duration)
+                 and float(stride) == stride_int)
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError("field_sparse_initialization_stride must be an integer in [1, duration]")
+    stride = stride_int
+    offsets = list(range(0, int(duration), stride))
+    suffix = "" if stride == 1 else "_stride{}".format(stride)
+    totalply_path = os.path.join(
+        path, "sparse", "0", "points3D_total{}{}.ply".format(duration, suffix)
+    )
+    scene_root = os.path.dirname(path)
+
+    if not os.path.exists(totalply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        totalxyz, totalrgb, totaltime = [], [], []
+        for offset in offsets:
+            source = os.path.join(scene_root, "colmap_{}".format(starttime + offset),
+                                  "sparse", "0", "points3D.bin")
+            xyz, rgb, _ = read_points3D_binary(source)
+            totalxyz.append(xyz)
+            totalrgb.append(rgb)
+            totaltime.append(np.ones((xyz.shape[0], 1)) * offset / duration)
+        xyz = np.concatenate(totalxyz, axis=0)
+        rgb = np.concatenate(totalrgb, axis=0)
+        times = np.concatenate(totaltime, axis=0)
+        assert xyz.shape[0] == rgb.shape[0]
+        storePly(totalply_path, np.concatenate((xyz, times), axis=1), rgb)
+    try:
+        pcd = fetchPly(totalply_path)
+    except Exception:
+        if stride != 1:
+            raise RuntimeError("Cannot read sampled initialization cache: " + totalply_path)
+        pcd = None  # Preserve the legacy full-initialization loading behavior.
+
+    if stride != 1:
+        # Reject stale/incorrect sampled caches instead of silently changing the experiment.
+        frames_float = np.asarray(pcd.times).reshape(-1) * duration
+        frames = np.rint(frames_float)
+        if (not np.isfinite(frames_float).all()
+                or not np.all(np.abs(frames_float - frames) < 1e-3)):
+            raise RuntimeError("Invalid source timestamps in sampled initialization cache: " + totalply_path)
+        unique, counts = np.unique(frames.astype(np.int64), return_counts=True)
+        actual_counts = dict(zip(unique.tolist(), counts.tolist()))
+        expected_counts = {}
+        for offset in offsets:
+            source = os.path.join(scene_root, "colmap_{}".format(starttime + offset),
+                                  "sparse", "0", "points3D.bin")
+            with open(source, "rb") as handle:
+                count = struct.unpack("<Q", handle.read(8))[0]
+            if count:
+                expected_counts[offset] = count
+        if actual_counts != expected_counts:
+            raise RuntimeError("Sampled initialization cache does not match source frames/counts: "
+                               + totalply_path + "; back it up before rebuilding")
+        print("[STEGF][Init][Dataset] Sparse initialization: stride={}, "
+              "source_frames={}/{}, points={}, cache={}; RGB supervision retains all {} frames"
+              .format(stride, len(offsets), duration, len(pcd.points), totalply_path, duration),
+              file=sys.stderr, flush=True)
+    return pcd, totalply_path
+
+
+def readColmapSceneInfo(path, images, eval, llffhold=8, multiview=False, duration=50,
+                        defer_image_loading=False, sparse_initialization_stride=1):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -800,7 +872,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, multiview=False, duratio
     starttime = int(starttime)
     
 
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), near=near, far=far, startime=starttime, duration=duration)
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), near=near, far=far, startime=starttime, duration=duration, defer_image_loading=defer_image_loading)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
      
 
@@ -828,31 +900,9 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, multiview=False, duratio
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    totalply_path = os.path.join(path, "sparse/0/points3D_total" + str(duration) + ".ply")
-    
-
-    
-    if not os.path.exists(totalply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        totalxyz = []
-        totalrgb = []
-        totaltime = []
-        for i in range(starttime, starttime + duration):
-            thisbin_path = os.path.join(path, "sparse/0/points3D.bin").replace("colmap_"+ str(starttime), "colmap_" + str(i), 1)
-            xyz, rgb, _ = read_points3D_binary(thisbin_path)
-            totalxyz.append(xyz)
-            totalrgb.append(rgb)
-            totaltime.append(np.ones((xyz.shape[0], 1)) * (i-starttime) / duration)
-        xyz = np.concatenate(totalxyz, axis=0)
-        rgb = np.concatenate(totalrgb, axis=0)
-        totaltime = np.concatenate(totaltime, axis=0)
-        assert xyz.shape[0] == rgb.shape[0]  
-        xyzt =np.concatenate( (xyz, totaltime), axis=1)     
-        storePly(totalply_path, xyzt, rgb)
-    try:
-        pcd = fetchPly(totalply_path)
-    except:
-        pcd = None
+    pcd, totalply_path = _read_colmap_sparse_initialization(
+        path, starttime, duration, sparse_initialization_stride,
+    )
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

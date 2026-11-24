@@ -44,7 +44,16 @@ class Camera(nn.Module):
             self.data_device = torch.device("cuda")
         # image is real image 
         if not isinstance(image, tuple):
-            if getgtisint8():
+            if image.dtype == torch.uint8:
+                if getgtisint8():
+                    self.original_image = image.to(self.data_device)
+                else:
+                    # Rendering utilities expect normalized float GT and do
+                    # not enable the training-only gtisint8 environment flag.
+                    self.original_image = image.to(
+                        device=self.data_device, dtype=torch.float32,
+                    ).div_(255.0)
+            elif getgtisint8():
                 self.original_image = (image*255).to(torch.uint8).to(self.data_device)
             else:
                 if "camera_" not in image_name:
@@ -161,7 +170,10 @@ class Camerass(nn.Module):
         if not isinstance(image, tuple):
            
             if getgtisint8():
-                self.original_image = (image*255).to(torch.uint8).to(self.data_device)
+                if image.dtype == torch.uint8:
+                    self.original_image = image.to(self.data_device)
+                else:
+                    self.original_image = (image*255).to(torch.uint8).to(self.data_device)
             else:
                 if "camera_" not in image_name:
                     self.original_image = image.clamp(0.0, 1.0).to(self.data_device)

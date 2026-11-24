@@ -1,0 +1,50 @@
+{
+  "n3d50": {
+    "dataset": "n3d",
+    "duration": 50,
+    "scenes": {
+      "coffee_martini": {"config": "configs/n3d_ours/coffee_martini.json", "train_steps": 30000, "checkpoint": 30000},
+      "cook_spinach": {"config": "configs/n3d_ours/cook_spinach.json", "train_steps": 30000, "checkpoint": 30000},
+      "cut_roasted_beef": {"config": "configs/n3d_ours/cut_roasted_beef.json", "train_steps": 30000, "checkpoint": 30000},
+      "flame_salmon_1": {"config": "configs/n3d_ours/flame_salmon_1.json", "train_steps": 30000, "checkpoint": 30000},
+      "flame_steak": {"config": "configs/n3d_ours/flame_steak.json", "train_steps": 30000, "checkpoint": 30000},
+      "sear_steak": {"config": "configs/n3d_ours/sear_steak.json", "train_steps": 30000, "checkpoint": 30000}
+    }
+  },
+  "n3d300": {
+    "dataset": "n3d",
+    "duration": 300,
+    "scenes": {
+      "coffee_martini": {"config": "configs/n3d_ours_300_three_group_90k/coffee_martini.json", "train_steps": 90000, "checkpoint": 80000},
+      "cook_spinach": {"config": "configs/n3d_ours_300_formal50_stride6_120k_refine/cook_spinach.json", "train_steps": 120000, "checkpoint": 50000},
+      "cut_roasted_beef": {"config": "configs/n3d_ours_300_three_group_90k/cut_roasted_beef.json", "train_steps": 90000, "checkpoint": 30000},
+      "flame_salmon_1": {"config": "configs/n3d_ours_300_three_group_90k_stride6/flame_salmon_1.json", "train_steps": 90000, "checkpoint": 90000},
+      "flame_steak": {"config": "configs/n3d_ours_300_formal50_stride6_120k/flame_steak.json", "train_steps": 120000, "checkpoint": 30000},
+      "sear_steak": {"config": "configs/n3d_ours_300_formal50_stride6_120k/sear_steak.json", "train_steps": 120000, "checkpoint": 10000}
+    }
+  },
+  "tech": {
+    "dataset": "tech",
+    "duration": 50,
+    "scenes": {
+      "Birthday": {"config": "configs/tech_ours/Birthday.json", "train_steps": 30000, "checkpoint": 30000},
+      "Fabien": {"config": "configs/tech_ours/Fabien.json", "train_steps": 30000, "checkpoint": 30000},
+      "Painter": {"config": "configs/tech_ours/Painter.json", "train_steps": 30000, "checkpoint": 30000},
+      "Theater": {"config": "configs/tech_ours/Theater.json", "train_steps": 30000, "checkpoint": 30000},
+      "Train": {"config": "configs/tech_ours/Train.json", "train_steps": 30000, "checkpoint": 30000}
+    }
+  },
+  "immersive": {
+    "dataset": "immersive",
+    "duration": 50,
+    "scenes": {
+      "01_Welder": {"config": "configs/immersive_ours/01_Welder.json", "train_steps": 30000, "checkpoint": 30000},
+      "02_Flames": {"config": "configs/immersive_ours/02_Flames.json", "train_steps": 30000, "checkpoint": 30000},
+      "04_Truck": {"config": "configs/immersive_ours/04_Truck.json", "train_steps": 30000, "checkpoint": 30000},
+      "09_Alexa": {"config": "configs/immersive_ours/09_Alexa.json", "train_steps": 30000, "checkpoint": 30000},
+      "10_Alexa": {"config": "configs/immersive_ours/10_Alexa.json", "train_steps": 30000, "checkpoint": 25000},
+      "11_Alexa": {"config": "configs/immersive_ours/11_Alexa.json", "train_steps": 30000, "checkpoint": 30000},
+      "12_Cave": {"config": "configs/immersive_ours/12_Cave.json", "train_steps": 30000, "checkpoint": 30000}
+    }
+  }
+}

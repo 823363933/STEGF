@@ -132,6 +132,31 @@ class SandwichDeepWide(nn.Module):
         return result
 
 
+class SandwichDeepWideNoActSS(nn.Module):
+    """Immersive deep-wide decoder without a bounded output activation."""
+
+    def __init__(self, dim, outdim=3, bias=False, hidden_dim=12):
+        super(SandwichDeepWideNoActSS, self).__init__()
+
+        self.mlp1 = nn.Conv2d(12, hidden_dim, kernel_size=1, bias=bias)
+        self.mlp2 = nn.Conv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=1,
+            bias=bias,
+        )
+        self.mlp3 = nn.Conv2d(hidden_dim, outdim, kernel_size=1, bias=bias)
+        self.relu = nn.ReLU()
+
+    def forward(self, input, rays, time=None):
+        albedo, spec, timefeature = input.chunk(3, dim=1)
+        specular = torch.cat([spec, timefeature, rays], dim=1)
+        specular = self.relu(self.mlp1(specular))
+        specular = self.relu(self.mlp2(specular))
+        specular = self.mlp3(specular)
+        return albedo + specular
+
+
 class Sandwichnoact(nn.Module):
     def __init__(self, dim, outdim=3, bias=False):
         super(Sandwichnoact, self).__init__()
@@ -432,6 +457,11 @@ def getcolormodel(rgbfuntion):
         rgbdecoder = SandwichWide(9,3)
     elif rgbfuntion in ("sandwich_deep_wide", "deep_wide_sandwich"):
         rgbdecoder = SandwichDeepWide(9,3)
+    elif rgbfuntion in (
+        "sandwich_deep_wide_noactss",
+        "deep_wide_sandwich_noactss",
+    ):
+        rgbdecoder = SandwichDeepWideNoActSS(9,3)
     
     elif rgbfuntion == "sandwichnoact":
         rgbdecoder = Sandwichnoact(9,3)

@@ -12,6 +12,7 @@
 from scene.cameras import Camera
 from scene.cameras import Camerass # ass 
 import numpy as np
+from PIL import Image
 
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
@@ -21,9 +22,32 @@ import sys
 WARNED = False
 
 
+def _pil_to_torch_uint8(pil_image, resolution):
+    """Resize directly into CHW uint8 without allocating float intermediates."""
+    with pil_image.resize(resolution) as resized:
+        array = np.array(resized, copy=True)
+    if array.dtype != np.uint8:
+        raise ValueError("Long-sequence loading requires 8-bit source images")
+    tensor = torch.from_numpy(array)
+    if tensor.ndim == 3:
+        return tensor.permute(2, 0, 1)
+    return tensor.unsqueeze(dim=-1).permute(2, 0, 1)
+
+
+def _release_source_image(cam_info):
+    image = getattr(cam_info, "image", None)
+    close = getattr(image, "close", None)
+    if callable(close):
+        close()
+
+
 
 def loadCamv2(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+    if cam_info.image is None:
+        with Image.open(cam_info.image_path) as source_image:
+            orig_w, orig_h = source_image.size
+    else:
+        orig_w, orig_h = cam_info.image.size
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
@@ -44,7 +68,17 @@ def loadCamv2(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    if bool(getattr(args, "field_long_sequence_uint8_loading", 0)):
+        if torch.device(args.data_device).type != "cpu":
+            raise ValueError("Long-sequence uint8 loading requires data_device=cpu")
+        # CameraInfo keeps the original PIL object alive for the whole Scene
+        # initialization. Close it before decoding, and reopen by path so that
+        # test aliases and additional resolution scales can still be loaded.
+        _release_source_image(cam_info)
+        with Image.open(cam_info.image_path) as source_image:
+            resized_image_rgb = _pil_to_torch_uint8(source_image, resolution)
+    else:
+        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None
@@ -235,7 +269,7 @@ def loadCamnogt(args, id, cam_info, resolution_scale):
 
 
 
-def _report_camera_progress(current, total, progress_label):
+def _report_camera_progress(current, total, progress_label, gt_bytes=None):
     if not progress_label:
         return
 
@@ -247,6 +281,17 @@ def _report_camera_progress(current, total, progress_label):
             f"[STEGF][Init][Cameras] {progress_label}: "
             f"{current}/{total}"
         )
+        if gt_bytes is not None:
+            message += f", GT={gt_bytes / (1024 ** 3):.2f} GiB"
+            try:
+                with open("/proc/self/status", encoding="utf-8") as status:
+                    for line in status:
+                        if line.startswith("VmRSS:"):
+                            rss_gib = int(line.split()[1]) / (1024 ** 2)
+                            message += f", RSS={rss_gib:.2f} GiB"
+                            break
+            except OSError:
+                pass
         sys.stderr.write("\r" + message)
         if current == total:
             sys.stderr.write("\n")
@@ -261,11 +306,23 @@ def cameraList_from_camInfosv2(
     progress_label=None,
 ):
     camera_list = []
+    low_memory_loading = bool(
+        getattr(args, "field_long_sequence_uint8_loading", 0)
+    )
+    if low_memory_loading and ss:
+        raise ValueError("Long-sequence uint8 loading supports N3D cameras only")
+    gt_bytes = 0
 
     if not ss: #
         for id, c in enumerate(cam_infos):
             camera_list.append(loadCamv2(args, id, c, resolution_scale))
-            _report_camera_progress(id + 1, len(cam_infos), progress_label)
+            if low_memory_loading:
+                image = camera_list[-1].original_image
+                gt_bytes += image.numel() * image.element_size()
+            _report_camera_progress(
+                id + 1, len(cam_infos), progress_label,
+                gt_bytes=gt_bytes if low_memory_loading else None,
+            )
     else:
         for id, c in enumerate(cam_infos):
             camera_list.append(loadCamv2ss(args, id, c, resolution_scale))

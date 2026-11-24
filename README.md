@@ -165,6 +165,31 @@ python script/run_n3d_train_test.py \
 By default, N3D and Technicolor scenes resolve under `/root/autodl-tmp`.
 Other data roots can always be supplied explicitly.
 
+Evaluation saves one shared GT set at `<savepath>/<scene>/gt/test/`.
+All checkpoints, compact evaluations and photometric fits reuse it; rendered
+and fitted images remain in their respective checkpoint directories.
+
+### Paper checkpoints
+
+[Paper run settings](configs/paper_runs.json) records the scene configuration,
+original training budget, and selected checkpoint for each protocol:
+`n3d300`, `n3d50`, `tech` (50 frames), and `immersive` (50 frames).
+Pass the corresponding scene configuration to the preprocessor with
+`--configpath` (in particular for the 300-frame N3D data).
+
+```bash
+python script/reproduce_paper.py --profile n3d300 --scene cook_spinach \
+  --datapath /path/to/N3D-300 --savepath output/paper
+```
+
+Use `--dry_run` to print the commands without running them. After training,
+the runner exports and evaluates the **selected** compact checkpoint under
+`<savepath>/<profile>/<scene>/compact/`, without fitting to held-out images.
+Data and trained weights are not included. Exact numerical reproduction also
+depends on the prepared inputs; the historical 50-frame `coffee_martini`
+result used different COLMAP and frame-0 initialization inputs from those
+produced by the current preprocessing recipe.
+
 ## Compact inference model
 
 The standard runner automatically exports the compact model. The exporter

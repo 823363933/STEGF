@@ -40,12 +40,25 @@ from tqdm import tqdm
 sys.path.append("./thirdparty/gaussian_splatting")
 
 from thirdparty.gaussian_splatting.utils.loss_utils import l1_loss, ssim, l2_loss, rel_loss
-from helper_train import getrenderpip, getmodel, getloss, controlgaussians, reloadhelper, trbfunction, setgtisint8, getgtisint8
+from helper_train import getrenderpip, getmodel, getloss, controlgaussians, reloadhelper, trbfunction, setgtisint8, getgtisint8, n3d_control_schedule, n3d_quality_schedule, n3d_quality_actions
+from helper_train import (long_sequence_refinement_schedule, validate_long_sequence_refinement,
+                          apply_refinement_learning_rate, prune_late_low_opacity,
+                          check_refinement_fixed_topology)
+from helper_image import cpu_uint8_to_float32, temporal_median_mad_cpu
 from thirdparty.gaussian_splatting.scene import Scene
 from argparse import Namespace
 from thirdparty.gaussian_splatting.helper3dg import getparser, getrenderparts
 from thirdparty.gaussian_splatting.renderer import observation_contribution_ours_full
 from thirdparty.gaussian_splatting.utils.graphics_utils import geom_transform_points
+from helper_background import (
+    INITIAL_CAMERA_DEPTH_BASE,
+    align_background_depth_like,
+    backproject_background_pixels,
+    collect_initial_camera_depths,
+    finite_distribution,
+    initial_camera_depth_base,
+    summarize_background_geometry,
+)
 
 
 def _init_status(message):
@@ -176,11 +189,83 @@ def compute_highfreq_densify_gate(image, gt_image, viewpoint_camera, means3D, ga
 
 
 def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration=50, rgbfunction="rgbv1", rdpip="v2"):
+    refinement_schedule = long_sequence_refinement_schedule(opt)
+    if bool(getattr(opt, "field_disable_legacy_opacity_reset", 0)):
+        if densify != 2:
+            raise ValueError("The legacy opacity-reset override requires densify=2")
+        reset_schedule = str(getattr(dataset, "field_global_reset_schedule", "")).strip()
+        try:
+            reset_steps = tuple(int(value.strip()) for value in reset_schedule.split(","))
+        except ValueError:
+            raise ValueError("An explicit positive opacity-reset schedule is required") from None
+        if (not bool(getattr(dataset, "field_global_reset", 0))
+                or not reset_steps or min(reset_steps) <= 0
+                or tuple(sorted(set(reset_steps))) != reset_steps):
+            raise ValueError("Enable field_global_reset with sorted unique positive reset steps")
+        _init_status(
+            "N3D opacity reset: legacy periodic resets disabled; explicit steps={}".format(
+                ",".join(str(step) for step in reset_steps)
+            )
+        )
+        control_steps = [step for step in range(1, min(int(opt.densify_until_iter), int(opt.iterations) + 1))
+                         if step > opt.densify_from_iter and step % opt.densification_interval == 0]
+        growth_steps = control_steps[:max(int(opt.desicnt), 0)]
+        prune_steps = control_steps[len(growth_steps):]
+        _init_status(
+            "N3D ordinary control: densify={}..{}/{} ({} events), "
+            "early_low_opacity_prune={}..{}/{} ({} events)".format(
+                growth_steps[0] if growth_steps else "none", growth_steps[-1] if growth_steps else "none",
+                opt.densification_interval, len(growth_steps),
+                prune_steps[0] if prune_steps else "none", prune_steps[-1] if prune_steps else "none",
+                opt.densification_interval, len(prune_steps),
+            )
+        )
+    if (refinement_schedule is not None and refinement_schedule.get('unlimited', False)
+            and os.path.exists(opt.prevpath)):
+        raise ValueError("A PLY-only warm start cannot restore the refinement training clock; start this experiment fresh")
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     first_iter = 0
     render, GRsetting, GRzer = getrenderpip(rdpip)
+
+    if densify == 1:
+        clock = n3d_control_schedule(opt)
+        quality = n3d_quality_schedule(opt)
+        if quality is not None:
+            if not bool(getattr(dataset, "field_disable_global_omega_split", 0)):
+                raise ValueError("The long-sequence schedule requires disabled global omega split")
+            dense_steps = [i for i in range(1, min(int(opt.densify_until_iter), int(opt.iterations) + 1))
+                           if n3d_quality_actions(quality, i)["densify"]]
+            _init_status(
+                "N3D quality schedule: ordinary_densify={}..{}/{} (up to {} events), "
+                "growth_cap=none, low_opacity_prune={}..{}/{} (late_interval={}), "
+                "opacity_reset={} prune_only_recovery={}, bounds_prune={}, topology_stop={}, "
+                "temporal_stats_filter={}".format(
+                    dense_steps[0] if dense_steps else "none", dense_steps[-1] if dense_steps else "none",
+                    opt.densification_interval, len(dense_steps), quality["prune_start"],
+                    quality["prune_until"], quality["prune_interval"], quality["late_prune_interval"],
+                    ",".join(str(i) for i in quality["reset_steps"]), quality["recovery"],
+                    quality["bounds_iter"], quality["prune_until"],
+                    int(bool(getattr(dataset, "field_densify_temporal_filter", 0))),
+                )
+            )
+        elif clock["scale"] != 1:
+            interval = int(opt.densification_interval)
+            first_dense = (int(opt.densify_from_iter) // interval + 1) * interval
+            last_dense = first_dense + max(int(opt.desicnt) - 1, 0) * interval
+            resets = range(clock["opacity_reset_interval"], int(opt.densify_until_iter),
+                           clock["opacity_reset_interval"])
+            _init_status(
+                "N3D control clock x{}: ordinary_densify={}..{}/{} ({} events), "
+                "early_until={}, opacity_reset={}, low_opacity_prune_until={}, "
+                "bounds_prune={}, spatial_prune_interval={} offset={}".format(
+                    clock["scale"], first_dense, last_dense, interval, opt.desicnt,
+                    opt.densify_until_iter, ",".join(str(i) for i in resets),
+                    clock["low_opacity_prune_until"], clock["bounds_prune_iter"],
+                    clock["spatial_prune_interval"], clock["spatial_prune_offset"],
+                )
+            )
 
     init_started = time.perf_counter()
     _init_status(f"1/5 Constructing Gaussian model: {dataset.model}")
@@ -189,6 +274,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     gaussians = GaussianModel(dataset.sh_degree, rgbfunction)
     if hasattr(gaussians, "configure_euler_field"):
         gaussians.configure_euler_field(dataset)
+    validate_long_sequence_refinement(refinement_schedule, opt, gaussians, densify)
     gaussians.trbfslinit = -1*opt.trbfslinit # 
     gaussians.preprocesspoints = opt.preprocesspoints 
     gaussians.addsphpointsscale = opt.addsphpointsscale 
@@ -208,6 +294,14 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         f"gaussians={int(gaussians.get_xyz.shape[0])}"
     )
     write_stegf_config(args, gaussians)
+    if gaussians.field_static_query_kernel_threshold > 0.0 and gaussians.use_euler_field:
+        gaussians._validate_static_query_kernel_policy()
+        _init_status(
+            "Static appearance query filter: current temporal kernel >= {:.8f}; "
+            "Gaussian rendering and densification thresholds unchanged".format(
+                gaussians.field_static_query_kernel_threshold
+            )
+        )
     
 
     currentxyz = gaussians._xyz 
@@ -227,6 +321,28 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     _init_status("4/5 Building optimizer and gradient caches")
     gaussians.training_setup(opt)
+    if bool(gaussians.field_mvstruct_unlimited) != bool(getattr(opt, 'field_mvstruct_refinement', 0)):
+        raise ValueError("Unlimited multi-view growth requires its paired refinement policy")
+    if refinement_schedule is not None:
+        refinement_metadata = dict(refinement_schedule)
+        refinement_metadata["xyz_lr"] = dict(
+            init=opt.position_lr_init, final=opt.position_lr_final,
+            max_steps=opt.position_lr_max_steps,
+        )
+        refinement_metadata["fixed_rate_base_lrs"] = {
+            group["name"]: group["_stegf_base_lr"]
+            for group in gaussians.optimizer.param_groups if group["name"] != "xyz"
+        }
+        refinement_metadata["checkpoint_timing"] = "after_optimizer_and_topology"
+        with open(os.path.join(args.model_path, "refinement_schedule.json"), "w") as handle:
+            json.dump(refinement_metadata, handle, indent=2, sort_keys=True)
+        _init_status("Independent long refinement: {}".format(json.dumps(refinement_schedule, sort_keys=True)))
+        if refinement_schedule.get('unlimited', False):
+            _init_status(
+                "Unlimited multi-view refinement: stats=10050..40000/50, "
+                "growth=10500..40000/500, budgets=none, time=shuffle_cycle; "
+                "base-opacity prune=11000..80000/1000, child protection=3000; "
+                "fixed topology from 80001 (legacy spatial prune also stops)")
     if bool(getattr(gaussians, "field_temporal_visibility_densify", False)) or bool(
         getattr(gaussians, "field_temporal_adaptive_threshold", False)
     ):
@@ -291,6 +407,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     validdepthdict = {}
     emsstartfromiterations = opt.emsstart   
     gtisint8 = getgtisint8()
+    long_sequence_uint8_loading = bool(
+        getattr(dataset, "field_long_sequence_uint8_loading", 0)
+    )
 
     if getattr(gaussians, "field_staged_training", False) and (not getattr(gaussians, "field_v23_compat", False)):
         gaussians.field_warmup_iters = max(int(gaussians.field_warmup_iters), int(opt.densify_until_iter))
@@ -301,6 +420,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
     def get_gt_image(camera):
         if gtisint8:
+            if long_sequence_uint8_loading:
+                # Match float GT from PILtoTorch: normalize on CPU before
+                # transfer, instead of changing CPU division to GPU division.
+                return cpu_uint8_to_float32(camera.original_image).cuda()
             return camera.original_image.float().cuda() / 255.0
         return camera.original_image.float().cuda()
 
@@ -394,19 +517,34 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         cameras_by_name = {}
         for cam in traincameralist:
             cameras_by_name.setdefault(cam.image_name, []).append(cam)
-        for image_name, cameras in cameras_by_name.items():
+        for camera_index, (image_name, cameras) in enumerate(cameras_by_name.items()):
             ordered = sorted(cameras, key=lambda cam: float(cam.timestamp))
-            frames = [get_gt_image(cam).detach().float().cpu() for cam in ordered]
-            stack = torch.stack(frames, dim=0)
-            median = torch.median(stack, dim=0).values
-            mad = torch.median(torch.abs(stack - median.unsqueeze(0)), dim=0).values.mean(dim=0)
+            if long_sequence_uint8_loading:
+                chunk_pixels = int(getattr(
+                    dataset, "field_long_sequence_median_chunk_pixels", 32768,
+                ))
+                _init_status(
+                    "Observation prior {}/{}: camera={}, frames={}, "
+                    "CPU spatial tile={} pixels".format(
+                        camera_index + 1, len(cameras_by_name), image_name,
+                        len(ordered), chunk_pixels,
+                    )
+                )
+                median, mad = temporal_median_mad_cpu(
+                    [cam.original_image for cam in ordered], chunk_pixels,
+                )
+            else:
+                frames = [get_gt_image(cam).detach().float().cpu() for cam in ordered]
+                stack = torch.stack(frames, dim=0)
+                median = torch.median(stack, dim=0).values
+                mad = torch.median(torch.abs(stack - median.unsqueeze(0)), dim=0).values.mean(dim=0)
+                del stack
             stable = mad < float(getattr(gaussians, "field_bg_prior_stability_threshold", 0.12))
             priors[image_name] = {
                 "median": median.contiguous(),
                 "mad": mad.contiguous(),
                 "stable": stable.contiguous(),
             }
-            del stack
         print(f"[STEGF] Built temporal-median observation priors for {len(priors)} cameras.")
         return priors
 
@@ -2228,6 +2366,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             depth_np = cache.get("depth_like", {}).get((0, cam_name))
             used_time_index = 0
         if depth_np is None:
+            if getattr(camera, "fisheyemapper", None) is not None:
+                raise RuntimeError(
+                    f"Immersive background insertion requires pinhole MiDaS data for "
+                    f"camera={cam_name}, time={time_index}. Run "
+                    "script/precompute_midas_beit_depth_like.py before training."
+                )
             if not bg_dense_beit_cache["warned"]:
                 print(f"[STEGF] Dense BEiT warning: no raw_depth_like.npy for time={time_index}, camera={cam_name}.")
                 bg_dense_beit_cache["warned"] = True
@@ -2235,19 +2379,17 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         depth_like = torch.from_numpy(depth_np).to(device="cuda", dtype=torch.float32)
         height, width = int(target_shape[0]), int(target_shape[1])
-        if depth_like.shape != (height, width):
-            depth_like = F.interpolate(
-                depth_like.view(1, 1, depth_like.shape[0], depth_like.shape[1]),
-                size=(height, width),
-                mode="bilinear",
-                align_corners=False,
-            ).view(height, width)
-
-        valid = torch.isfinite(depth_like)
+        depth_like, valid, alignment_stats = align_background_depth_like(
+            depth_like, camera, (height, width),
+        )
+        is_fisheye = getattr(camera, "fisheyemapper", None) is not None
         if torch.count_nonzero(valid) == 0:
-            return depth_like, torch.zeros((height, width), device="cuda", dtype=torch.bool), {
+            # An invalid/out-of-view fisheye prior must not allow background
+            # insertion merely because zero padding resembles a far value.
+            return depth_like, torch.full((height, width), is_fisheye, device="cuda", dtype=torch.bool), {
                 "enabled": True,
                 "reason": "empty_valid_depth_like",
+                "alignment": alignment_stats,
             }
 
         low_q = max(0.0, min(float(getattr(gaussians, "field_bg_dense_beit_band_low", 0.10)), 1.0))
@@ -2260,7 +2402,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         band = ((depth_like - lo) / denom).clamp(0.0, 1.0)
         threshold = max(0.0, min(float(getattr(gaussians, "field_bg_dense_beit_threshold", 0.5)), 1.0))
         foreground = valid & (band >= threshold)
-        return band.detach(), foreground.detach(), {
+        excluded = foreground | (~valid) if is_fisheye else foreground
+        return band.detach(), excluded.detach(), {
             "enabled": True,
             "path": cache.get("path"),
             "camera": cam_name,
@@ -2270,6 +2413,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "band_high": float(high_q),
             "threshold": float(threshold),
             "foreground_pixels": int(torch.count_nonzero(foreground).item()),
+            "invalid_excluded_pixels": int(torch.count_nonzero(~valid).item()) if is_fisheye else 0,
+            "alignment": alignment_stats,
         }
 
     def layer_responsibility_due(iteration):
@@ -2935,41 +3080,25 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             debug,
         )
 
-    def dense_candidate_worldpoints(pixel_indices, viewpoint_cam, depth_base, depth_value=None, depth_scale=None):
-        if pixel_indices is None or pixel_indices.numel() == 0:
-            return torch.empty((0, 3), device=depth_base.device, dtype=depth_base.dtype)
-
-        def pix2ndc(v, S):
-            return (v * 2.0 + 1.0) / S - 1.0
-
-        if depth_base.dim() == 3:
-            depth_base = depth_base.squeeze(0)
-        pixel_indices = pixel_indices.to(device=depth_base.device)
-        u = pixel_indices[:, 0].long()
-        v = pixel_indices[:, 1].long()
-
-        if depth_value is not None and float(depth_value) > 0.0:
-            target_depth = torch.full((pixel_indices.shape[0], 1), float(depth_value), device=depth_base.device, dtype=depth_base.dtype)
-        else:
-            scale = float(depth_scale) if depth_scale is not None and float(depth_scale) > 0.0 else 1.0
-            target_depth = depth_base[u, v].view(-1, 1).clamp_min(1e-4) * scale
-
-        camera2wold = viewpoint_cam.world_view_transform.T.inverse().to(device=depth_base.device, dtype=depth_base.dtype)
-        projectinverse = viewpoint_cam.projection_matrix.T.inverse().to(device=depth_base.device, dtype=depth_base.dtype)
-        ndcu = pix2ndc(u, viewpoint_cam.image_height).unsqueeze(1).to(dtype=depth_base.dtype)
-        ndcv = pix2ndc(v, viewpoint_cam.image_width).unsqueeze(1).to(dtype=depth_base.dtype)
-        ndccamera = torch.cat((ndcv, ndcu, torch.ones_like(ndcu), torch.ones_like(ndcu)), dim=1)
-        localpointuv = ndccamera @ projectinverse.T
-        direction_local = localpointuv / localpointuv[:, 3:]
-        denom = direction_local[:, 2:3]
-        denom = torch.where(torch.abs(denom) < 1e-6, torch.full_like(denom, 1e-6), denom)
-        rate = target_depth / denom
-        localpoint = direction_local * rate
-        localpoint[:, -1] = 1.0
-        worldpoint_h = localpoint @ camera2wold.T
-        worldpoint = worldpoint_h / worldpoint_h[:, 3:]
-        xyz = worldpoint[:, :3]
-        return clip_dense_worldpoints_to_bbox(xyz, viewpoint_cam)
+    def dense_candidate_worldpoints(pixel_indices, viewpoint_cam, depth_base, depth_value=None, depth_scale=None,
+                                    return_audit=False):
+        if pixel_indices is None:
+            pixel_indices = torch.empty((0, 2), device=depth_base.device, dtype=torch.long)
+        raw_xyz = backproject_background_pixels(
+            pixel_indices, viewpoint_cam, depth_base,
+            depth_value=depth_value, depth_scale=depth_scale,
+        )
+        xyz = clip_dense_worldpoints_to_bbox(raw_xyz, viewpoint_cam)
+        if return_audit:
+            audit = summarize_background_geometry(
+                raw_xyz, xyz, viewpoint_cam, getattr(gaussians, "euler_field", None),
+            )
+            audit["pixel_domain"] = (
+                "fisheye_supervision" if getattr(viewpoint_cam, "fisheyemapper", None) is not None
+                else "pinhole"
+            )
+            return xyz, audit
+        return xyz
 
     def clip_dense_worldpoints_to_bbox(xyz, viewpoint_cam):
         if not bool(getattr(gaussians, "field_bg_dense_clip_to_bbox", 0)):
@@ -3031,6 +3160,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "cells": 0,
             "existing_occupied_cells": 0,
             "outside_bbox_candidates": 0,
+            "invalid_geometry_candidates": 0,
+            "inside_bbox_before_clip": 0,
+            "outside_bbox_before_clip": 0,
+            "clipped_candidates": 0,
+            "rejected_existing_cell_budget": 0,
+            "rejected_candidate_cell_budget": 0,
             "multi_view_cells": 0,
             "mean_candidates_per_cell": 0.0,
             "level": int(getattr(gaussians, "field_bg_dense_dedup_level", 3)),
@@ -3088,6 +3223,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
         selected_by_payload = []
         per_payload_pre = []
         per_payload_pre_candidates = []
+        audit_records = {}
 
         with torch.no_grad():
             existing_xyz = gaussians.get_xyz.detach()
@@ -3097,11 +3233,15 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 resolution_existing = torch.tensor(resolution, device=existing_xyz.device, dtype=torch.long)
                 existing_cell_coords = torch.floor((existing_xyz - bbox_min_existing) / cell_size_existing).long()
                 valid_existing = torch.all((existing_cell_coords >= 0) & (existing_cell_coords < resolution_existing.view(1, 3)), dim=1)
-                existing_cell_coords_cpu = existing_cell_coords[valid_existing].detach().cpu()
+                occupied, counts = torch.unique(
+                    existing_cell_coords[valid_existing], dim=0, return_counts=True,
+                )
+                existing_cell_coords_cpu = occupied.detach().cpu()
+                existing_counts_cpu = counts.detach().cpu()
                 for idx in range(existing_cell_coords_cpu.shape[0]):
                     cell_key = tuple(int(v) for v in existing_cell_coords_cpu[idx].tolist())
-                    existing_counts_by_cell[cell_key] = existing_counts_by_cell.get(cell_key, 0) + 1
-                del existing_cell_coords, valid_existing, existing_cell_coords_cpu
+                    existing_counts_by_cell[cell_key] = int(existing_counts_cpu[idx].item())
+                del existing_cell_coords, valid_existing, existing_cell_coords_cpu, existing_counts_cpu, occupied, counts
                 torch.cuda.empty_cache()
 
         for payload_idx, payload in enumerate(dense_payloads):
@@ -3111,6 +3251,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             per_payload_pre.append(pre_count)
             per_payload_pre_candidates.append(pre_count * len(depth_candidates))
             selected_by_payload.append({})
+            payload["candidate_geometry"] = []
             for kind, value in depth_candidates:
                 selected_by_payload[payload_idx][(kind, float(value))] = torch.zeros(pre_count, dtype=torch.bool)
             if pre_count == 0:
@@ -3121,24 +3262,40 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             camera_name = str(payload["image_name"])
             for kind, value in depth_candidates:
                 with torch.no_grad():
-                    xyz = dense_candidate_worldpoints(
+                    xyz, geometry = dense_candidate_worldpoints(
                         pixel_indices_cuda,
                         payload["camera"],
                         depth_base,
                         depth_value=value if kind == "value" else None,
                         depth_scale=value if kind == "scale" else None,
+                        return_audit=True,
                     )
+                    geometry.update({
+                        "depth_kind": kind, "depth_value_or_scale": float(value),
+                        "rejected_existing_cell_budget": 0,
+                        "rejected_candidate_cell_budget": 0,
+                        "selected_candidates": 0,
+                    })
+                    payload["candidate_geometry"].append(geometry)
+                    audit_records[(payload_idx, kind, float(value))] = geometry
+                    for key in ("inside_bbox_before_clip", "outside_bbox_before_clip", "clipped_candidates"):
+                        stats[key] += int(geometry.get(key, 0))
                     bbox_min_cuda = bbox_min.to(device=xyz.device, dtype=xyz.dtype)
                     cell_size_cuda = cell_size.to(device=xyz.device, dtype=xyz.dtype)
                     resolution_cuda = torch.tensor(resolution, device=xyz.device, dtype=torch.long)
                     cell_coords = torch.floor((xyz - bbox_min_cuda) / cell_size_cuda).long()
-                    valid_cell = torch.all((cell_coords >= 0) & (cell_coords < resolution_cuda.view(1, 3)), dim=1)
-                    if torch.count_nonzero(valid_cell) == 0:
-                        stats["outside_bbox_candidates"] += int(cell_coords.shape[0])
-                        del xyz, cell_coords, valid_cell
-                        continue
-                    outside_count = int(cell_coords.shape[0] - torch.count_nonzero(valid_cell).item())
+                    finite_xyz = torch.isfinite(xyz).all(dim=1)
+                    valid_cell = finite_xyz & torch.all((cell_coords >= 0) & (cell_coords < resolution_cuda.view(1, 3)), dim=1)
+                    invalid_count = int((~finite_xyz).sum().item())
+                    outside_count = int((finite_xyz & ~valid_cell).sum().item())
+                    stats["invalid_geometry_candidates"] += invalid_count
                     stats["outside_bbox_candidates"] += outside_count
+                    geometry["outside_grid_after_clip"] = outside_count
+                    geometry["inside_grid_after_clip"] = int(valid_cell.sum().item())
+                    geometry["unique_cells_after_clip"] = int(torch.unique(cell_coords[valid_cell], dim=0).shape[0])
+                    if torch.count_nonzero(valid_cell) == 0:
+                        del xyz, cell_coords, valid_cell, finite_xyz
+                        continue
                     valid_indices = torch.nonzero(valid_cell, as_tuple=False).view(-1)
                     valid_cell_coords = cell_coords[valid_indices]
                     valid_xyz = xyz[valid_indices]
@@ -3160,7 +3317,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         float(value),
                     ))
                     cell_camera_sets.setdefault(cell_key, set()).add(camera_name)
-                del xyz, cell_coords, valid_cell, valid_indices, valid_cell_coords, valid_xyz, cell_centers, center_distance
+                del xyz, cell_coords, valid_cell, finite_xyz, valid_indices, valid_cell_coords, valid_xyz, cell_centers, center_distance
                 torch.cuda.empty_cache()
             del depth_base, pixel_indices_cuda
             torch.cuda.empty_cache()
@@ -3175,9 +3332,24 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             existing_count = int(existing_counts_by_cell.get(cell_key, 0))
             remaining = max_per_cell - existing_count
             if remaining <= 0:
+                stats["rejected_existing_cell_budget"] += len(items)
+                for _, _, payload_idx, _, kind, value in items:
+                    audit_records[(payload_idx, kind, float(value))]["rejected_existing_cell_budget"] += 1
                 continue
             for _, _, payload_idx, local_idx, kind, value in items[:remaining]:
                 selected_by_payload[payload_idx][(kind, float(value))][local_idx] = True
+                audit_records[(payload_idx, kind, float(value))]["selected_candidates"] += 1
+            stats["rejected_candidate_cell_budget"] += len(items[remaining:])
+            for _, _, payload_idx, _, kind, value in items[remaining:]:
+                audit_records[(payload_idx, kind, float(value))]["rejected_candidate_cell_budget"] += 1
+
+        for geometry in audit_records.values():
+            accounted = sum(int(geometry[key]) for key in (
+                "invalid_geometry_candidates", "outside_grid_after_clip",
+                "rejected_existing_cell_budget", "rejected_candidate_cell_budget", "selected_candidates",
+            ))
+            if accounted != int(geometry["input_candidates"]):
+                raise RuntimeError("Dense depth-layer audit does not match input_candidates")
 
         post_pixel_total = 0
         post_candidate_total = 0
@@ -3219,6 +3391,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 "pre_candidates": int(per_payload_pre_candidates[payload_idx]),
                 "post_candidates": int(sum(int(v.shape[0]) for v in selected_depth_values.values()) + sum(int(v.shape[0]) for v in selected_depth_scales.values())),
                 "removed_candidates": int(per_payload_pre_candidates[payload_idx] - (sum(int(v.shape[0]) for v in selected_depth_values.values()) + sum(int(v.shape[0]) for v in selected_depth_scales.values()))),
+                "candidate_geometry": payload["candidate_geometry"],
             }
 
         cell_count = len(candidates_by_cell)
@@ -3234,15 +3407,29 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "removed_candidates": int(stats["pre_candidates"] - post_candidate_total),
             "cells": int(cell_count),
             "existing_occupied_cells": int(len(existing_counts_by_cell)),
+            "bbox_min": bbox_min.cpu().tolist(),
+            "bbox_max": (bbox_min + bbox_span).cpu().tolist(),
+            "cell_size": cell_size.cpu().tolist(),
             "multi_view_cells": int(sum(1 for cameras in cell_camera_sets.values() if len(cameras) > 1)),
             "mean_candidates_per_cell": float(stats["pre_candidates"] / max(cell_count, 1)),
         })
+        accounted = sum(int(stats[key]) for key in (
+            "invalid_geometry_candidates", "outside_bbox_candidates",
+            "rejected_existing_cell_budget", "rejected_candidate_cell_budget", "post_candidates",
+        ))
+        if accounted != int(stats["pre_candidates"]):
+            raise RuntimeError("Dense candidate audit accounting does not match pre_candidates")
+        stats["candidate_accounting_verified"] = True
         print(
             f"[STEGF] Dense cell dedup: level={level}, resolution={resolution}, "
             f"max_per_cell={max_per_cell}, priority={dedup_priority}, "
             f"candidates {stats['pre_candidates']} -> {stats['post_candidates']}, "
             f"pixels {stats['pre_pixels']} -> {stats['post_pixels']}, cells={stats['cells']}, "
-            f"existing_cells={stats['existing_occupied_cells']}, multi_view_cells={stats['multi_view_cells']}"
+            f"existing_cells={stats['existing_occupied_cells']}, multi_view_cells={stats['multi_view_cells']}, "
+            f"outside_before_clip={stats['outside_bbox_before_clip']}, clipped={stats['clipped_candidates']}, "
+            f"invalid={stats['invalid_geometry_candidates']}, outside_after_clip={stats['outside_bbox_candidates']}, "
+            f"occupied_rejected={stats['rejected_existing_cell_budget']}, "
+            f"candidate_collision_rejected={stats['rejected_candidate_cell_budget']}"
         )
         return stats
 
@@ -3252,7 +3439,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                                         beit_band=None, beit_foreground_mask=None, beit_stats=None,
                                         pre_dedup_sample_mask=None, dedup_stats=None,
                                         source_selection_stats=None, source_selection_debug=None,
-                                        persistent_need_mask=None, time0_unreliable_mask=None):
+                                        persistent_need_mask=None, time0_unreliable_mask=None,
+                                        selection_error_ema=None, inserted_candidates=None):
         if not bool(getattr(gaussians, "field_bg_dense_debug", 0)):
             return
         safe_name = str(camera.image_name).replace("/", "_").replace("\\", "_")
@@ -3300,6 +3488,26 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
         event_dir = os.path.join(args.model_path, "bg_dense_add_debug", f"{int(iteration):06d}_{safe_name}")
         os.makedirs(event_dir, exist_ok=True)
+        # Preserve the actual insertion-time inputs, not a reconstruction from
+        # the final model. MiDaS remains a relative filter, not camera-z depth.
+        selection_inputs = {
+            "base_camera_z": depth_base.detach().float().cpu().numpy(),
+            "need_mask": union_mask.detach().cpu().numpy(),
+            "filtered_mask": filtered_mask.detach().cpu().numpy(),
+            "pre_dedup_sample_mask": pre_dedup_sample_mask.detach().cpu().numpy(),
+            "post_dedup_sample_mask": sample_mask.detach().cpu().numpy(),
+        }
+        if selection_error_ema is not None:
+            selection_inputs["error_ema"] = selection_error_ema.detach().float().cpu().numpy()
+        np.savez_compressed(os.path.join(event_dir, "selection_inputs.npz"), **selection_inputs)
+        if inserted_candidates:
+            np.savez_compressed(
+                os.path.join(event_dir, "inserted_candidates.npz"),
+                **{
+                    key: torch.cat([item[key] for item in inserted_candidates], dim=0).cpu().numpy()
+                    for key in inserted_candidates[0]
+                },
+            )
 
         render_vis = image.detach().float().clamp(0.0, 1.0)
         color_vis = color_image.detach().float().clamp(0.0, 1.0)
@@ -3388,9 +3596,54 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             "source_selection": source_selection_stats or {},
             "cell_dedup": dedup_stats or {},
             "frame_stats": frame_stats,
+            "pixel_domain": (
+                "fisheye_supervision" if getattr(camera, "fisheyemapper", None) is not None else "pinhole"
+            ),
+            "base_depth_semantics": "camera_z_from_render_not_metric_MiDaS",
+            "initial_camera_depth": bg_dense_initial_depths.get("per_camera", {}).get(str(camera.image_name)),
+            "coordinate_protocol": "fisheye_mapper_pixel_center_v1",
+            "candidate_geometry": (dedup_stats or {}).get("candidate_geometry", []),
         }
         with open(os.path.join(event_dir, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2, sort_keys=True)
+
+    def initialize_dense_background_depths():
+        if not bool(getattr(gaussians, "field_bg_dense_add", 0)):
+            return {}
+        mode = str(getattr(gaussians, "field_bg_dense_depth_base", "render")).strip().lower()
+        if mode not in ("render", "da3", INITIAL_CAMERA_DEPTH_BASE):
+            raise ValueError("Unknown field_bg_dense_depth_base: {}".format(mode))
+        if mode != INITIAL_CAMERA_DEPTH_BASE:
+            return {}
+        if os.path.exists(opt.prevpath):
+            raise RuntimeError("Initial camera background depth requires a fresh training run, not --prevpath")
+        if str(getattr(gaussians, "field_bg_dense_depth_values", "")).strip():
+            raise ValueError("Initial camera background depth cannot be combined with absolute depth_values")
+        if bool(getattr(gaussians, "field_bg_dense_source_time_select", 0)):
+            raise ValueError("Initial camera background depth cannot be combined with source_time_select")
+        cameras = traincamdict.get(0, [])
+        if {str(camera.image_name) for camera in cameras} != {str(camera.image_name) for camera in traincameralist}:
+            raise RuntimeError("Initial background depth is missing some time-zero training cameras")
+        _init_status("Caching time-zero maximum non-15 background depth for {} training cameras".format(len(cameras)))
+
+        def render_initial_camera(camera):
+            return render(
+                camera, gaussians, pipe, background, override_color=None,
+                basicfunction=rbfbasefunction, GRsetting=GRsetting, GRzer=GRzer,
+                time_conditioned=None,
+            )
+
+        def report_progress(done, total, record):
+            if done % 8 == 0 or done == total:
+                _init_status("Initial background camera depths: {}/{}".format(done, total))
+
+        initial_depths = collect_initial_camera_depths(cameras, render_initial_camera, report_progress)
+        initial_depths["initial_gaussian_count"] = int(gaussians.get_xyz.shape[0])
+        path = os.path.join(args.model_path, "bg_dense_initial_depths.json")
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(initial_depths, stream, indent=2, sort_keys=True, allow_nan=False)
+        _init_status("Saved fixed initial camera background depths: {}".format(path))
+        return initial_depths
 
     def run_dense_background_add(iteration):
         nonlocal bg_dense_add_done
@@ -3437,6 +3690,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             f"[STEGF] Dense background add at iter {int(iteration)}: "
             f"{len(image_names)} cameras, times={reference_time_indices}, "
             f"source_time_select={int(source_time_select)}, source_times={source_time_indices}, "
+            f"depth_base={getattr(gaussians, 'field_bg_dense_depth_base', 'render')}, "
             f"depth_values={depth_values}, depth_scales={depth_scales}, "
             f"sample_block={int(getattr(gaussians, 'field_bg_dense_sample_block_size', 3))}x"
             f"{int(getattr(gaussians, 'field_bg_dense_sample_block_size', 3))}, "
@@ -3544,6 +3798,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "unreliable_pixels": unreliable_count,
                     "mask_source": mask_source,
                     "ema_available": bool(ema_available),
+                    "render_camera_z_at_need_pixels": finite_distribution(depth[unreliable_mask]),
                 }
                 if source_time_select and use_accumulated_mask:
                     frame_stat.update({
@@ -3641,8 +3896,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 if beit_foreground_mask is not None:
                     beit_foreground_mask = beit_foreground_mask.to(device=union_mask.device, dtype=torch.bool)
                     filtered_mask = filtered_mask & (~beit_foreground_mask)
-                depth_base_mode = str(getattr(gaussians, "field_bg_dense_depth_base", "render")).lower()
-                if depth_base_mode == "da3" and da3_depth is not None:
+                depth_base_mode = str(getattr(gaussians, "field_bg_dense_depth_base", "render")).strip().lower()
+                if depth_base_mode == INITIAL_CAMERA_DEPTH_BASE:
+                    depth_base = initial_camera_depth_base(depth_base, image_name, bg_dense_initial_depths)
+                    da3_stats = dict(da3_stats or {})
+                    da3_stats["depth_base"] = depth_base_mode
+                elif depth_base_mode == "da3" and da3_depth is not None:
                     da3_depth_for_base = da3_depth.to(device=depth_base.device, dtype=depth_base.dtype)
                     valid_da3_depth = torch.isfinite(da3_depth_for_base) & (da3_depth_for_base > 1e-4)
                     depth_base = torch.where(valid_da3_depth, da3_depth_for_base, depth_base)
@@ -3666,6 +3925,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 "candidate_pixels": int(torch.count_nonzero(filtered_mask).item()),
                 "pre_dedup_pixels": int(torch.count_nonzero(sample_mask).item()),
                 "source_selection_stats": source_selection_stats,
+                "sampled_base_camera_z": finite_distribution(depth_base[sample_mask]),
+                "initial_camera_depth": bg_dense_initial_depths.get("per_camera", {}).get(str(image_name)),
             }
             if dense_debug_enabled:
                 payload.update({
@@ -3683,6 +3944,11 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "persistent_need_mask": persistent_need_union.detach().cpu() if persistent_need_union is not None else None,
                     "time0_unreliable_mask": time0_unreliable_union.detach().cpu() if time0_unreliable_union is not None else None,
                     "frame_stats": frame_stats,
+                    "selection_error_ema": (
+                        observation_error_ema[str(reference_camera.image_name)].detach().cpu()
+                        if str(reference_camera.image_name) in observation_error_ema else None
+                    ),
+                    "inserted_candidates": [],
                 })
             dense_payloads.append(payload)
             del reference_gt, reference_image, union_mask, filtered_mask, sample_mask, color_accum, color_count, depth_base, fallback_depth, color_image, pixel_indices
@@ -3738,6 +4004,13 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 v = selected_pixels_cuda[:, 1].long()
                 rgb = color_image_cuda[:, u, v].permute(1, 0).clamp(0.0, 1.0)
                 source_times = source_timestamp_map_cuda[u, v].reshape(-1, 1)
+                finite_xyz = torch.isfinite(xyz).all(dim=1)
+                if not torch.any(finite_xyz):
+                    return 0
+                if not torch.all(finite_xyz):
+                    xyz = xyz[finite_xyz]
+                    rgb = rgb[finite_xyz]
+                    source_times = source_times[finite_xyz]
                 if depth_value is not None:
                     scale_tag_value = float("inf")
                 else:
@@ -3746,6 +4019,18 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 all_dense_rgb.append(rgb.detach())
                 all_dense_depth_scale_tags.append(torch.full((xyz.shape[0],), scale_tag_value, device=xyz.device, dtype=xyz.dtype))
                 all_dense_source_times.append(source_times.detach())
+                if dense_debug_enabled and xyz.shape[0] > 0:
+                    requested_z = (
+                        torch.full_like(u, float(depth_value), dtype=xyz.dtype)
+                        if depth_value is not None
+                        else depth_base_cuda[u, v].clamp_min(1e-4) * scale_tag_value
+                    )
+                    payload["inserted_candidates"].append({
+                        "xyz_world": xyz.detach().cpu(),
+                        "supervision_pixels_rc": selected_pixels_cuda[finite_xyz].detach().cpu(),
+                        "requested_camera_z": requested_z[finite_xyz].detach().cpu(),
+                        "source_times": source_times.detach().cpu(),
+                    })
                 count = int(xyz.shape[0])
                 del (
                     selected_pixels_cuda,
@@ -3795,6 +4080,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             ))
             del dense_xyz, dense_rgb, dense_depth_scale_tags, dense_source_times
             torch.cuda.empty_cache()
+
+        if cell_dedup_stats.get("reason") == "ok" and total_added != int(cell_dedup_stats["post_candidates"]):
+            raise RuntimeError("Inserted background point count differs from the audited selection")
 
         if total_added > 0 and dense_source_time_range is not None:
             single_expert = str(
@@ -3846,6 +4134,8 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     source_selection_debug=payload.get("source_selection_debug"),
                     persistent_need_mask=payload.get("persistent_need_mask"),
                     time0_unreliable_mask=payload.get("time0_unreliable_mask"),
+                    selection_error_ema=payload.get("selection_error_ema"),
+                    inserted_candidates=payload.get("inserted_candidates"),
                 )
             source_counts = (payload.get("source_selection_stats") or {}).get("source_counts", {})
             print(
@@ -3869,6 +4159,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             with open(os.path.join(dense_log_dir, "events.jsonl"), "a") as f:
                 f.write(json.dumps({
                     "iteration": int(iteration),
+                    "coordinate_protocol": "fisheye_mapper_pixel_center_v1",
                     "train_cameras": int(len(image_names)),
                     "camera_events": int(camera_events),
                     "time_indices": reference_time_indices,
@@ -3876,6 +4167,12 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "source_time_select": int(source_time_select),
                     "source_time_indices": source_time_indices,
                     "depth_base": str(getattr(gaussians, "field_bg_dense_depth_base", "render")),
+                    "initial_camera_depths_file": (
+                        "bg_dense_initial_depths.json" if bg_dense_initial_depths else None
+                    ),
+                    "depth_base_computed_at_iteration": (
+                        bg_dense_initial_depths.get("computed_at_iteration") if bg_dense_initial_depths else int(iteration)
+                    ),
                     "depth_values": depth_values,
                     "depth_scales": depth_scales,
                     "mask_source": mask_source,
@@ -3889,6 +4186,21 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     "sample_pixels": int(total_sampled),
                     "added_points": int(total_added),
                     "cell_dedup": cell_dedup_stats,
+                    "per_camera": [
+                        {
+                            "camera": payload["image_name"],
+                            "need_pixels": int(payload["union_pixels"]),
+                            "after_foreground_filter_pixels": int(payload["candidate_pixels"]),
+                            "pre_dedup_pixels": int(payload["pre_dedup_pixels"]),
+                            "post_dedup_pixels": int(payload["pixel_indices"].shape[0]),
+                            "added_points": int(payload.get("pending_added_count", 0)),
+                            "sampled_base_camera_z": payload["sampled_base_camera_z"],
+                            "initial_camera_depth": payload.get("initial_camera_depth"),
+                            "beit": payload.get("beit_stats", {}),
+                            "cell_dedup": payload.get("dedup_stats", {}),
+                        }
+                        for payload in dense_payloads
+                    ],
                     "union_map_dir": "unreliable_union_by_camera",
                     "sample_map_dir": "sampled_pixels_by_camera",
                     "pre_dedup_sample_map_dir": "sampled_pixels_before_cell_dedup_by_camera",
@@ -4322,6 +4634,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             json.dump(manifest, f, indent=2, sort_keys=True)
         print(f"[STEGF] Saved {len(manifest)} initial depth debug views.")
 
+    bg_dense_initial_depths = initialize_dense_background_depths()
     save_initial_depth_debug()
     if bool(getattr(args, "field_init_depth_only", 0)):
         print("[STEGF] field_init_depth_only=1, stop after initial depth debug.")
@@ -4471,11 +4784,29 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     temporal_densify_enabled = bool(
         getattr(gaussians, "field_temporal_visibility_densify", False)
     ) or bool(getattr(gaussians, "field_temporal_adaptive_threshold", False))
-    if temporal_densify_enabled and first_iter <= 1:
+    if (temporal_densify_enabled or gaussians.field_mvstruct_unlimited) and first_iter <= 1:
         with open(temporal_densify_stats_path, "w", encoding="utf-8"):
             pass
 
+    narrow_birth_controller = None
+    if gaussians._narrow_birth_config['field_narrow_birth']:
+        from helper_narrow_birth import NarrowBirthController
+        narrow_birth_controller = NarrowBirthController(
+            gaussians, traincamdict, duration, background, GRsetting, GRzer,
+            rbfbasefunction, scene.model_path, extent=scene.cameras_extent)
+    narrow_growth_enabled = bool(gaussians._narrow_birth_config.get('field_narrow_birth_growth', 0))
+    if narrow_growth_enabled:
+        from helper_narrow_growth import observe_growth
+
+    mvstruct_time_sampler = None
+    if gaussians.field_mvstruct_time_sampling == 'shuffle_cycle':
+        from helper_mv_refinement import ShuffledTimeSampler
+        mvstruct_time_sampler = ShuffledTimeSampler(duration)
+
     for iteration in range(first_iter, opt.iterations + 1):
+        if check_refinement_fixed_topology(refinement_schedule, gaussians, iteration):
+            print("[STEGF] Fixed-topology refinement from iter {}: gaussians={}".format(
+                iteration, len(gaussians.get_xyz)), flush=True)
         if ems_main_enabled and iteration ==  opt.emsstart:
             flagems = 1 # start ems
 
@@ -4499,6 +4830,13 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     f"full_lr={getattr(gaussians, 'field_soft_geometry_full_lr_groups', '')}"
                 )
                 soft_geometry_lr_logged = True
+        refinement_lr_factor = apply_refinement_learning_rate(refinement_schedule, gaussians, iteration)
+        if refinement_schedule is not None and (iteration % 1000 == 0 or iteration == 1):
+            lr_record = dict(iteration=iteration, fixed_rate_factor=refinement_lr_factor,
+                             learning_rates={group["name"]: group["lr"]
+                                             for group in gaussians.optimizer.param_groups})
+            with open(os.path.join(args.model_path, "refinement_learning_rates.jsonl"), "a") as handle:
+                handle.write(json.dumps(lr_record, sort_keys=True) + "\n")
         if hasattr(gaussians, "set_field_training_stage"):
             gaussians.set_field_training_stage(iteration)
             if getattr(gaussians, "field_staged_training", False) and iteration in (
@@ -4542,6 +4880,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             hard_mvstruct_event = mvstruct_event and bool(getattr(gaussians, "field_mvstruct_hard_time", 0))
             if hard_mvstruct_event:
                 timeindex, hard_time_mode, hard_time_score = select_hard_time_index()
+            elif mvstruct_event and mvstruct_time_sampler is not None:
+                timeindex = mvstruct_time_sampler.sample()
+                hard_time_mode, hard_time_score = "", 0.0
             else:
                 timeindex = randint(0, duration-1) # 0 to 49
                 hard_time_mode, hard_time_score = "", 0.0
@@ -4566,6 +4907,13 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     )
             else:
                 camindex = random.sample(viewpointset, current_batch)
+            if mvstruct_event and gaussians.field_mvstruct_unlimited:
+                with open(os.path.join(scene.model_path, 'refinement_multiview_events.jsonl'), 'a') as handle:
+                    handle.write(json.dumps(dict(
+                        iteration=iteration, time_index=timeindex,
+                        time_cycle=mvstruct_time_sampler.cycles,
+                        cameras=[str(camera.image_name) for camera in camindex],
+                        points=len(gaussians.get_xyz)), sort_keys=True) + '\n')
             if mvstruct_event and hasattr(gaussians, "mvstruct_begin_event"):
                 gaussians.mvstruct_begin_event(expected_views=current_batch)
             static_app_active = (
@@ -4623,6 +4971,18 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     static_radiance_mask=static_radiance_mask,
                     iteration=iteration,
                 )
+                if i == 0 and iteration % 1000 == 0:
+                    query_stats = gaussians._last_static_query_stats
+                    if query_stats is not None:
+                        total = query_stats["total_points"]
+                        queried = query_stats["queried_points"]
+                        scene.recordpoints(
+                            iteration,
+                            "static_query_time{}_kernel{:.6f}_queried{}_total{}_skipped{:.2%}".format(
+                                timeindex, query_stats["threshold"], queried, total,
+                                1.0 - queried / max(total, 1),
+                            ),
+                        )
                 image, viewspace_point_tensor, visibility_filter, radii = getrenderparts(render_pkg) 
                 means3D_for_mvstruct = render_pkg.get("means3D")
                 if mvstruct_event and torch.is_tensor(means3D_for_mvstruct) and means3D_for_mvstruct.requires_grad:
@@ -4771,6 +5131,9 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
 
                 retain_graph = (not hard_mvstruct_event) and i < (current_batch - 1)
                 loss.backward(retain_graph=retain_graph)
+                if narrow_growth_enabled:
+                    observe_growth(gaussians, iteration, viewspace_point_tensor.grad,
+                                   visibility_filter, gaussians.trbfoutput, render_pkg['opacity'])
                 if mvstruct_event and hasattr(gaussians, "mvstruct_capture_view"):
                     feature_dc_grad = getattr(gaussians, "_features_dc", None)
                     feature_dc_grad = feature_dc_grad.grad.detach().clone() if feature_dc_grad is not None and feature_dc_grad.grad is not None else None
@@ -4942,7 +5305,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     with open(existence_stats_path, "a", encoding="utf-8") as stats_file:
                         stats_file.write(json.dumps(final_existence_stats, sort_keys=True) + "\n")
 
-            if (iteration in saving_iterations):
+            if iteration in saving_iterations and refinement_schedule is None:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -4963,6 +5326,10 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                 else:
                     bg_candidate_mask = gaussians.get_background_candidate_mask()
                     stats_filter = visibility_filter & bg_candidate_mask
+                if bool(getattr(gaussians, "field_densify_temporal_filter", False)):
+                    stats_filter = gaussians.filter_densification_visibility(
+                        stats_filter, render_pkg.get("opacity"),
+                    )
                 if bool(getattr(gaussians, "field_temporal_visibility_densify", False)):
                     point_opacity = render_pkg.get("opacity")
                     if (
@@ -5004,7 +5371,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
             if (
                 temporal_densify_enabled
                 and control_due
-                and control_flag_before < opt.desicnt
+                and int(flag) > control_flag_before
             ):
                 temporal_densify_record = dict(
                     getattr(gaussians, "_last_temporal_densify_stats", {})
@@ -5298,16 +5665,26 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         scene.cameras_extent,
                     )
                     if isinstance(mvstruct_stats, dict) and int(mvstruct_stats.get("due", 0)) > 0:
-                        if temporal_densify_enabled:
+                        if temporal_densify_enabled or gaussians.field_mvstruct_unlimited:
                             temporal_densify_record = dict(mvstruct_stats)
                             temporal_densify_record.update(
                                 {"iteration": int(iteration), "source": "mvstruct"}
                             )
+                            if gaussians.field_mvstruct_unlimited:
+                                temporal_densify_record['cuda_peak_allocated_MiB'] = (
+                                    torch.cuda.max_memory_allocated() / 1024 ** 2)
                             with open(temporal_densify_stats_path, "a", encoding="utf-8") as stats_file:
                                 stats_file.write(
                                     json.dumps(temporal_densify_record, sort_keys=True)
                                     + "\n"
                                 )
+                        if gaussians.field_mvstruct_unlimited:
+                            print("[STEGF][MultiView] iter={} eligible={} selected={} "
+                                  "clone={} split={} net={} points={} budget=none".format(
+                                      iteration, mvstruct_stats.get('eligible', 0),
+                                      mvstruct_stats.get('selected', 0), mvstruct_stats.get('cloned', 0),
+                                      mvstruct_stats.get('split_parents', 0),
+                                      mvstruct_stats.get('net_points', 0), len(gaussians.get_xyz)), flush=True)
                         scene.recordpoints(
                             iteration,
                             (
@@ -5378,6 +5755,25 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                         )
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            if narrow_birth_controller is not None:
+                # All old-topology statistics/optimizer work have finished.
+                narrow_birth_controller.tick(iteration)
+            # Independent of the ordinary growth/reset clock and narrow-child
+            # cleanup. Run after optimizer/statistics users of the old topology.
+            late_prune = prune_late_low_opacity(refinement_schedule, gaussians, iteration)
+            if late_prune is not None:
+                with open(os.path.join(args.model_path, "refinement_prune_events.jsonl"), "a") as handle:
+                    handle.write(json.dumps(late_prune, sort_keys=True) + "\n")
+                scene.recordpoints(iteration, "late_low_opacity_prune_{}".format(late_prune["pruned"]))
+                print("[STEGF][LatePrune] iter={iteration} candidates={low_opacity_candidates} "
+                      "young_protected={young_narrow_protected} bg_protected={background_protected} "
+                      "pruned={pruned} points={points_before}->{points_after}".format(**late_prune), flush=True)
+            check_refinement_fixed_topology(refinement_schedule, gaussians, iteration)
+            if refinement_schedule is not None and iteration in saving_iterations:
+                # In particular, iteration 80000 includes the FINAL prune, not
+                # the pre-prune state used by the legacy checkpoint placement.
+                print("\n[ITER {}] Saving Gaussians after refinement".format(iteration))
+                scene.save(iteration)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ if str(GAUSSIAN_SPLATTING_ROOT) not in sys.path:
     sys.path.append(str(GAUSSIAN_SPLATTING_ROOT))
 
 from helper_train import getmodel, getrenderpip, trbfunction
+from helper_gt import write_gt_reference
 from thirdparty.gaussian_splatting.arguments import (
     ModelParams,
     OptimizationParams,
@@ -70,7 +71,10 @@ def _parse_args():
         "--camera_round_decimals",
         default=6,
         type=int,
-        help="Precision used to identify unique and held-out camera centers.",
+        help=(
+            "Precision for camera-center deduplication; held-out centers "
+            "must match uniquely within 10**(-decimals) per coordinate."
+        ),
     )
     parser.add_argument(
         "--verify_indices",
@@ -186,31 +190,62 @@ def _unique_cameras(cameras, decimals):
 def _training_cameras(all_cameras, test_views, decimals):
     unique_all = _unique_cameras(all_cameras, decimals)
     test_keys = {_camera_key(camera, decimals) for camera in test_views}
+    if not unique_all or not test_views:
+        raise RuntimeError(
+            "Camera records and validation cameras are both required to "
+            "verify the train/test split"
+        )
+
+    # JSON positions use NumPy's inverse, whereas runtime cameras invert a
+    # float32 transform on CUDA. Even tiny differences can straddle a rounding
+    # boundary, so rounded tuple equality is unsuitable for split matching.
+    centers = torch.stack([
+        camera.camera_center.detach().double().cpu().reshape(-1)
+        for camera in unique_all
+    ])
+    if centers.shape[1] != 3 or not torch.isfinite(centers).all():
+        raise RuntimeError("Invalid camera centers in cameras.json")
+    center_atol = 10.0 ** (-int(decimals))
+    matched_test = set()
+    for test_camera in _unique_cameras(test_views, decimals):
+        test_center = test_camera.camera_center.detach().double().cpu().reshape(-1)
+        if test_center.numel() != 3 or not torch.isfinite(test_center).all():
+            raise RuntimeError("Invalid validation camera center")
+        errors = (centers - test_center).abs().amax(dim=1)
+        matches = torch.nonzero(errors <= center_atol, as_tuple=False).flatten()
+        if matches.numel() != 1:
+            raise RuntimeError(
+                "Validation camera {!r} has {} matching centers in cameras.json "
+                "within {:.3e} per coordinate (nearest difference {:.3e}); "
+                "refusing to average cameras because the train/test split "
+                "cannot be verified uniquely".format(
+                    getattr(test_camera, "image_name", "unknown"),
+                    matches.numel(),
+                    center_atol,
+                    errors.min().item(),
+                )
+            )
+        matched_camera = unique_all[matches.item()]
+        matched_test.add(_camera_key(matched_camera, decimals))
+
     training = [
         camera
         for camera in unique_all
-        if _camera_key(camera, decimals) not in test_keys
+        if _camera_key(camera, decimals) not in matched_test
     ]
-    matched_test = {
-        _camera_key(camera, decimals)
-        for camera in unique_all
-        if _camera_key(camera, decimals) in test_keys
-    }
     if not training:
         raise RuntimeError(
             "No training camera centers remain after excluding validation "
             "camera centers"
         )
-    if not matched_test:
-        raise RuntimeError(
-            "The validation camera center was not found in cameras.json; "
-            "refusing to average cameras because the train/test split cannot "
-            "be verified"
-        )
     return training, unique_all, test_keys, matched_test
 
 
 def _static_app_delta(gaussians, camera_center):
+    # Bake every Gaussian, not just those active at an arbitrary export frame.
+    # The training query gate is intentionally NOT preserved in the compact
+    # model. Retain the original all-point baking procedure, and measure its
+    # image difference in _verify_bake rather than claiming exact equivalence.
     level_features = gaussians.euler_field.query_static_level_features(
         gaussians._xyz.detach(),
         camera_center=camera_center,
@@ -430,6 +465,7 @@ def _sha256(path):
 
 
 def _copy_runtime_metadata(source_root, output_root, config_path, args):
+    write_gt_reference(source_root, output_root)
     for name in ("cameras.json", "stegf_config.json"):
         source = source_root / name
         if source.is_file():
@@ -442,6 +478,11 @@ def _copy_runtime_metadata(source_root, output_root, config_path, args):
             compact_config = json.load(handle)
         compact_config["use_euler_field"] = 0
         compact_config["field_static_app_scale"] = 0.0
+        compact_config["field_static_query_kernel_threshold"] = 0.0
+        compact_config["field_narrow_birth"] = 0
+        compact_config["field_narrow_birth_growth"] = 0
+        compact_config["field_mvstruct_unlimited"] = 0
+        compact_config["field_mvstruct_refinement"] = 0
         compact_config_path = output_root / "compact_config.json"
         with compact_config_path.open("w", encoding="utf-8") as handle:
             json.dump(compact_config, handle, indent=2, sort_keys=True)
@@ -463,6 +504,11 @@ def _copy_runtime_metadata(source_root, output_root, config_path, args):
     compact_args["model_path"] = str(output_root)
     compact_args["use_euler_field"] = False
     compact_args["field_static_app_scale"] = 0.0
+    compact_args["field_static_query_kernel_threshold"] = 0.0
+    compact_args["field_narrow_birth"] = 0
+    compact_args["field_narrow_birth_growth"] = 0
+    compact_args["field_mvstruct_unlimited"] = 0
+    compact_args["field_mvstruct_refinement"] = 0
     if compact_config_path is not None:
         compact_args["configpath"] = str(compact_config_path)
     with (output_root / "cfg_args").open("w", encoding="utf-8") as handle:
@@ -496,6 +542,7 @@ def _write_compact_checkpoint(
 
     original_use_field = bool(gaussians.use_euler_field)
     original_static_app_scale = float(gaussians.field_static_app_scale)
+    original_query_threshold = gaussians.field_static_query_kernel_threshold
     implicit_motion_anchor = (
         str(gaussians.field_motion_model).strip().lower()
         in {"couptest_polynomial", "couptest_grid"}
@@ -518,10 +565,13 @@ def _write_compact_checkpoint(
             gaussians._features_dc[:, :6].add_(mean_delta)
             gaussians.use_euler_field = False
             gaussians.field_static_app_scale = 0.0
+            gaussians.field_static_query_kernel_threshold = 0.0
         gaussians.save_ply(str(temporary_ply))
 
         payload = torch.load(temporary_pt, map_location="cpu")
         training_only_keys = (
+            "narrow_birth_state",
+            "refinement_birth_state",
             "static_level_logits",
             "static_radiance_level_logits",
             "dynamic_level_logits",
@@ -557,6 +607,9 @@ def _write_compact_checkpoint(
         for key in removed_keys:
             payload.pop(key, None)
         metadata["removed_auxiliary_keys"] = removed_keys
+        payload['field_config']['field_narrow_birth'] = 0
+        payload['field_config']['field_narrow_birth_growth'] = 0
+        payload['field_config']['field_mvstruct_unlimited'] = 0
         removed_redundant_keys = []
         if implicit_motion_anchor and payload.get("motion_time_anchor") is not None:
             payload.pop("motion_time_anchor", None)
@@ -576,6 +629,7 @@ def _write_compact_checkpoint(
             gaussians._features_dc.copy_(base_features)
         gaussians.use_euler_field = original_use_field
         gaussians.field_static_app_scale = original_static_app_scale
+        gaussians.field_static_query_kernel_threshold = original_query_threshold
         for path in (temporary_ply, temporary_pt):
             if path.exists():
                 path.unlink()
@@ -611,6 +665,13 @@ def export_compact(args, dataset, pipeline):
     iteration = int(scene.loaded_iter)
     _prepare_model(gaussians)
     _validate_baking_conditions(gaussians)
+    if gaussians.field_static_query_kernel_threshold > 0.0:
+        print(
+            "[STEGF][Compact] Baking every Gaussian without temporal-query "
+            "filtering; the source query gate is not retained. Image "
+            "verification measures the resulting difference.",
+            flush=True,
+        )
 
     test_views = sorted(
         scene.getTestCameras(),
@@ -703,16 +764,29 @@ def export_compact(args, dataset, pipeline):
         "bake_target": "features_dc[:,0:6]",
         "bake_operation": "training_camera_mean_static_grid_residual",
         "field_query_position": "canonical_xyz",
+        "static_query_policy": {
+            "source_kernel_threshold": gaussians.field_static_query_kernel_threshold,
+            "selection_quantity": "current_temporal_kernel_without_base_opacity",
+            "comparison": ">=",
+            "bake_selection": "all_gaussians_independent_of_export_time",
+            "compact_runtime": "fully_baked_no_grid_query",
+            "temporal_query_gate_preserved": False,
+        },
         "training_camera_centers": len(training_cameras),
         "all_unique_camera_centers": len(unique_all),
         "excluded_validation_camera_centers": len(matched_test),
         "validation_camera_keys": [list(key) for key in sorted(test_keys)],
+        "matched_validation_camera_keys": [
+            list(key) for key in sorted(matched_test)
+        ],
         "camera_round_decimals": int(args.camera_round_decimals),
+        "camera_center_match_atol": 10.0 ** (-int(args.camera_round_decimals)),
         "residual": residual_report,
         "verification": verification,
         "compact_field_config": {
             "use_euler_field": 0,
             "field_static_app_scale": 0.0,
+            "field_static_query_kernel_threshold": 0.0,
             "static_grid_baked": True,
         },
     }

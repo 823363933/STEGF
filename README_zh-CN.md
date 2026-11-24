@@ -145,6 +145,19 @@ python script/run_n3d_train_test.py \
 
 默认情况下，N3D 和 Technicolor 场景从 `/root/autodl-tmp` 解析，也可始终显式指定其他数据根目录。
 
+评估只在 `<savepath>/<scene>/gt/test/` 保存一份共享GT，所有检查点、紧凑模型评估和光度拟合均复用它；渲染图和拟合后图像仍分别保存在各检查点目录中。
+
+### 论文检查点
+
+[论文运行配置](configs/paper_runs.json)逐场景记录配置文件、原实验训练总步数和选定检查点。可选协议为 `n3d300`、`n3d50`、`tech`（50 帧）和 `immersive`（50 帧）。预处理时用 `--configpath` 指定对应场景配置，尤其是 N3D 的 300 帧实验。
+
+```bash
+python script/reproduce_paper.py --profile n3d300 --scene cook_spinach \
+  --datapath /path/to/N3D-300 --savepath output/paper
+```
+
+加 `--dry_run` 可先查看命令。训练结束后，脚本在 `<savepath>/<profile>/<scene>/compact/` 导出并评估**选定步数**的紧凑模型，不使用测试图像进行光度拟合。仓库不含数据和权重；数值复现还依赖预处理输入，历史 50 帧 `coffee_martini` 结果所用的 COLMAP 点云及第 0 帧初始化点云与当前流程生成的版本不同。
+
 ## 紧凑推理模型
 
 标准运行会自动完成紧凑导出。导出器在高斯规范位置查询训练后的脚手架，将训练相机平均贡献烘焙至逐高斯外观特征，删除仅训练时需要的网格与路由参数，并写入：

@@ -397,6 +397,14 @@ class GaussianModel:
         self._motion_time_anchor = torch.empty(0)
         self._carrier_id = torch.empty(0, dtype=torch.long)
         self._initialization_role = torch.empty(0, dtype=torch.int8)
+        from helper_narrow_birth import options as narrow_birth_options
+        self._narrow_birth_config = narrow_birth_options({})
+        self._narrow_birth_state = None
+        self.field_mvstruct_unlimited = False
+        self.field_mvstruct_time_sampling = "random"
+        self._refinement_birth_state = None
+        self._refinement_iteration = 0
+        self._refinement_topology_until = None
         
         self.rgbdecoder = getcolormodel(rgbfuntion)
         self.euler_field = None
@@ -483,6 +491,8 @@ class GaussianModel:
         self.field_static_motion_scale = 0.05
         self.field_static_opacity_scale = 0.02
         self.field_static_app_scale = 0.05
+        self.field_static_query_kernel_threshold = 0.0
+        self._last_static_query_stats = None
         self.field_static_temporal_residual = False
         self.field_static_temporal_frames = 50
         self.field_static_temporal_scale = 1.0
@@ -683,6 +693,12 @@ class GaussianModel:
         self.field_motion_model = "polynomial"
         self.field_couptest_mode = "none"
         self.field_couptest_initial_existence_floor = 0.95
+        self.field_couptest_initial_window_frames = 0.0
+        self.field_couptest_initialization_mode = "uniform"
+        self.field_couptest_initial_sparse_prefix_frames = 50
+        self.field_couptest_initial_sparse_prefix_scale = 1.0
+        self._couptest_initialization_stats = {}
+        self._couptest_sequence_frames = 50
         self.field_couptest_grid_resolution = "auto_finest"
         self.field_couptest_grid_resolved_resolution = ""
         self.field_couptest_grid_feature_dim = 8
@@ -778,6 +794,7 @@ class GaussianModel:
         self.field_mvstruct_specialize_offset_ratio = 0.5
         self.field_mvstruct_specialize_scale_ratio = 0.5
         self.field_temporal_visibility_densify = False
+        self.field_densify_temporal_filter = False
         self.field_temporal_visibility_min_opacity = 0.05
         self.field_temporal_adaptive_threshold = False
         self.field_temporal_adaptive_alpha = 0.8
@@ -802,6 +819,7 @@ class GaussianModel:
         self._mvstruct_gradient_accum = None
         self._mvstruct_visibility_count = None
         self._mvstruct_observation_count = None
+        self._mvstruct_temporal_opportunities = None
         self._mvstruct_max_radii2D = None
         self._mvstruct_last_topology_iter = None
         self._mvstruct_conflict_accum = None
@@ -1678,6 +1696,10 @@ class GaussianModel:
 
         
     def capture(self):
+        if self.field_mvstruct_unlimited:
+            raise RuntimeError('Legacy capture omits refinement ages; use save_ply()')
+        if self._narrow_birth_config['field_narrow_birth']:
+            raise RuntimeError('Legacy capture omits narrow birth state; use save_ply()')
         if self.field_motion_model == "carrier_hybrid":
             raise RuntimeError(
                 "Legacy capture() does not encode Carrier identity state; "
@@ -1698,6 +1720,10 @@ class GaussianModel:
         )
     
     def restore(self, model_args, training_args):
+        if self.field_mvstruct_unlimited:
+            raise RuntimeError('Legacy restore omits refinement ages; use load_ply()')
+        if self._narrow_birth_config['field_narrow_birth']:
+            raise RuntimeError('Legacy restore omits narrow birth state; use load_ply()')
         if self.field_motion_model == "carrier_hybrid":
             raise RuntimeError(
                 "Legacy restore() cannot restore Carrier identity state; "
@@ -1805,6 +1831,16 @@ class GaussianModel:
         self.field_static_motion_scale = float(getattr(args, "field_static_motion_scale", 0.05))
         self.field_static_opacity_scale = float(getattr(args, "field_static_opacity_scale", 0.02))
         self.field_static_app_scale = float(getattr(args, "field_static_app_scale", 0.05))
+        self.field_static_query_kernel_threshold = float(
+            getattr(args, "field_static_query_kernel_threshold", 0.0)
+        )
+        from helper_narrow_birth import options as narrow_birth_options
+        self._narrow_birth_config = narrow_birth_options(args)
+        if (
+            not math.isfinite(self.field_static_query_kernel_threshold)
+            or not 0.0 <= self.field_static_query_kernel_threshold <= 1.0
+        ):
+            raise ValueError("field_static_query_kernel_threshold must be finite and in [0, 1]")
         self.field_static_temporal_residual = bool(getattr(args, "field_static_temporal_residual", 0))
         self.field_static_temporal_frames = int(getattr(args, "field_static_temporal_frames", getattr(args, "duration", 50)))
         self.field_static_temporal_scale = float(getattr(args, "field_static_temporal_scale", 1.0))
@@ -2078,6 +2114,20 @@ class GaussianModel:
         self.field_couptest_initial_existence_floor = float(
             getattr(args, "field_couptest_initial_existence_floor", 0.95)
         )
+        self.field_couptest_initial_window_frames = float(
+            getattr(args, "field_couptest_initial_window_frames", 0.0)
+        )
+        self.field_couptest_initialization_mode = str(
+            getattr(args, "field_couptest_initialization_mode", "uniform")
+        ).strip().lower()
+        self.field_couptest_initial_sparse_prefix_frames = getattr(
+            args, "field_couptest_initial_sparse_prefix_frames", 50
+        )
+        self.field_couptest_initial_sparse_prefix_scale = float(
+            getattr(args, "field_couptest_initial_sparse_prefix_scale", 1.0)
+        )
+        self._couptest_sequence_frames = int(getattr(args, "duration", 50))
+        self._validate_couptest_initialization()
         self.field_couptest_grid_resolution = str(
             getattr(args, "field_couptest_grid_resolution", "auto_finest")
         ).strip()
@@ -2143,6 +2193,7 @@ class GaussianModel:
             self._couptest_full_width = 1.0 / math.sqrt(
                 -math.log(self.field_couptest_initial_existence_floor)
             )
+            self._couptest_initial_width()
             if self.field_motion_model == "couptest_grid" and not self.use_euler_field:
                 raise ValueError("couptest_grid requires use_euler_field=1")
         self.field_h2_level_resolutions = str(
@@ -2251,6 +2302,14 @@ class GaussianModel:
         self.field_existence_coverage_weight = float(getattr(args, "field_existence_coverage_weight", 0.001))
         self.field_existence_log_interval = int(getattr(args, "field_existence_log_interval", 500))
         self.field_mvstruct = bool(getattr(args, "field_mvstruct", 0))
+        self.field_mvstruct_unlimited = bool(getattr(args, "field_mvstruct_unlimited", 0))
+        self.field_mvstruct_time_sampling = str(getattr(args, "field_mvstruct_time_sampling", "random"))
+        if self.field_mvstruct_time_sampling not in {"random", "shuffle_cycle"}:
+            raise ValueError("Unknown multi-view time sampling policy")
+        if self.field_mvstruct_unlimited and (
+                bool(getattr(args, "field_mvstruct_oversize_split", 0))
+                or bool(getattr(args, "field_mvstruct_conflict_split", 0))):
+            raise ValueError("Unlimited refinement uses ordinary spatial clone/split only")
         self.field_mvstruct_start = int(getattr(args, "field_mvstruct_start", 10000))
         self.field_mvstruct_until = int(getattr(args, "field_mvstruct_until", 20000))
         self.field_mvstruct_interval = int(getattr(args, "field_mvstruct_interval", 50))
@@ -2295,6 +2354,7 @@ class GaussianModel:
         self.field_mvstruct_specialize_offset_ratio = float(getattr(args, "field_mvstruct_specialize_offset_ratio", 0.5))
         self.field_mvstruct_specialize_scale_ratio = float(getattr(args, "field_mvstruct_specialize_scale_ratio", 0.5))
         self.field_temporal_visibility_densify = bool(getattr(args, "field_temporal_visibility_densify", 0))
+        self.field_densify_temporal_filter = bool(getattr(args, "field_densify_temporal_filter", 0))
         self.field_temporal_visibility_min_opacity = max(
             float(getattr(args, "field_temporal_visibility_min_opacity", 0.05)),
             0.0,
@@ -3838,6 +3898,56 @@ class GaussianModel:
     def _get_static_level_logits(self):
         return self._static_level_logits
 
+    def _validate_static_query_kernel_policy(self):
+        # This gate only selects shared appearance for the final transient model;
+        # do not silently change legacy geometry/opacity residual branches.
+        if (
+            self.field_v23_compat
+            or self.field_staged_training
+            or not self.field_disable_dynamic_grid
+            or self.field_existence_single_expert != "transient"
+            or self.field_existence_moe
+            or self.field_static_temporal_residual
+            or self.field_static_radiance_branch
+        ):
+            raise RuntimeError(
+                "Kernel-filtered static queries require the appearance-only, "
+                "non-staged transient model with the dynamic grid disabled"
+            )
+
+    def _query_static_appearance_subset(
+        self, canonical_points, point_indices, timestamp, camera_center
+    ):
+        """Query only active rows, without removing any renderable Gaussian."""
+        output = self._features_dc.new_zeros(self._features_dc.shape)
+        level_logits = self._get_static_level_logits()
+        if point_indices.numel() == 0:
+            # Zero (not absent) gradients preserve Adam's momentum/step behavior
+            # even for batch=1 when no point can contribute at this timestamp.
+            zero = level_logits.reshape(-1)[:0].sum()
+            for module in (
+                self.euler_field, self.field_static_view_mapper,
+                self.field_static_app_head,
+            ):
+                if module is not None:
+                    for parameter in module.parameters():
+                        zero = zero + parameter.reshape(-1)[:0].sum()
+            if not self.field_query_detach:
+                zero = zero + canonical_points.reshape(-1)[:0].sum()
+            return output + zero
+        level_features = self.euler_field.query_static_level_features(
+            canonical_points.index_select(0, point_indices),
+            camera_center=camera_center,
+            view_mapper=self.field_static_view_mapper,
+            view_scale=self.field_static_app_scale,
+            timestamp=timestamp,
+        )
+        feature = self.euler_field.blend_level_features(
+            level_features, level_logits.index_select(0, point_indices)
+        )
+        residual = self.field_static_app_head(feature)
+        return output.index_copy(0, point_indices, residual)
+
     def _get_dynamic_level_logits(self, timestamp, level_features=None):
         level_logits = self._dynamic_level_logits
         if self._dynamic_level_time_coeff.numel() > 0:
@@ -3985,6 +4095,118 @@ class GaussianModel:
             )
         return weight * loss
 
+    def _validate_couptest_initialization(self):
+        mode = self.field_couptest_initialization_mode
+        if mode not in {"uniform", "three_group", "dense_wide_sparse_unit"}:
+            raise ValueError("Invalid field_couptest_initialization_mode={!r}".format(mode))
+        if mode == "uniform":
+            return
+        if self.field_motion_model not in {"couptest_polynomial", "couptest_grid"}:
+            raise ValueError("Source-aware initialization requires a couptest motion model")
+        if mode == "dense_wide_sparse_unit":
+            return
+        prefix = float(self.field_couptest_initial_sparse_prefix_frames)
+        if (not math.isfinite(prefix) or not prefix.is_integer()
+                or not 0 < prefix < self._couptest_sequence_frames):
+            raise ValueError("Sparse prefix must be an integer within (0, duration)")
+        self.field_couptest_initial_sparse_prefix_frames = int(prefix)
+        scale = self.field_couptest_initial_sparse_prefix_scale
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Initial sparse prefix scale must be finite and positive")
+        window = self.field_couptest_initial_window_frames
+        if not math.isfinite(window) or not 0 < window <= self._couptest_sequence_frames:
+            raise ValueError("Three-group initialization needs a positive late window <= duration")
+
+    @torch.no_grad()
+    def _initialize_couptest_three_group_widths(self, times, sparse_count):
+        """Initialize source-aware widths; the original three-group policy stays exact."""
+        self._validate_couptest_initialization()
+        count = self._trbf_scale.shape[0]
+        if times.shape != (count, 1) or not 0 < sparse_count < count:
+            raise ValueError("Source-aware initialization requires sparse points followed by dense points")
+        duration = self._couptest_sequence_frames
+        sparse_frames_float = times[:sparse_count, 0] * duration
+        sparse_frames = torch.round(sparse_frames_float)
+        if (not bool(torch.isfinite(times).all())
+                or not bool((torch.abs(sparse_frames_float - sparse_frames) < 1e-3).all())
+                or not bool(((sparse_frames >= 0) & (sparse_frames < duration)).all())
+                or not bool((times[sparse_count:] == 0).all())):
+            raise ValueError("Source-aware initialization requires integer sparse source frames and frame-0 dense points")
+        if self.field_couptest_initialization_mode == "dense_wide_sparse_unit":
+            self._trbf_scale[:sparse_count].zero_()  # log(s=1), for every source frame.
+            self._trbf_scale[sparse_count:].fill_(math.log(self._couptest_full_width))
+            self._couptest_initialization_stats = {
+                "mode": "dense_wide_sparse_unit",
+                "sparse_points": sparse_count,
+                "sparse_scale": 1.0,
+                "dense_points": count - sparse_count,
+                "dense_scale": self._couptest_full_width,
+                "coupling_width_reference": self._couptest_full_width,
+                "total_points": count,
+            }
+            _init_status(
+                "Two-group time initialization: sparse_all_frames={} (s=1), "
+                "dense_frame0={} (s={:.7g}); all widths remain learnable, "
+                "coupling_reference={:.7g}".format(
+                    sparse_count, count - sparse_count, self._couptest_full_width,
+                    self._couptest_full_width,
+                )
+            )
+            return
+        prefix = self.field_couptest_initial_sparse_prefix_frames
+        early = sparse_frames < prefix
+        late_width = self._couptest_initial_width()
+        self._trbf_scale.fill_(math.log(late_width))
+        self._trbf_scale[:sparse_count][early] = math.log(
+            self.field_couptest_initial_sparse_prefix_scale
+        )
+        self._trbf_scale[sparse_count:].fill_(math.log(self._couptest_full_width))
+        early_count = int(early.sum().item())
+        self._couptest_initialization_stats = {
+            "mode": "three_group",
+            "sparse_prefix_frames": prefix,
+            "sparse_prefix_points": early_count,
+            "sparse_prefix_scale": self.field_couptest_initial_sparse_prefix_scale,
+            "sparse_late_points": sparse_count - early_count,
+            "sparse_late_window_frames": self.field_couptest_initial_window_frames,
+            "sparse_late_scale": late_width,
+            "dense_points": count - sparse_count,
+            "dense_scale": self._couptest_full_width,
+            "coupling_width_reference": self._couptest_full_width,
+            "total_points": count,
+        }
+        _init_status(
+            "Three-group time initialization: dense_frame0={} (s={:.7g}), "
+            "sparse_frames0..{}={} (s={:.7g}), sparse_frames{}..{}={} "
+            "(window={:g} frames, s={:.7g}); all widths remain learnable, "
+            "coupling_reference={:.7g}".format(
+                count - sparse_count, self._couptest_full_width,
+                prefix - 1, early_count, self.field_couptest_initial_sparse_prefix_scale,
+                prefix, duration - 1, sparse_count - early_count,
+                self.field_couptest_initial_window_frames, late_width,
+                self._couptest_full_width,
+            )
+        )
+
+    def _couptest_initial_width(self):
+        """Initialization only; do not change the motion coupling reference.
+
+        A positive window is the total frame span where the temporal gate is
+        at least 1/255, before multiplying by the material opacity. Zero keeps
+        the legacy sequence-wide initialization. Learned widths are not capped.
+        """
+        frames = float(self.field_couptest_initial_window_frames)
+        if not math.isfinite(frames) or frames < 0.0:
+            raise ValueError(
+                "field_couptest_initial_window_frames must be finite and >= 0"
+            )
+        if frames == 0.0:
+            return self._couptest_full_width
+        duration = int(self._couptest_sequence_frames)
+        if duration <= 0:
+            raise ValueError("A frame-based initial time window requires duration > 0")
+        return (0.5 * frames / duration) / math.sqrt(math.log(255.0))
+
     def _couptest_motion_terms(self, timestamp, point_indices=None):
         if self.field_motion_model not in {
             "couptest_polynomial",
@@ -4130,6 +4352,22 @@ class GaussianModel:
         app_residual = None
         static_warmup = 0.0
         trbfdistanceoffset = timestamp - self.get_trbfcenter
+        query_trbfoutput = None
+        static_query_indices = None
+        self._last_static_query_stats = None
+        query_threshold = self.field_static_query_kernel_threshold
+        if self.use_euler_field and query_threshold > 0.0:
+            self._validate_static_query_kernel_policy()
+            query_trbfoutput = basicfunction(
+                trbfdistanceoffset / torch.exp(self._trbf_scale)
+            )
+            # Reuse the learned temporal kernel for opacity below. The selection
+            # is detached: it is not a new differentiable lifecycle constraint.
+            current_kernel = query_trbfoutput.detach().reshape(-1)
+            static_query_indices = torch.nonzero(
+                torch.isfinite(current_kernel) & (current_kernel >= query_threshold),
+                as_tuple=False,
+            ).reshape(-1)
         if self.field_motion_model == "carrier_hybrid":
             if (
                 self.carrier_motion_bank is None
@@ -4355,7 +4593,7 @@ class GaussianModel:
                         device=self.get_xyz.device,
                         dtype=self.get_xyz.dtype,
                     )
-                if static_warmup > 0.0:
+                if static_warmup > 0.0 and static_query_indices is None:
                     static_level_features = self.euler_field.query_static_level_features(
                         canonical_points,
                         camera_center=camera_center,
@@ -4379,6 +4617,20 @@ class GaussianModel:
                     dynamic_route = torch.zeros_like(static_route)
                     gate_alpha = torch.zeros_like(dynamic_weight)
                 app_residual = None
+                if (
+                    static_query_indices is not None
+                    and static_warmup > 0.0
+                    and self.field_static_app_head is not None
+                    and self.field_static_app_scale > 0.0
+                ):
+                    app_residual = self._query_static_appearance_subset(
+                        canonical_points, static_query_indices, timestamp, camera_center
+                    )
+                    self._last_static_query_stats = {
+                        "threshold": query_threshold,
+                        "total_points": int(canonical_points.shape[0]),
+                        "queried_points": int(static_query_indices.numel()),
+                    }
                 if static_feature is not None:
                     if self.field_static_app_head is not None and self.field_static_app_scale > 0.0:
                         app_residual = self.field_static_app_head(static_feature)
@@ -4437,8 +4689,11 @@ class GaussianModel:
                 if dynamic_field_residual is not None:
                     motion, opacity_param = self._apply_field_residual(motion, opacity_param, dynamic_field_residual)
 
-        trbfdistance = trbfdistanceoffset / torch.exp(self._trbf_scale)
-        trbfoutput = basicfunction(trbfdistance)
+        if query_trbfoutput is None:
+            trbfdistance = trbfdistanceoffset / torch.exp(self._trbf_scale)
+            trbfoutput = basicfunction(trbfdistance)
+        else:
+            trbfoutput = query_trbfoutput
         existence_output = trbfoutput
         if self.field_existence_single_expert == "persistent":
             existence_output = torch.ones_like(trbfoutput)
@@ -5366,6 +5621,15 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
+        if self.field_couptest_initialization_mode in {"three_group", "dense_wide_sparse_unit"}:
+            self._validate_couptest_initialization()
+            if (not self.field_dense_initialization or self.field_carrier_initialization
+                    or int(self.preprocesspoints) != 0
+                    or self.field_dense_initialization_time != 0.0):
+                raise ValueError(
+                    "Source-aware initialization requires frame-0 dense fusion, "
+                    "preprocesspoints=0, and no Carrier reordering"
+                )
         if self.field_dense_initialization and self.field_carrier_initialization:
             raise ValueError(
                 "Dense initialization cannot be combined with Carrier "
@@ -5409,8 +5673,8 @@ class GaussianModel:
         raw_points = np.asarray(pcd.points)
         raw_colors = np.asarray(pcd.colors)
         raw_times = np.asarray(pcd.times)
+        sparse_count = int(raw_points.shape[0])
         if self.field_dense_initialization:
-            sparse_count = int(raw_points.shape[0])
             dense_points, dense_colors, dense_times = (
                 self._load_dense_initialization()
             )
@@ -5541,19 +5805,40 @@ class GaussianModel:
             "couptest_polynomial",
             "couptest_grid",
         }:
-            nn.init.constant_(
-                self._trbf_scale,
-                math.log(self._couptest_full_width),
-            )
-            _init_status(
-                "S2.0.4 couptest initialized: motion={}, mode={}, "
-                "width={:.6g}, existence_floor={:.3f}".format(
-                    self.field_motion_model,
-                    self.field_couptest_mode,
-                    self._couptest_full_width,
-                    self.field_couptest_initial_existence_floor,
+            initial_width = self._couptest_initial_width()
+            if self.field_couptest_initialization_mode in {"three_group", "dense_wide_sparse_unit"}:
+                self._initialize_couptest_three_group_widths(times, sparse_count)
+            else:
+                nn.init.constant_(
+                    self._trbf_scale,
+                    math.log(initial_width),
                 )
-            )
+            if (self.field_couptest_initialization_mode == "uniform"
+                    and self.field_couptest_initial_window_frames > 0.0):
+                _init_status(
+                    "S2.0.4 couptest initialized: motion={}, mode={}, "
+                    "width={:.6g}, initial_window_frames={:g}, "
+                    "window_gate_boundary={:.6g}, sequence_frames={}, "
+                    "coupling_width_reference={:.6g}".format(
+                        self.field_motion_model,
+                        self.field_couptest_mode,
+                        initial_width,
+                        self.field_couptest_initial_window_frames,
+                        1.0 / 255.0,
+                        self._couptest_sequence_frames,
+                        self._couptest_full_width,
+                    )
+                )
+            elif self.field_couptest_initialization_mode == "uniform":
+                _init_status(
+                    "S2.0.4 couptest initialized: motion={}, mode={}, "
+                    "width={:.6g}, existence_floor={:.3f}".format(
+                        self.field_motion_model,
+                        self.field_couptest_mode,
+                        initial_width,
+                        self.field_couptest_initial_existence_floor,
+                    )
+                )
 
         nn.init.constant_(self._features_t, 0)
         nn.init.constant_(self._omega, 0)
@@ -5588,6 +5873,10 @@ class GaussianModel:
             self._init_field_residual_gate()
         self._init_ems_mask(self.get_xyz.shape[0])
         self._init_dynamic_score_state(self.get_xyz.shape[0])
+
+        if self.field_mvstruct_unlimited:
+            from helper_mv_refinement import RefinementBirthState
+            self._refinement_birth_state = RefinementBirthState(len(self.get_xyz), self.get_xyz.device)
 
     def boost_background_candidate_gradients(self, iteration):
         if not bool(getattr(self, "field_bg_candidate_grad_boost", False)):
@@ -6135,6 +6424,7 @@ class GaussianModel:
 
     def _checkpoint_field_config(self):
         return {
+            **self._narrow_birth_config,
             "use_euler_field": self.use_euler_field,
             "field_base_resolution": self.field_base_resolution,
             "field_num_levels": self.field_num_levels,
@@ -6184,6 +6474,7 @@ class GaussianModel:
             "field_static_motion_scale": self.field_static_motion_scale,
             "field_static_opacity_scale": self.field_static_opacity_scale,
             "field_static_app_scale": self.field_static_app_scale,
+            "field_static_query_kernel_threshold": self.field_static_query_kernel_threshold,
             "field_static_temporal_residual": int(self.field_static_temporal_residual),
             "field_static_temporal_frames": self.field_static_temporal_frames,
             "field_static_temporal_scale": self.field_static_temporal_scale,
@@ -6402,6 +6693,14 @@ class GaussianModel:
             "field_motion_model": self.field_motion_model,
             "field_couptest_mode": self.field_couptest_mode,
             "field_couptest_initial_existence_floor": self.field_couptest_initial_existence_floor,
+            "field_couptest_initial_window_frames": self.field_couptest_initial_window_frames,
+            "field_couptest_initialization_mode": self.field_couptest_initialization_mode,
+            "field_couptest_initial_sparse_prefix_frames": self.field_couptest_initial_sparse_prefix_frames,
+            "field_couptest_initial_sparse_prefix_scale": self.field_couptest_initial_sparse_prefix_scale,
+            "field_couptest_initialization_stats": dict(self._couptest_initialization_stats),
+            "field_couptest_sequence_frames": self._couptest_sequence_frames,
+            "field_couptest_initial_window_gate_boundary": 1.0 / 255.0,
+            "field_couptest_initial_width": self._couptest_initial_width(),
             "field_couptest_full_width": self._couptest_full_width,
             "field_couptest_grid_resolution": self.field_couptest_grid_resolution,
             "field_couptest_grid_resolved_resolution": self.field_couptest_grid_resolved_resolution,
@@ -6432,6 +6731,8 @@ class GaussianModel:
             "field_h2_integration_method": self.field_h2_integration_method,
             "field_h2_velocity_reg_weight": self.field_h2_velocity_reg_weight,
             "field_mvstruct": int(self.field_mvstruct),
+            "field_mvstruct_unlimited": int(self.field_mvstruct_unlimited),
+            "field_mvstruct_time_sampling": self.field_mvstruct_time_sampling,
             "field_mvstruct_start": self.field_mvstruct_start,
             "field_mvstruct_until": self.field_mvstruct_until,
             "field_mvstruct_interval": self.field_mvstruct_interval,
@@ -6476,6 +6777,7 @@ class GaussianModel:
             "field_mvstruct_specialize_offset_ratio": self.field_mvstruct_specialize_offset_ratio,
             "field_mvstruct_specialize_scale_ratio": self.field_mvstruct_specialize_scale_ratio,
             "field_temporal_visibility_densify": int(self.field_temporal_visibility_densify),
+            "field_densify_temporal_filter": int(self.field_densify_temporal_filter),
             "field_temporal_visibility_min_opacity": self.field_temporal_visibility_min_opacity,
             "field_temporal_adaptive_threshold": int(self.field_temporal_adaptive_threshold),
             "field_temporal_adaptive_alpha": self.field_temporal_adaptive_alpha,
@@ -6765,6 +7067,17 @@ class GaussianModel:
             self.field_static_motion_scale = float(config.get("field_static_motion_scale", self.field_static_motion_scale))
             self.field_static_opacity_scale = float(config.get("field_static_opacity_scale", self.field_static_opacity_scale))
             self.field_static_app_scale = float(config.get("field_static_app_scale", self.field_static_app_scale))
+            # Old checkpoints retain their original all-point query behavior.
+            from helper_narrow_birth import options as narrow_birth_options
+            self._narrow_birth_config = narrow_birth_options(config)
+            self.field_static_query_kernel_threshold = float(
+                config.get("field_static_query_kernel_threshold", 0.0)
+            )
+            if (
+                not math.isfinite(self.field_static_query_kernel_threshold)
+                or not 0.0 <= self.field_static_query_kernel_threshold <= 1.0
+            ):
+                raise ValueError("Invalid static query kernel threshold in checkpoint")
             self.field_static_temporal_residual = bool(config.get("field_static_temporal_residual", int(self.field_static_temporal_residual)))
             self.field_static_temporal_frames = int(config.get("field_static_temporal_frames", self.field_static_temporal_frames))
             self.field_static_temporal_scale = float(config.get("field_static_temporal_scale", self.field_static_temporal_scale))
@@ -6994,6 +7307,28 @@ class GaussianModel:
                     self.field_couptest_initial_existence_floor,
                 )
             )
+            # Loading a checkpoint preserves its learned per-Gaussian widths.
+            # Missing policy metadata denotes a legacy checkpoint, not the new
+            # initialization policy supplied by the current training config.
+            self.field_couptest_initial_window_frames = float(
+                config.get("field_couptest_initial_window_frames", 0.0)
+            )
+            self.field_couptest_initialization_mode = str(
+                config.get("field_couptest_initialization_mode", "uniform")
+            ).strip().lower()
+            self.field_couptest_initial_sparse_prefix_frames = config.get(
+                "field_couptest_initial_sparse_prefix_frames", 50
+            )
+            self.field_couptest_initial_sparse_prefix_scale = float(
+                config.get("field_couptest_initial_sparse_prefix_scale", 1.0)
+            )
+            self._couptest_initialization_stats = dict(
+                config.get("field_couptest_initialization_stats", {})
+            )
+            self._couptest_sequence_frames = int(
+                config.get("field_couptest_sequence_frames", self._couptest_sequence_frames)
+            )
+            self._validate_couptest_initialization()
             self.field_couptest_grid_resolution = str(
                 config.get(
                     "field_couptest_grid_resolution",
@@ -7076,6 +7411,7 @@ class GaussianModel:
                 self._couptest_full_width = 1.0 / math.sqrt(
                     -math.log(self.field_couptest_initial_existence_floor)
                 )
+                self._couptest_initial_width()
             self.field_carrier_initialization = bool(
                 config.get(
                     "field_carrier_initialization",
@@ -7185,6 +7521,8 @@ class GaussianModel:
             self.field_existence_coverage_weight = float(config.get("field_existence_coverage_weight", self.field_existence_coverage_weight))
             self.field_existence_log_interval = int(config.get("field_existence_log_interval", self.field_existence_log_interval))
             self.field_mvstruct = bool(config.get("field_mvstruct", int(self.field_mvstruct)))
+            self.field_mvstruct_unlimited = bool(config.get("field_mvstruct_unlimited", 0))
+            self.field_mvstruct_time_sampling = str(config.get("field_mvstruct_time_sampling", "random"))
             self.field_mvstruct_start = int(config.get("field_mvstruct_start", self.field_mvstruct_start))
             self.field_mvstruct_until = int(config.get("field_mvstruct_until", self.field_mvstruct_until))
             self.field_mvstruct_interval = int(config.get("field_mvstruct_interval", self.field_mvstruct_interval))
@@ -7229,6 +7567,8 @@ class GaussianModel:
             self.field_mvstruct_specialize_offset_ratio = float(config.get("field_mvstruct_specialize_offset_ratio", self.field_mvstruct_specialize_offset_ratio))
             self.field_mvstruct_specialize_scale_ratio = float(config.get("field_mvstruct_specialize_scale_ratio", self.field_mvstruct_specialize_scale_ratio))
             self.field_temporal_visibility_densify = bool(config.get("field_temporal_visibility_densify", int(self.field_temporal_visibility_densify)))
+            # Old checkpoints must not silently adopt a new training statistic.
+            self.field_densify_temporal_filter = bool(config.get("field_densify_temporal_filter", 0))
             self.field_temporal_visibility_min_opacity = max(float(config.get("field_temporal_visibility_min_opacity", self.field_temporal_visibility_min_opacity)), 0.0)
             self.field_temporal_adaptive_threshold = bool(config.get("field_temporal_adaptive_threshold", int(self.field_temporal_adaptive_threshold)))
             self.field_temporal_adaptive_alpha = max(float(config.get("field_temporal_adaptive_alpha", self.field_temporal_adaptive_alpha)), 0.0)
@@ -7362,6 +7702,27 @@ class GaussianModel:
         self._ensure_content_exposure_head()
         if payload.get("content_exposure_head") is not None and self.content_exposure_head is not None:
             self._load_module_state_compatible(self.content_exposure_head, payload["content_exposure_head"])
+
+        if self.field_mvstruct_unlimited:
+            from helper_mv_refinement import RefinementBirthState
+            if append:
+                raise RuntimeError("Appending unlimited-refinement checkpoints is unsupported")
+            self._refinement_birth_state = RefinementBirthState.load(
+                payload.get('refinement_birth_state'), self.get_xyz.device,
+                len(self.get_xyz), mask=mask)
+            self._refinement_iteration = int(payload['refinement_birth_state']['iteration'])
+        else:
+            self._refinement_birth_state = None
+
+        if self._narrow_birth_config['field_narrow_birth']:
+            from helper_narrow_birth import BirthState
+            if append or payload.get('narrow_birth_state') is None:
+                raise RuntimeError('Narrow birth checkpoints require their identity/budget state; PLY append is unsupported')
+            self._narrow_birth_state = BirthState.load(
+                payload['narrow_birth_state'], self.get_xyz.device, mask=mask)
+            self._narrow_birth_state.check(self.get_xyz.shape[0])
+        else:
+            self._narrow_birth_state = None
 
         if self.field_carrier_initialization:
             if append:
@@ -8008,6 +8369,10 @@ class GaussianModel:
         self._visibility_persistence_ema = visibility_score
 
     def save_ply(self, path):
+        if self.field_mvstruct_unlimited:
+            if self._refinement_birth_state is None:
+                raise RuntimeError("Cannot save refinement checkpoint without birth ages")
+            self._refinement_birth_state.check(len(self.get_xyz))
         mkdir_p(os.path.dirname(path))
         self._assert_carrier_topology()
         self._assert_couptest_topology()
@@ -8042,6 +8407,10 @@ class GaussianModel:
         print(f'Saving model checkpoint to: {model_fname}')
         payload = {
             "rgbdecoder": self.rgbdecoder.state_dict() if self.rgbdecoder is not None else None,
+            "narrow_birth_state": self._narrow_birth_checkpoint_state(),
+            "refinement_birth_state": (
+                self._refinement_birth_state.snapshot(self._refinement_iteration)
+                if self._refinement_birth_state is not None else None),
             "content_exposure_head": self.content_exposure_head.state_dict() if self.content_exposure_head is not None else None,
             "field_config": self._checkpoint_field_config(),
             "existence_logits": self._existence_logits.detach().cpu() if self._existence_logits.numel() > 0 else None,
@@ -8908,6 +9277,12 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask):
+        if self._refinement_birth_state is not None:
+            self._assert_refinement_mutation_allowed()
+            self._refinement_birth_state.check(len(self.get_xyz))
+            self._refinement_birth_state.prune(~mask.reshape(-1).bool())
+        if self._narrow_birth_state is not None:
+            self._narrow_birth_state.prune(~mask.reshape(-1).bool())
         valid_points_mask = ~mask
         old_motion_time_anchor = self._motion_time_anchor
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
@@ -9056,13 +9431,59 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None, new_existence_logits=None, new_interval_center_raw=None, new_interval_log_half_width=None, new_motion_time_anchor=None, new_existence_parent_indices=None, new_carrier_id=None, new_initialization_role=None):
+    def _assert_refinement_mutation_allowed(self):
+        if (self._refinement_topology_until is not None
+                and self._refinement_iteration > self._refinement_topology_until):
+            raise RuntimeError("Topology mutation after the refinement cutoff")
+
+    def _narrow_birth_checkpoint_state(self):
+        from helper_narrow_birth import ensure_state
+        state = ensure_state(self)
+        return state.state_dict() if state is not None else None
+
+    def _narrow_birth_growth_mask(self, selected):
+        state = self._narrow_birth_state
+        if state is None:
+            return selected
+        state.check(len(self.get_xyz))
+        return selected & (state.born < 0)
+
+    def densification_postfix(self, new_xyz, new_features_dc, new_opacities, new_scaling, new_rotation, new_trbf_center, new_trbfscale, new_motion, new_omega, new_featuret, new_static_level_logits=None, new_dynamic_level_logits=None, new_dynamic_level_time_coeff=None, new_ems_mask=None, new_bg_candidate_mask=None, new_bg_birth_iter=None, new_existence_logits=None, new_interval_center_raw=None, new_interval_log_half_width=None, new_motion_time_anchor=None, new_existence_parent_indices=None, new_carrier_id=None, new_initialization_role=None, narrow_birth_parents=None, narrow_growth_parents=None, narrow_growth_iteration=None):
         old_count = self._xyz.shape[0]
         new_count = int(new_xyz.shape[0])
+        if self._refinement_birth_state is not None:
+            self._assert_refinement_mutation_allowed()
+            self._refinement_birth_state.check(old_count)
+        if narrow_growth_parents is not None:
+            from helper_narrow_birth import validate_model, ensure_state
+            validate_model(self)
+            state = ensure_state(self)
+            if (not self._narrow_birth_config.get('field_narrow_birth_growth', 0)
+                    or state is None or state.growth is None or narrow_birth_parents is not None
+                    or narrow_growth_iteration is None or new_existence_parent_indices is None
+                    or narrow_growth_parents.shape != (new_count,)
+                    or torch.any(narrow_growth_parents < 0) or torch.any(narrow_growth_parents >= old_count)
+                    or not torch.equal(narrow_growth_parents, new_existence_parent_indices)
+                    or not bool((state.born[narrow_growth_parents] >= 0).all())):
+                raise RuntimeError('Invalid explicit narrow spatial-growth parents')
+        if narrow_birth_parents is not None:
+            from helper_narrow_birth import validate_model, ensure_state
+            validate_model(self)
+            if ensure_state(self) is None or new_existence_parent_indices is not None:
+                raise RuntimeError('Explicit narrow birth requires enabled identity state and a separate anchor')
+            if (narrow_birth_parents.shape != (new_count,)
+                    or torch.any(narrow_birth_parents < 0)
+                    or torch.any(narrow_birth_parents >= old_count)):
+                raise ValueError('Explicit narrow birth parent indices are invalid')
+        if self._narrow_birth_state is not None:
+            parents = narrow_birth_parents if narrow_birth_parents is not None else new_existence_parent_indices
+            if (parents is not None and torch.any(self._narrow_birth_state.born[parents] >= 0)
+                    and narrow_growth_parents is None):
+                raise RuntimeError('Narrow children cannot be topology parents')
         if self.field_motion_model in {
             "couptest_polynomial",
             "couptest_grid",
-        }:
+        } and narrow_birth_parents is None:
             if new_existence_parent_indices is not None:
                 couptest_parent_indices = new_existence_parent_indices.to(
                     device=self.get_xyz.device,
@@ -9395,6 +9816,17 @@ class GaussianModel:
             old_bg_birth = torch.full((old_count, 1), -1.0, device="cuda", dtype=torch.float32)
             self._bg_birth_iter = torch.cat((old_bg_birth, new_bg_birth_iter), dim=0)
         self._mvstruct_on_points_added(old_count, new_xyz.shape[0])
+        if self._refinement_birth_state is not None:
+            self._refinement_birth_state.append(new_count, self._refinement_iteration)
+            self._refinement_birth_state.check(len(self.get_xyz))
+        if self._narrow_birth_state is not None:
+            parents = narrow_birth_parents if narrow_birth_parents is not None else new_existence_parent_indices
+            self._narrow_birth_state.append(
+                new_count, parents=parents,
+                birth_iteration=(int(narrow_growth_iteration) if narrow_growth_parents is not None
+                                 else 0 if narrow_birth_parents is not None else None),
+                allow_descendants=narrow_growth_parents is not None)
+            self._narrow_birth_state.check(len(self.get_xyz))
         self._assert_carrier_topology()
         self._assert_couptest_topology()
 
@@ -9407,6 +9839,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        selected_pts_mask = self._narrow_birth_growth_mask(selected_pts_mask)
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -9456,6 +9889,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        selected_pts_mask = self._narrow_birth_growth_mask(selected_pts_mask)
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -9505,6 +9939,7 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        selected_pts_mask = self._narrow_birth_growth_mask(selected_pts_mask)
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
@@ -9552,6 +9987,7 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
+        selected_pts_mask = self._narrow_birth_growth_mask(selected_pts_mask)
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
@@ -9583,6 +10019,7 @@ class GaussianModel:
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
         
+        selected_pts_mask = self._narrow_birth_growth_mask(selected_pts_mask)
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         # new_features_rest = self._features_rest[selected_pts_mask]
@@ -9613,15 +10050,69 @@ class GaussianModel:
 
 
   
+    def _prepare_temporal_densify_grads(self, grads, max_grad, source):
+        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
+        threshold_multiplier = self._temporal_densify_threshold_multiplier()
+        effective_grads = grads
+        if threshold_multiplier is not None:
+            effective_grads = grads / threshold_multiplier.reshape(-1, 1).clamp_min(1e-12)
+
+        temporal_visibility = bool(
+            getattr(self, "field_temporal_visibility_densify", False)
+        )
+        temporal_threshold = bool(
+            getattr(self, "field_temporal_adaptive_threshold", False)
+        )
+        if temporal_visibility or temporal_threshold:
+            width_ratio = self._temporal_densify_width_ratio()
+            candidate = effective_grads.squeeze(1) >= float(max_grad)
+            stats = self._temporal_densify_selection_stats(
+                candidate,
+                width_ratio,
+                threshold_multiplier,
+            )
+            stats.update(
+                {
+                    "source": str(source),
+                    "visibility_weighted": int(temporal_visibility),
+                    "adaptive_threshold": int(temporal_threshold),
+                }
+            )
+            positive_weight = self.denom.detach().reshape(-1)
+            positive_weight = positive_weight[positive_weight > 0]
+            stats["visibility_weight_p50"] = self._temporal_densify_quantile(
+                positive_weight,
+                0.50,
+            )
+            stats["visibility_weight_p90"] = self._temporal_densify_quantile(
+                positive_weight,
+                0.90,
+            )
+            self._last_temporal_densify_stats = stats
+            print(
+                "\n[STEGF][TAD] {source} candidates={candidate_count}, "
+                "width_p50={width_p50:.4f}, "
+                "selected_width_p50={selected_width_p50:.4f}, "
+                "threshold_p50={threshold_multiplier_p50:.4f}".format(
+                    **stats
+                ),
+                flush=True,
+            )
+        return effective_grads
+
     def densify_prunecloneim(self, max_grad, min_opacity, extent, max_screen_size, splitN=1):
         grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+        effective_grads = self._prepare_temporal_densify_grads(
+            grads,
+            max_grad,
+            "legacy_im",
+        )
         
         print("befre clone", self._xyz.shape[0])
-        self.densify_and_cloneim(grads, max_grad, extent)
+        self.densify_and_cloneim(effective_grads, max_grad, extent)
         print("after clone", self._xyz.shape[0])
 
-        self.densify_and_splitim(grads, max_grad, extent, 2)
+        self.densify_and_splitim(effective_grads, max_grad, extent, 2)
         print("after split", self._xyz.shape[0])
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -9688,13 +10179,17 @@ class GaussianModel:
     # this is not using random and use numpy bmm for densify
     def densify_prunecloneimgeneral(self, max_grad, min_opacity, extent, max_screen_size, splitN=1):
         grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
+        effective_grads = self._prepare_temporal_densify_grads(
+            grads,
+            max_grad,
+            "legacy_im_general",
+        )
         
         print("befre clone", self._xyz.shape[0])
-        self.densify_and_cloneim(grads, max_grad, extent)
+        self.densify_and_cloneim(effective_grads, max_grad, extent)
         print("after clone", self._xyz.shape[0])
 
-        self.densify_and_split(grads, max_grad, extent, 2)
+        self.densify_and_split(effective_grads, max_grad, extent, 2)
         print("after split", self._xyz.shape[0])
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
@@ -9752,7 +10247,25 @@ class GaussianModel:
             "selected_threshold_multiplier_p50": self._temporal_densify_quantile(selected_threshold, 0.50),
         }
 
+    def filter_densification_visibility(self, spatial_filter, point_opacity):
+        """Exclude impossible raster contributions from density statistics only.
+
+        This is not VAD weighting, TAT, rendering culling, or point deletion.
+        A peak opacity below 1/255 cannot pass the rasterizer's alpha threshold.
+        """
+        if not bool(getattr(self, "field_densify_temporal_filter", False)):
+            return spatial_filter
+        count = int(self.get_xyz.shape[0])
+        if not torch.is_tensor(point_opacity) or point_opacity.numel() != count:
+            raise ValueError("Temporal density statistics require one rendered opacity per Gaussian")
+        if spatial_filter.dtype != torch.bool or spatial_filter.shape != (count,):
+            raise ValueError("Density statistics require a point-aligned boolean spatial mask")
+        opacity = point_opacity.detach().reshape(-1).to(device=spatial_filter.device)
+        return spatial_filter & torch.isfinite(opacity) & (opacity >= 1.0 / 255.0)
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter, point_opacity=None):
+        if bool(getattr(self, "field_densify_temporal_filter", False)):
+            update_filter = self.filter_densification_visibility(update_filter, point_opacity)
         if bool(getattr(self, "field_temporal_visibility_densify", False)):
             if point_opacity is None or point_opacity.shape[0] != self.get_xyz.shape[0]:
                 return False
@@ -9780,6 +10293,8 @@ class GaussianModel:
         return True
 
     def add_densification_stats_with_gate(self, viewspace_point_tensor, update_filter, point_gate, point_opacity=None):
+        if bool(getattr(self, "field_densify_temporal_filter", False)):
+            update_filter = self.filter_densification_visibility(update_filter, point_opacity)
         if bool(getattr(self, "field_temporal_visibility_densify", False)):
             if point_opacity is None or point_opacity.shape[0] != self.get_xyz.shape[0]:
                 return False
@@ -9819,6 +10334,11 @@ class GaussianModel:
 
     def _mvstruct_buffers_ready(self):
         conflict_dim = self._mvstruct_conflict_dim()
+        temporal_count_ready = (
+            not bool(getattr(self, "field_densify_temporal_filter", False))
+            or (self._mvstruct_temporal_opportunities is not None
+                and self._mvstruct_temporal_opportunities.shape[0] == self.get_xyz.shape[0])
+        )
         observation_count_ready = (
             not bool(getattr(self, "field_temporal_visibility_densify", False))
             or (
@@ -9830,6 +10350,7 @@ class GaussianModel:
             self._mvstruct_gradient_accum is not None
             and self._mvstruct_visibility_count is not None
             and observation_count_ready
+            and temporal_count_ready
             and self._mvstruct_max_radii2D is not None
             and self._mvstruct_last_topology_iter is not None
             and self._mvstruct_conflict_accum is not None
@@ -9854,6 +10375,10 @@ class GaussianModel:
         conflict_dim = self._mvstruct_conflict_dim()
         self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
         self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_temporal_opportunities = (
+            torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+            if bool(getattr(self, "field_densify_temporal_filter", False)) else None
+        )
         self._mvstruct_observation_count = (
             torch.zeros((n_points, 1), device=device, dtype=torch.float32)
             if bool(getattr(self, "field_temporal_visibility_densify", False))
@@ -9879,6 +10404,10 @@ class GaussianModel:
         conflict_dim = self._mvstruct_conflict_dim()
         self._mvstruct_gradient_accum = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
         self._mvstruct_visibility_count = torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+        self._mvstruct_temporal_opportunities = (
+            torch.zeros((n_points, 1), device=device, dtype=torch.float32)
+            if bool(getattr(self, "field_densify_temporal_filter", False)) else None
+        )
         self._mvstruct_observation_count = (
             torch.zeros((n_points, 1), device=device, dtype=torch.float32)
             if bool(getattr(self, "field_temporal_visibility_densify", False))
@@ -9904,6 +10433,9 @@ class GaussianModel:
             self._mvstruct_gradient_accum.shape[0] == old_count
             and self._mvstruct_visibility_count is not None
             and self._mvstruct_visibility_count.shape[0] == old_count
+            and (not bool(getattr(self, "field_densify_temporal_filter", False))
+                 or (self._mvstruct_temporal_opportunities is not None
+                     and self._mvstruct_temporal_opportunities.shape[0] == old_count))
             and (
                 not bool(getattr(self, "field_temporal_visibility_densify", False))
                 or (
@@ -9933,6 +10465,11 @@ class GaussianModel:
                 (self._mvstruct_visibility_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
                 dim=0,
             )
+            if self._mvstruct_temporal_opportunities is not None:
+                self._mvstruct_temporal_opportunities = torch.cat(
+                    (self._mvstruct_temporal_opportunities,
+                     torch.zeros((new_count, 1), device=device, dtype=torch.float32)), dim=0,
+                )
             if self._mvstruct_observation_count is not None:
                 self._mvstruct_observation_count = torch.cat(
                     (self._mvstruct_observation_count, torch.zeros((new_count, 1), device=device, dtype=torch.float32)),
@@ -9973,6 +10510,9 @@ class GaussianModel:
             self._mvstruct_gradient_accum.shape[0] == valid_points_mask.shape[0]
             and self._mvstruct_visibility_count is not None
             and self._mvstruct_visibility_count.shape[0] == valid_points_mask.shape[0]
+            and (not bool(getattr(self, "field_densify_temporal_filter", False))
+                 or (self._mvstruct_temporal_opportunities is not None
+                     and self._mvstruct_temporal_opportunities.shape[0] == valid_points_mask.shape[0]))
             and (
                 not bool(getattr(self, "field_temporal_visibility_densify", False))
                 or (
@@ -9995,6 +10535,8 @@ class GaussianModel:
         ):
             self._mvstruct_gradient_accum = self._mvstruct_gradient_accum[valid_points_mask]
             self._mvstruct_visibility_count = self._mvstruct_visibility_count[valid_points_mask]
+            if self._mvstruct_temporal_opportunities is not None:
+                self._mvstruct_temporal_opportunities = self._mvstruct_temporal_opportunities[valid_points_mask]
             if self._mvstruct_observation_count is not None:
                 self._mvstruct_observation_count = self._mvstruct_observation_count[valid_points_mask]
             self._mvstruct_max_radii2D = self._mvstruct_max_radii2D[valid_points_mask]
@@ -10014,6 +10556,9 @@ class GaussianModel:
         n_points = self.get_xyz.shape[0]
         assert self._mvstruct_gradient_accum.shape[0] == n_points
         assert self._mvstruct_visibility_count.shape[0] == n_points
+        if bool(getattr(self, "field_densify_temporal_filter", False)):
+            assert self._mvstruct_temporal_opportunities is not None
+            assert self._mvstruct_temporal_opportunities.shape[0] == n_points
         if bool(getattr(self, "field_temporal_visibility_densify", False)):
             assert self._mvstruct_observation_count is not None
             assert self._mvstruct_observation_count.shape[0] == n_points
@@ -10042,17 +10587,22 @@ class GaussianModel:
             return False
         grad_norm = torch.norm(viewspace_grad[:, :2].detach(), dim=-1, keepdim=True).to(device=self.get_xyz.device, dtype=torch.float32)
         visible = visibility_filter.detach().to(device=self.get_xyz.device, dtype=torch.bool)
+        temporal_filter = bool(getattr(self, "field_densify_temporal_filter", False))
+        if temporal_filter:
+            visible = self.filter_densification_visibility(visible, point_opacity)
         radii = radii.detach().to(device=self.get_xyz.device, dtype=torch.float32)
         opacity = None
         if (
-            bool(getattr(self, "field_temporal_visibility_densify", False))
+            (bool(getattr(self, "field_temporal_visibility_densify", False)) or temporal_filter)
             and point_opacity is not None
             and point_opacity.shape[0] == n_points
         ):
             opacity = point_opacity.detach().reshape(-1).to(
                 device=self.get_xyz.device,
                 dtype=torch.float32,
-            ).clamp(min=0.0, max=1.0)
+            )
+            if not temporal_filter:
+                opacity = opacity.clamp(min=0.0, max=1.0)
         feature_grad = None
         if bool(getattr(self, "field_mvstruct_conflict_split", False)) and (not self._mvstruct_conflict_source_is_position()) and feature_dc_grad is not None:
             if feature_dc_grad.shape[0] == n_points:
@@ -10097,6 +10647,13 @@ class GaussianModel:
         for grad_norm, visible, radii, point_opacity, feature_grad, pos_grad in self._mvstruct_event_records:
             if grad_norm.shape[0] != n_points or visible.shape[0] != n_points or radii.shape[0] != n_points:
                 continue
+            if bool(getattr(self, "field_densify_temporal_filter", False)):
+                # Count temporally eligible observations even outside the view
+                # frustum, so the spatial visibility ratio retains its meaning.
+                eligible = self.filter_densification_visibility(
+                    torch.ones_like(visible), point_opacity,
+                )
+                self._mvstruct_temporal_opportunities += eligible.reshape(-1, 1).to(dtype=torch.float32)
             spatial_valid = visible & event_consistent
             if torch.count_nonzero(spatial_valid) == 0:
                 continue
@@ -10107,7 +10664,7 @@ class GaussianModel:
                 density_valid = spatial_valid & (point_opacity > min_temporal_opacity)
             if torch.count_nonzero(density_valid) > 0:
                 if visibility_weighted:
-                    weight = point_opacity[density_valid].reshape(-1, 1)
+                    weight = point_opacity[density_valid].reshape(-1, 1).clamp(min=0.0, max=1.0)
                     self._mvstruct_gradient_accum[density_valid] += grad_norm[density_valid] * weight
                     self._mvstruct_visibility_count[density_valid] += weight
                     self._mvstruct_observation_count[density_valid] += 1.0
@@ -10161,6 +10718,11 @@ class GaussianModel:
         self._mvstruct_total_views += len(self._mvstruct_event_records)
         self._mvstruct_event_records = []
         return stats
+
+    def _mvstruct_visibility_ratio(self, observation_count):
+        if bool(getattr(self, "field_densify_temporal_filter", False)):
+            return observation_count / self._mvstruct_temporal_opportunities.clamp_min(1.0)
+        return observation_count / max(float(self._mvstruct_total_views), 1.0)
 
     def _mvstruct_make_child_tensors(self, selected_mask, split=False, children=2):
         if torch.count_nonzero(selected_mask) == 0:
@@ -10531,7 +11093,7 @@ class GaussianModel:
             if visibility_weighted
             else self._mvstruct_visibility_count
         )
-        visibility_ratio = observation_count / max(float(self._mvstruct_total_views), 1.0)
+        visibility_ratio = self._mvstruct_visibility_ratio(observation_count)
         positive_weight = self._mvstruct_visibility_count.squeeze(1)
         positive_weight = positive_weight[positive_weight > 0]
         positive_observations = observation_count.squeeze(1)
@@ -10563,10 +11125,12 @@ class GaussianModel:
                 visibility_ratio.squeeze(1)
                 >= float(self.field_mvstruct_min_visibility_ratio)
             )
+        observed_candidate = self._narrow_birth_growth_mask(observed_candidate)
         base_candidate = (
             (mean_grad.squeeze(1) >= point_threshold)
             & observed_candidate
         )
+        base_candidate = self._narrow_birth_growth_mask(base_candidate)
         width_ratio = self._temporal_densify_width_ratio()
         if visibility_weighted or threshold_multiplier is not None:
             stats.update(
@@ -10588,14 +11152,25 @@ class GaussianModel:
         total_budget = int(float(self.field_mvstruct_total_max_ratio) * float(self._mvstruct_budget_reference_points))
         event_budget = max(event_budget, 1)
         remaining_budget = max(total_budget - int(self._mvstruct_total_added), 0)
+        unlimited = bool(getattr(self, 'field_mvstruct_unlimited', False))
+        if unlimited:
+            # Algorithmic eligibility only: these old ratio fields are ignored.
+            # n_points is an upper bound on the candidate set, not a growth quota.
+            event_budget = remaining_budget = int(self.get_xyz.shape[0])
+            stats["growth_budget_mode"] = "unlimited"
         stats["event_budget"] = int(event_budget)
         stats["remaining_budget"] = int(remaining_budget)
+        if unlimited:
+            stats["event_budget"] = stats["remaining_budget"] = -1
         base_candidate_indices = torch.nonzero(base_candidate, as_tuple=False).squeeze(1)
         base_select_count = min(int(base_candidate_indices.numel()), event_budget, remaining_budget)
         if base_select_count > 0:
             base_candidate_scores = score.squeeze(1)[base_candidate_indices].float()
-            _, base_topk = torch.topk(base_candidate_scores, k=base_select_count, largest=True)
-            base_selected_indices = base_candidate_indices[base_topk]
+            if unlimited:
+                base_selected_indices = base_candidate_indices
+            else:
+                _, base_topk = torch.topk(base_candidate_scores, k=base_select_count, largest=True)
+                base_selected_indices = base_candidate_indices[base_topk]
             stats["recent_would_select"] = int(torch.count_nonzero(torch.logical_not(cooldown_ready[base_selected_indices])).item())
 
         radii2d = self._mvstruct_max_radii2D.float()
@@ -10779,8 +11354,11 @@ class GaussianModel:
             stats["clone_candidates"] = int(candidate_indices.numel() - stats["split_candidates"])
             normal_select_count = min(int(candidate_indices.numel()), int(normal_budget))
             if normal_select_count > 0:
-                _, topk = torch.topk(candidate_scores, k=normal_select_count, largest=True)
-                selected_indices = candidate_indices[topk]
+                if unlimited:
+                    selected_indices = candidate_indices
+                else:
+                    _, topk = torch.topk(candidate_scores, k=normal_select_count, largest=True)
+                    selected_indices = candidate_indices[topk]
                 normal_selected_mask[selected_indices] = True
 
         if (
@@ -10891,6 +11469,9 @@ class GaussianModel:
         stats["net_points"] = int(self.get_xyz.shape[0] - old_count)
         self._mvstruct_total_added += max(int(stats["net_points"]), 0)
         stats["total_added"] = int(self._mvstruct_total_added)
+        if unlimited:
+            stats["event_budget"] = -1  # Explicit unlimited sentinel in legacy text logs.
+            stats["remaining_budget"] = -1
         self.reset_mvstruct_window()
         return stats
 

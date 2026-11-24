@@ -33,6 +33,8 @@ DATASET_PROFILES = {
     },
 }
 
+DEFAULT_EVALUATION_MILESTONES = (10000, 20000)
+
 
 def get_model_path(args, scene, repeat_idx=None):
     output_root = (
@@ -73,9 +75,20 @@ def resolve_save_iterations(args, final_iteration, test_iterations):
     )
 
 
-def resolve_test_iterations(args, final_iteration):
+def resolve_test_iterations(args, final_iteration, config=None):
     if args.test_iterations is None:
-        return [int(final_iteration)]
+        milestones = (range(10000, int(final_iteration), 10000)
+                      if ((config or {}).get('field_narrow_birth', 0)
+                          or (config or {}).get('field_late_prune', 0))
+                      else DEFAULT_EVALUATION_MILESTONES)
+        return sorted(
+            {
+                int(iteration)
+                for iteration in milestones
+                if int(iteration) <= int(final_iteration)
+            }
+            | {int(final_iteration)}
+        )
     iterations = sorted({int(iteration) for iteration in args.test_iterations})
     invalid = [
         iteration
@@ -229,10 +242,10 @@ def get_configured_couptest_mode(config_path):
     with config_path.open("r", encoding="utf-8") as config_file:
         config = json.load(config_file)
     configured_mode = str(config.get("field_couptest_mode", "none"))
-    if configured_mode != "coupled_detached":
+    if configured_mode not in {"uncoupled", "coupled_detached"}:
         raise ValueError(
-            f"The final runner requires field_couptest_mode="
-            f"'coupled_detached' in {config_path}, got "
+            f"The runner requires field_couptest_mode='coupled_detached' "
+            f"or 'uncoupled' (ablation) in {config_path}, got "
             f"{configured_mode!r}"
         )
     return configured_mode
@@ -491,8 +504,9 @@ def main():
         default=None,
         help=(
             "Full-model checkpoint iterations to test after training. "
-            "Defaults to the resolved final training iteration. The compact "
-            "model is tested only at the final iteration."
+            "Defaults to 10000, 20000, and the resolved final training "
+            "iteration, omitting milestones beyond a shorter run. The "
+            "compact model is tested only at the final iteration."
         ),
     )
     parser.add_argument(
@@ -603,7 +617,7 @@ def main():
         args.configured_couptest_mode = couptest_mode
         scene_config = get_scene_config(config_path)
         final_iteration = resolve_final_iteration(args, scene_config)
-        test_iterations = resolve_test_iterations(args, final_iteration)
+        test_iterations = resolve_test_iterations(args, final_iteration, scene_config)
         for repeat_idx in range(1, args.re + 1):
             repeat_suffix = None if args.re == 1 else repeat_idx
             model_path = get_model_path(args, scene, repeat_suffix)
@@ -630,6 +644,11 @@ def main():
                 print(f"[STEGF] Repeat output: {model_path}", flush=True)
             print(
                 f"[STEGF] Final checkpoint: iteration {final_iteration}",
+                flush=True,
+            )
+            print(
+                "[STEGF] Full-model checkpoints: "
+                + ", ".join(str(iteration) for iteration in test_iterations),
                 flush=True,
             )
             if not args.skip_compact_stage:

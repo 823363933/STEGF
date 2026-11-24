@@ -49,6 +49,7 @@ from PIL import Image
 
 from thirdparty.gaussian_splatting.lpipsPyTorch import lpips
 from helper_train import getrenderpip, getmodel, trbfunction
+from helper_gt import SharedGroundTruth, shared_gt_path
 from thirdparty.gaussian_splatting.utils.loss_utils import ssim
 from thirdparty.gaussian_splatting.utils.image_utils import psnr
 from thirdparty.gaussian_splatting.helper3dg import gettestparse
@@ -137,7 +138,7 @@ def evaluate_photometric_fit(
 ):
     base_path = os.path.join(model_path, name, "ours_{}".format(iteration))
     render_path = os.path.join(base_path, "renders")
-    gts_path = os.path.join(base_path, "gt")
+    gts_path = shared_gt_path(model_path, name)
     fit_render_path = os.path.join(base_path, "renders_photometric_fit")
     if save_images:
         makedirs(fit_render_path, exist_ok=True)
@@ -203,10 +204,9 @@ def evaluate_photometric_fit(
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, rbfbasefunction, rdpip, timing_repeats=0, photometric_fit=False, photometric_fit_mode="rgb_affine", photometric_fit_reg=1e-6, photometric_fit_clamp=True, photometric_fit_save_images=True):
     render, GRsetting, GRzer = getrenderpip(rdpip) 
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    gt_cache = SharedGroundTruth(model_path, name, views=views)
 
     makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
     if gaussians.rgbdecoder is not None:
         gaussians.rgbdecoder.cuda()
         gaussians.rgbdecoder.eval()
@@ -311,10 +311,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        gt_cache.ensure_frame('{0:05d}'.format(idx) + ".png", gt)
         image_names.append('{0:05d}'.format(idx) + ".png")
 
     
+
+    gt_cache.finish()
+    print("[STEGF] Shared GT: {}, saved={}, reused={}".format(
+        gt_cache.path, gt_cache.saved, gt_cache.reused,
+    ))
 
     timing_repeats = max(int(timing_repeats), 0)
     if timing_repeats > 0:

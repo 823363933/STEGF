@@ -678,6 +678,11 @@ def getparser():
 
     # 2. Get actual user-provided args
     args = parser.parse_args()
+    # An explicit 30000 still overrides a scene with a different JSON budget.
+    explicit_iterations = any(
+        token == "--iterations" or token.startswith("--iterations=")
+        for token in sys.argv[1:]
+    )
 
     # Always save the final iteration, but keep the list stable and unique.
     args.save_iterations.append(args.iterations)
@@ -697,7 +702,7 @@ def getparser():
                 current_val = getattr(args, k)
                 default_val = defaults.get(k)
 
-                if current_val == default_val:
+                if current_val == default_val and not (k == "iterations" and explicit_iterations):
                     setattr(args, k, v)
                     
                 else:

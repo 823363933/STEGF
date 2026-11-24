@@ -52,11 +52,23 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         raydict = {}
+        long_sequence_uint8_loading = bool(
+            getattr(args, "field_long_sequence_uint8_loading", 0)
+        )
+        if long_sequence_uint8_loading and loader not in ("colmap", "colmapvalid"):
+            raise ValueError("Long-sequence uint8 loading supports N3D cameras only")
+        sparse_initialization_stride = getattr(args, "field_sparse_initialization_stride", 1)
+        if sparse_initialization_stride != 1 and loader not in ("colmap", "colmapvalid"):
+            raise ValueError("Sparse initialization stride supports N3D cameras only")
 
 
         scene_load_started = time.perf_counter()
         if loader == "colmap" or loader == "colmapvalid": # colmapvalid only for testing
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, multiview, duration=duration)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path, args.images, args.eval, multiview,
+                duration=duration, defer_image_loading=long_sequence_uint8_loading,
+                sparse_initialization_stride=sparse_initialization_stride,
+            )
         
         elif loader == "technicolor" or loader == "technicolorvalid" :
             scene_info = sceneLoadTypeCallbacks["Technicolor"](args.source_path, args.images, args.eval, multiview, duration=duration)
@@ -107,6 +119,12 @@ class Scene:
 
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+
+        if long_sequence_uint8_loading:
+            _init_status(
+                "Low-memory long-sequence camera loading enabled: "
+                "direct uint8 CPU images, source decode buffers released"
+            )
 
         for resolution_scale in resolution_scales:
             if loader in ["colmapvalid", "colmapmv", "immersivevalid","technicolorvalid", "immersivevalidss", "imv2valid"]:         
